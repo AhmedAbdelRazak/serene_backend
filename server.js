@@ -10,8 +10,12 @@ const socketIo = require("socket.io");
 
 // SSL setup
 const options = {
-	key: fs.readFileSync("/etc/letsencrypt/live/serenejannat.com/privkey.pem"),
-	cert: fs.readFileSync("/etc/letsencrypt/live/serenejannat.com/fullchain.pem"),
+	key: fs.readFileSync(
+		"/home/infiniteappsadmin/SereneJannat/serene_backend/certs/privkey.pem"
+	),
+	cert: fs.readFileSync(
+		"/home/infiniteappsadmin/SereneJannat/serene_backend/certs/fullchain.pem"
+	),
 };
 
 // app
