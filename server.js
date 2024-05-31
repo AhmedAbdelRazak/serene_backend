@@ -96,7 +96,7 @@ const options = {
 
 // app
 const app = express();
-const server = https.createServer(options, app);
+const server = http.createServer(options, app);
 
 // db
 mongoose
