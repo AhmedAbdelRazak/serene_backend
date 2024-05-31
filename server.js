@@ -4,12 +4,31 @@ const morgan = require("morgan");
 const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
-const http = require("http");
+const https = require("https");
+const fs = require("fs");
 const socketIo = require("socket.io");
 
 // app
 const app = express();
-const server = http.createServer(app);
+
+// SSL Certificates
+const privateKey = fs.readFileSync(
+	"/etc/letsencrypt/live/serenejannat.com/privkey.pem",
+	"utf8"
+);
+const certificate = fs.readFileSync(
+	"/etc/letsencrypt/live/serenejannat.com/cert.pem",
+	"utf8"
+);
+const ca = fs.readFileSync(
+	"/etc/letsencrypt/live/serenejannat.com/chain.pem",
+	"utf8"
+);
+
+const credentials = { key: privateKey, cert: certificate, ca: ca };
+
+// Create HTTPS server
+const server = https.createServer(credentials, app);
 
 // db
 mongoose
