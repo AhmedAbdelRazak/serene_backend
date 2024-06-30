@@ -27,6 +27,14 @@ const conversationSchema = new Schema({
 		required: false,
 		default: "",
 	},
+	seenByAdmin: {
+		type: Boolean,
+		default: false,
+	},
+	seenByCustomer: {
+		type: Boolean,
+		default: false,
+	},
 });
 
 const supportCaseSchema = new Schema({

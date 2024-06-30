@@ -19,7 +19,8 @@ exports.createSupportCase = async (req, res) => {
 // Get all support cases
 exports.getSupportCases = async (req, res) => {
 	try {
-		const cases = await SupportCase.find()
+		const status = req.query.status || "open"; // Default to 'open' if status is not provided
+		const cases = await SupportCase.find({ caseStatus: status })
 			.populate("supporterId")
 			.populate("conversation.messageBy");
 		res.status(200).json(cases);
@@ -40,7 +41,6 @@ exports.getSupportCaseById = async (req, res) => {
 			return res.status(404).json({ error: "Support case not found" });
 		}
 
-		console.log("Support case fetched:", supportCase);
 		res.status(200).json(supportCase);
 	} catch (error) {
 		console.error("Error fetching support case:", error);
@@ -99,6 +99,54 @@ exports.updateSupportCase = async (req, res) => {
 	}
 };
 
+// Update seenByAdmin field
+exports.updateSeenByAdmin = async (req, res) => {
+	try {
+		const { id } = req.params;
+		console.log(`Updating seenByAdmin for case ID: ${id}`);
+
+		const result = await SupportCase.updateOne(
+			{ _id: id, "conversation.seenByAdmin": false },
+			{ $set: { "conversation.$[].seenByAdmin": true } }
+		);
+
+		if (result.nModified === 0) {
+			console.log(`No documents were modified. Case ID: ${id}`);
+			return res
+				.status(404)
+				.json({ error: "Support case not found or already updated" });
+		}
+
+		console.log(`Seen status updated for case ID: ${id}`);
+		res.status(200).json({ message: "Seen status updated" });
+	} catch (error) {
+		console.error("Error updating seen status:", error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
+// Update seenByCustomer field
+exports.updateSeenByCustomer = async (req, res) => {
+	try {
+		const { id } = req.params;
+		const result = await SupportCase.updateOne(
+			{ _id: id, "conversation.seenByCustomer": false },
+			{ $set: { "conversation.$[].seenByCustomer": true } }
+		);
+
+		if (result.nModified === 0) {
+			return res
+				.status(404)
+				.json({ error: "Support case not found or already updated" });
+		}
+
+		res.status(200).json({ message: "Seen status updated" });
+	} catch (error) {
+		console.error("Error updating seen status:", error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
 // Delete a support case by ID
 exports.deleteSupportCase = async (req, res) => {
 	try {
@@ -153,6 +201,72 @@ exports.getUnassignedSupportCases = async (req, res) => {
 		const cases = await SupportCase.find({ supporterId: null });
 		res.status(200).json(cases);
 	} catch (error) {
+		res.status(400).json({ error: error.message });
+	}
+};
+
+exports.getUnassignedSupportCasesCount = async (req, res) => {
+	try {
+		const count = await SupportCase.countDocuments({ supporterId: null });
+		res.status(200).json({ count });
+	} catch (error) {
+		console.log(error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
+exports.getUnseenMessagesCountByAdmin = async (req, res) => {
+	try {
+		const count = await SupportCase.countDocuments({
+			"conversation.seenByAdmin": false,
+		});
+		res.status(200).json({ count });
+	} catch (error) {
+		console.error("Error fetching unseen messages count:", error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
+exports.getUnseenMessagesDetails = async (req, res) => {
+	try {
+		const unseenMessages = await SupportCase.find({
+			"conversation.seenByAdmin": false,
+		}).populate("conversation.messageBy");
+
+		res.status(200).json(unseenMessages);
+	} catch (error) {
+		console.error("Error fetching unseen messages details:", error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
+exports.getUnseenMessagesCountByCustomer = async (req, res) => {
+	try {
+		const { id } = req.params;
+		const supportCase = await SupportCase.findById(id);
+		if (!supportCase) {
+			return res.status(404).json({ error: "Support case not found" });
+		}
+
+		const unseenCount = supportCase.conversation.filter(
+			(msg) => !msg.seenByCustomer
+		).length;
+		res.status(200).json({ count: unseenCount });
+	} catch (error) {
+		console.error("Error fetching unseen messages count:", error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
+exports.getUnseenMessagesDetailsByCustomer = async (req, res) => {
+	try {
+		const unseenMessages = await SupportCase.find({
+			"conversation.seenByCustomer": false,
+		}).populate("conversation.messageBy");
+
+		res.status(200).json(unseenMessages);
+	} catch (error) {
+		console.error("Error fetching unseen messages details:", error);
 		res.status(400).json({ error: error.message });
 	}
 };

@@ -184,6 +184,16 @@ const productSchema = new mongoose.Schema(
 			type: Array,
 		},
 
+		geodata: {
+			type: Object,
+			default: {
+				length: "",
+				width: "",
+				height: "",
+				weight: "",
+			},
+		},
+
 		relatedProducts: [
 			{
 				type: ObjectId,

@@ -1,4 +1,3 @@
-// routes/supportcase.js
 const express = require("express");
 const router = express.Router();
 const supportCaseController = require("../controllers/supportcase");
@@ -29,6 +28,18 @@ router.put(
 	supportCaseController.updateSupportCase
 );
 
+// Update seenByAdmin field
+router.put(
+	"/support-cases-admin/:id/seen",
+	supportCaseController.updateSeenByAdmin
+);
+
+// Update seenByCustomer field
+router.put(
+	"/support-cases-customer/:id/seen",
+	supportCaseController.updateSeenByCustomer
+);
+
 // Delete a support case by ID
 router.delete("/support-cases/:id", supportCaseController.deleteSupportCase);
 
@@ -36,6 +47,36 @@ router.delete("/support-cases/:id", supportCaseController.deleteSupportCase);
 router.get(
 	"/support-cases/unassigned",
 	supportCaseController.getUnassignedSupportCases
+);
+
+// Get count of unassigned support cases
+router.get(
+	"/support-cases/unassigned/count",
+	supportCaseController.getUnassignedSupportCasesCount
+);
+
+// Get count of unseen messages by admin
+router.get(
+	"/support-cases/unseen/count",
+	supportCaseController.getUnseenMessagesCountByAdmin
+);
+
+// Get details of unseen messages
+router.get(
+	"/support-cases/unseen/details",
+	supportCaseController.getUnseenMessagesDetails
+);
+
+// Get count of unseen messages by customer
+router.get(
+	"/support-cases-customer/:id/unseen-count",
+	supportCaseController.getUnseenMessagesCountByCustomer
+);
+
+// Get details of unseen messages by customer
+router.get(
+	"/support-cases-customer/unseen/details",
+	supportCaseController.getUnseenMessagesDetailsByCustomer
 );
 
 module.exports = router;
