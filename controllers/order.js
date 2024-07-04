@@ -194,6 +194,8 @@ const sendOrderConfirmationSMS = async (order) => {
 		formattedPhone = `+1${formattedPhone}`;
 	}
 
+	console.log(formattedPhone, "formattedPhone");
+
 	try {
 		await orderStatusSMS.messages.create({
 			body: smsData.text,

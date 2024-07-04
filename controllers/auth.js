@@ -31,6 +31,8 @@ exports.signup = async (req, res) => {
 
 	try {
 		await user.save();
+
+		console.log(user, "user");
 		// Remove sensitive information before sending user object
 		user.salt = undefined;
 		user.hashed_password = undefined;
