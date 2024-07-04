@@ -77,28 +77,37 @@ const createPdfBuffer = (order) => {
 	return new Promise(async (resolve, reject) => {
 		const doc = new PDFDocument({ margin: 50 });
 		let buffers = [];
+		let imagePath = path.join(__dirname, "temp", "shop_logo.png");
 
 		doc.on("data", buffers.push.bind(buffers));
 		doc.on("end", () => {
 			const pdfBuffer = Buffer.concat(buffers);
 			resolve(pdfBuffer);
 
-			// Clean up the downloaded image
-			fs.unlinkSync(imagePath);
+			// Clean up the downloaded image if it exists
+			if (fs.existsSync(imagePath)) {
+				fs.unlinkSync(imagePath);
+			}
 		});
 		doc.on("error", (err) => {
+			if (fs.existsSync(imagePath)) {
+				fs.unlinkSync(imagePath);
+			}
 			reject(err);
 		});
 
 		// Ensure temp directory exists
 		ensureTempDirExists();
 
-		// Download the shop logo
-		const imagePath = path.join(__dirname, "temp", "shop_logo.png");
-		await downloadImage(shopLogo, imagePath);
-
-		// Add shop logo
-		doc.image(imagePath, 50, 45, { width: 120 }).moveDown();
+		// Try to download and add the shop logo
+		try {
+			await downloadImage(shopLogo, imagePath);
+			doc.image(imagePath, 50, 45, { width: 120 }).moveDown();
+		} catch (error) {
+			console.error("Error downloading shop logo:", error);
+			// Use a placeholder text if the download fails
+			doc.text("Shop Logo Here", 50, 45).moveDown();
+		}
 
 		// Add content to the PDF
 		doc.fontSize(25).text("Order Invoice", { align: "center" });
@@ -154,7 +163,7 @@ const createPdfBuffer = (order) => {
 const sendOrderConfirmationEmail = async (order) => {
 	try {
 		const pdfBuffer = await createPdfBuffer(order);
-		const htmlContent = await formatOrderEmail(order); // Await the result here
+		const htmlContent = await formatOrderEmail(order);
 
 		const FormSubmittionEmail = {
 			to: order.customerDetails.email || defaultEmail,
@@ -164,7 +173,7 @@ const sendOrderConfirmationEmail = async (order) => {
 				{ email: "ahmedandsally14@gmail.com" },
 			],
 			subject: `${BusinessName} - Order Confirmation`,
-			html: htmlContent, // Use the awaited html content
+			html: htmlContent,
 			attachments: [
 				{
 					content: pdfBuffer.toString("base64"),
@@ -179,7 +188,6 @@ const sendOrderConfirmationEmail = async (order) => {
 		console.log("Order confirmation email sent successfully.");
 	} catch (error) {
 		console.error("Error sending order confirmation email:", error);
-		throw error;
 	}
 };
 
@@ -398,7 +406,6 @@ const convertBigIntToString = (obj) => {
 exports.create = async (req, res) => {
 	try {
 		const { paymentToken, orderData, zipCode } = req.body;
-		// console.log("Received order data:", orderData); // Log received data
 
 		if (!orderData || !orderData.totalAmount) {
 			throw new Error("Order data or totalAmount is missing");
@@ -417,7 +424,7 @@ exports.create = async (req, res) => {
 			orderData.totalAmount,
 			paymentToken,
 			zipCode,
-			orderData.customerDetails // Pass customer details here
+			orderData.customerDetails
 		);
 
 		// Generate a unique invoice number
@@ -427,15 +434,21 @@ exports.create = async (req, res) => {
 		const order = new Order({
 			...orderData,
 			invoiceNumber,
-			paymentDetails: paymentResult, // Add payment details to order
+			paymentDetails: paymentResult,
 		});
 
 		// Save the order
 		const data = await order.save();
 
 		await updateStock(order);
-		await sendOrderConfirmationEmail(order);
-		await sendOrderConfirmationSMS(order);
+
+		// Send email and SMS, but do not block the response in case of an error
+		sendOrderConfirmationEmail(order).catch((error) => {
+			console.error("Error sending confirmation email:", error);
+		});
+		sendOrderConfirmationSMS(order).catch((error) => {
+			console.error("Error sending confirmation SMS:", error);
+		});
 
 		// Convert BigInt values to strings before sending the response
 		const responseOrder = convertBigIntToString(data.toObject());
