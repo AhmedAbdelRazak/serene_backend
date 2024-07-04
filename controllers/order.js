@@ -29,8 +29,7 @@ const squareClient = new Client({
 const BusinessName = "Serene Jannat";
 const fromEmail = "noreply@serenejannat.com";
 const defaultEmail = "ahmed.abdelrazak@infinite-apps.com";
-const shopLogo =
-	"https://res.cloudinary.com/infiniteapps/image/upload/v1715488895/serene_janat/1715488896602.png";
+const shopLogo = path.join(__dirname, "../shopLogo/logo.png");
 
 exports.orderById = async (req, res, next, id) => {
 	try {
@@ -49,63 +48,25 @@ exports.orderById = async (req, res, next, id) => {
 	}
 };
 
-// Function to ensure the temp directory exists
-const ensureTempDirExists = () => {
-	const tempDir = path.join(__dirname, "temp");
-	if (!fs.existsSync(tempDir)) {
-		fs.mkdirSync(tempDir);
-	}
-};
-
-const downloadImage = async (url, imagePath) => {
-	const writer = fs.createWriteStream(imagePath);
-	const response = await axios({
-		url,
-		method: "GET",
-		responseType: "stream",
-	});
-
-	response.data.pipe(writer);
-
-	return new Promise((resolve, reject) => {
-		writer.on("finish", resolve);
-		writer.on("error", reject);
-	});
-};
-
 const createPdfBuffer = (order) => {
 	return new Promise(async (resolve, reject) => {
 		const doc = new PDFDocument({ margin: 50 });
 		let buffers = [];
-		let imagePath = path.join(__dirname, "temp", "shop_logo.png");
 
 		doc.on("data", buffers.push.bind(buffers));
 		doc.on("end", () => {
 			const pdfBuffer = Buffer.concat(buffers);
 			resolve(pdfBuffer);
-
-			// Clean up the downloaded image if it exists
-			if (fs.existsSync(imagePath)) {
-				fs.unlinkSync(imagePath);
-			}
 		});
 		doc.on("error", (err) => {
-			if (fs.existsSync(imagePath)) {
-				fs.unlinkSync(imagePath);
-			}
 			reject(err);
 		});
 
-		// Ensure temp directory exists
-		ensureTempDirExists();
-
-		// Try to download and add the shop logo
-		try {
-			await downloadImage(shopLogo, imagePath);
-			doc.image(imagePath, 50, 45, { width: 120 }).moveDown();
-		} catch (error) {
-			console.error("Error downloading shop logo:", error);
-			// Use a placeholder text if the download fails
+		// Ensure the image path is correct and add the shop logo
+		if (fs.existsSync(shopLogo)) {
+			doc.image(shopLogo, 50, 45, { width: 120 }).moveDown();
+		} else {
+			console.error("Error: Shop logo not found.");
 			doc.text("Shop Logo Here", 50, 45).moveDown();
 		}
 
@@ -154,7 +115,11 @@ const createPdfBuffer = (order) => {
 		}
 
 		doc.moveDown();
-		doc.fontSize(16).text(`Total Amount: $${order.totalAmountAfterDiscount}`);
+		doc
+			.fontSize(16)
+			.text(
+				`Total Amount: $${Number(order.totalAmountAfterDiscount).toFixed(2)}`
+			);
 
 		doc.end();
 	});

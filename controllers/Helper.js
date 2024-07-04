@@ -5,9 +5,9 @@ const sgMail = require("@sendgrid/mail");
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 const BusinessName = "Serene Jannat";
-const BusinessWebsite = "https://serenejannat.com/";
+const BusinessWebsite = "https://serenejannat.com";
 const shopLogo =
-	"https://res.cloudinary.com/infiniteapps/image/upload/v1715488895/serene_janat/1715488896602.png";
+	"https://res.cloudinary.com/infiniteapps/image/upload/v1719198504/serene_janat/1719198503886.png";
 
 const formatOrderEmail = async (order) => {
 	const firstName = order.customerDetails.name.split(" ")[0];
@@ -189,7 +189,7 @@ const formatOrderEmail = async (order) => {
                         </table>
                         <h2>Total Amount: $${Number(
 													order.totalAmountAfterDiscount
-												)}</h2>
+												).toFixed(2)}</h2>
                     </div>
                     <div class="footer">
                         <img src="${shopLogo}" alt="Shop Logo">
