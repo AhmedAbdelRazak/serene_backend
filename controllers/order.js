@@ -130,13 +130,21 @@ const sendOrderConfirmationEmail = async (order) => {
 		const pdfBuffer = await createPdfBuffer(order);
 		const htmlContent = await formatOrderEmail(order);
 
+		const recipientEmail = order.customerDetails.email || defaultEmail;
+		const bccEmails = [
+			{ email: "ahmed.abdelrazak20@gmail.com" },
+			{ email: "ahmedandsally14@gmail.com" },
+		];
+
+		// Remove duplicates
+		const uniqueBccEmails = bccEmails.filter(
+			(bcc) => bcc.email !== recipientEmail
+		);
+
 		const FormSubmittionEmail = {
-			to: order.customerDetails.email || defaultEmail,
+			to: recipientEmail,
 			from: fromEmail,
-			bcc: [
-				{ email: "ahmed.abdelrazak20@gmail.com" },
-				{ email: "ahmedandsally14@gmail.com" },
-			],
+			bcc: uniqueBccEmails,
 			subject: `${BusinessName} - Order Confirmation`,
 			html: htmlContent,
 			attachments: [
@@ -153,13 +161,16 @@ const sendOrderConfirmationEmail = async (order) => {
 		console.log("Order confirmation email sent successfully.");
 	} catch (error) {
 		console.error("Error sending order confirmation email:", error);
+		if (error.response) {
+			console.error("SendGrid response body:", error.response.body);
+		}
 	}
 };
 
 const sendOrderConfirmationSMS = async (order) => {
 	const smsData = {
 		phone: order.customerDetails.phone,
-		text: `Hi ${order.customerDetails.name} - Your order was successfully placed. Thank you for choosing Serene Jannat for Fashion.`,
+		text: `Hi ${order.customerDetails.name} - Your order was successfully placed. Thank you for choosing Serene Jannat Gifts.`,
 	};
 
 	let formattedPhone = smsData.phone;
