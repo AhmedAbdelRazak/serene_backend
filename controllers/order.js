@@ -12,7 +12,11 @@ const moment = require("moment");
 const { Client, Environment } = require("square");
 const crypto = require("crypto");
 
-const { formatOrderEmail } = require("./Helper");
+const {
+	formatOrderEmail,
+	formatOrderEmailPOS,
+	formatPaymentLinkEmail,
+} = require("./Helper");
 
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 const orderStatusSMS = require("twilio")(
@@ -449,6 +453,117 @@ exports.readSingleOrder = async (req, res) => {
 	}
 };
 
+const createPdfBufferPOS = (order) => {
+	return new Promise(async (resolve, reject) => {
+		const doc = new PDFDocument({ margin: 50 });
+		let buffers = [];
+
+		doc.on("data", buffers.push.bind(buffers));
+		doc.on("end", () => {
+			const pdfBuffer = Buffer.concat(buffers);
+			resolve(pdfBuffer);
+		});
+		doc.on("error", (err) => {
+			reject(err);
+		});
+
+		// Ensure the image path is correct and add the shop logo
+		if (fs.existsSync(shopLogo)) {
+			doc.image(shopLogo, 50, 45, { width: 120 }).moveDown();
+		} else {
+			console.error("Error: Shop logo not found.");
+			doc.text("Shop Logo Here", 50, 45).moveDown();
+		}
+
+		// Add content to the PDF
+		doc.fontSize(25).text("Order Invoice", { align: "center" });
+		doc.moveDown();
+		doc.fontSize(16).text(`Invoice Number: ${order.invoiceNumber}`);
+		doc.text(`Customer Name: ${order.customerDetails.name}`);
+		doc.text(
+			`Order Date: ${moment(order.createdAt).format("MMMM Do YYYY, h:mm:ss a")}`
+		);
+		doc.text(`Status: ${order.status}`);
+		doc.moveDown();
+
+		doc.fontSize(20).text("Product Details:", { underline: true });
+
+		// Handle products without variables
+		order.productsNoVariable.forEach((product, index) => {
+			doc.moveDown();
+			doc.fontSize(16).text(`Product ${index + 1}`);
+			doc.fontSize(14).text(`Name: ${product.name}`);
+			doc.text(`Quantity: ${product.ordered_quantity}`);
+			doc.text(`Price: ${product.price}`);
+		});
+
+		// Handle products with variables
+		for (const item of order.chosenProductQtyWithVariables) {
+			const product = await Product.findById(item.productId);
+			if (product) {
+				const color = await Colors.findOne({
+					hexa: item.chosenAttributes.color,
+				});
+				doc.moveDown();
+				doc.fontSize(16).text(`Product: ${product.productName}`);
+				doc.text(`Color: ${color ? color.color : item.chosenAttributes.color}`);
+				doc.text(`Size: ${item.chosenAttributes.size}`);
+				doc.text(`Quantity: ${item.ordered_quantity}`);
+				doc.text(`Price: ${item.price}`);
+			}
+		}
+
+		doc.moveDown();
+		doc
+			.fontSize(16)
+			.text(`Total Amount: $${Number(order.totalAmount).toFixed(2)}`);
+
+		doc.end();
+	});
+};
+
+const sendOrderConfirmationEmailPOS = async (order) => {
+	try {
+		const pdfBuffer = await createPdfBufferPOS(order);
+		const htmlContent = await formatOrderEmailPOS(order);
+
+		const recipientEmail = order.customerDetails.email || defaultEmail;
+		const bccEmails = [
+			{ email: "ahmed.abdelrazak20@gmail.com" },
+			{ email: "ahmedandsally14@gmail.com" },
+		];
+
+		// Remove duplicates
+		const uniqueBccEmails = bccEmails.filter(
+			(bcc) => bcc.email !== recipientEmail
+		);
+
+		const FormSubmittionEmail = {
+			to: recipientEmail,
+			from: fromEmail,
+			bcc: uniqueBccEmails,
+			subject: `${BusinessName} - Order Confirmation`,
+			html: htmlContent,
+			attachments: [
+				{
+					content: pdfBuffer.toString("base64"),
+					filename: "Order_Confirmation.pdf",
+					type: "application/pdf",
+					disposition: "attachment",
+				},
+			],
+		};
+
+		await sgMail.send(FormSubmittionEmail);
+		console.log("Order confirmation email sent successfully.");
+	} catch (error) {
+		console.error("Error sending order confirmation email:", error);
+		if (error.response) {
+			console.error("SendGrid response body:", error.response.body);
+		}
+	}
+};
+
 exports.createPOS = async (req, res) => {
 	try {
 		const { orderData } = req.body;
@@ -486,7 +601,7 @@ exports.createPOS = async (req, res) => {
 
 		// Check if sendReceipt is true, then send confirmation email with PDF attached
 		if (orderData.sendReceipt) {
-			sendOrderConfirmationEmail(order).catch((error) => {
+			sendOrderConfirmationEmailPOS(order).catch((error) => {
 				console.error("Error sending confirmation email:", error);
 			});
 		}
@@ -516,11 +631,12 @@ exports.createPOS = async (req, res) => {
 						);
 					});
 			} else if (email) {
+				const htmlContent = formatPaymentLinkEmail(order, paymentLink);
 				const FormSubmittionEmail = {
 					to: email,
 					from: fromEmail,
 					subject: `${BusinessName} - Payment Link`,
-					html: `Dear ${name},<br/><br/>Please use the following link to complete your payment: <a href="${paymentLink}">${paymentLink}</a><br/><br/>Thank you for shopping with ${BusinessName}.`,
+					html: htmlContent,
 				};
 
 				sgMail
