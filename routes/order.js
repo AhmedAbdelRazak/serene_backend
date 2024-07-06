@@ -12,10 +12,16 @@ const {
 	listOfAggregatedForPagination,
 	updateSingleOrder,
 	orderSearch,
+	createPOS,
+	readSingleOrder,
+	processOrderPayment,
 } = require("../controllers/order");
 
 router.post("/order/creation/:userId", requireSignin, isAuth, create);
+router.post("/pos-order/creation/:userId", requireSignin, isAuth, createPOS);
 router.get("/order/history/:userId", requireSignin, isAuth, usersHistoryOrders);
+router.get("/read-order/:singleOrderId", readSingleOrder);
+router.post("/process-payment", processOrderPayment);
 
 router.get(
 	"/list-of-orders-aggregated/:page/:records/:startDate/:endDate/:status/:userId",

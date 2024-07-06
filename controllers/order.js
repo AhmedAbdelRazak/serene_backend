@@ -436,6 +436,155 @@ exports.create = async (req, res) => {
 	}
 };
 
+exports.readSingleOrder = async (req, res) => {
+	try {
+		const order = await Order.findById(req.params.singleOrderId).exec();
+		if (!order) {
+			return res.status(404).json({ error: "Order not found" });
+		}
+		res.json(order);
+	} catch (err) {
+		console.error("Error fetching order:", err);
+		res.status(400).json({ error: "Error fetching order" });
+	}
+};
+
+exports.createPOS = async (req, res) => {
+	try {
+		const { orderData } = req.body;
+
+		if (!orderData || !orderData.totalAmount) {
+			throw new Error("Order data or totalAmount is missing");
+		}
+
+		console.log("Order data received: ", orderData);
+
+		// Check stock availability before proceeding
+		const stockIssue = await checkStockAvailability(orderData);
+		if (stockIssue) {
+			return res.status(400).json({ error: stockIssue });
+		}
+
+		// Generate a unique invoice number
+		const invoiceNumber = await generateUniqueInvoiceNumber();
+
+		// Create the order object with the unique invoice number
+		const order = new Order({
+			...orderData,
+			invoiceNumber,
+			orderSource: "POS",
+		});
+
+		console.log("Order object before saving: ", order);
+
+		// Save the order
+		const data = await order.save();
+		console.log("Order saved successfully: ", data);
+
+		// Update stock
+		await updateStock(order);
+
+		// Check if sendReceipt is true, then send confirmation email with PDF attached
+		if (orderData.sendReceipt) {
+			sendOrderConfirmationEmail(order).catch((error) => {
+				console.error("Error sending confirmation email:", error);
+			});
+		}
+
+		// Check if sendPaymentLink is true, then send payment link
+		if (orderData.sendPaymentLink) {
+			const paymentLink = `${process.env.CLIENT_URL}/payment-link/${order._id}`;
+			const { email, phone, name } = order.customerDetails;
+
+			if (phone) {
+				const formattedPhone = phone.startsWith("+1") ? phone : `+1${phone}`;
+				const smsData = {
+					body: `Dear ${name}, please use the following link to complete your payment: ${paymentLink}`,
+					from: "+19094884148",
+					to: formattedPhone,
+				};
+
+				orderStatusSMS.messages
+					.create(smsData)
+					.then(() => {
+						console.log(`Payment link SMS sent to ${formattedPhone}`);
+					})
+					.catch((err) => {
+						console.error(
+							`Error sending payment link SMS to ${formattedPhone}:`,
+							err
+						);
+					});
+			} else if (email) {
+				const FormSubmittionEmail = {
+					to: email,
+					from: fromEmail,
+					subject: `${BusinessName} - Payment Link`,
+					html: `Dear ${name},<br/><br/>Please use the following link to complete your payment: <a href="${paymentLink}">${paymentLink}</a><br/><br/>Thank you for shopping with ${BusinessName}.`,
+				};
+
+				sgMail
+					.send(FormSubmittionEmail)
+					.then(() => {
+						console.log("Payment link email sent successfully.");
+					})
+					.catch((error) => {
+						console.error("Error sending payment link email:", error);
+						if (error.response) {
+							console.error("SendGrid response body:", error.response.body);
+						}
+					});
+			} else {
+				console.log("No phone or email provided for sending payment link.");
+			}
+		}
+
+		// Convert BigInt values to strings before sending the response
+		const responseOrder = convertBigIntToString(data.toObject());
+
+		res.json(responseOrder);
+	} catch (error) {
+		console.error("Error creating POS order:", error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
+exports.processOrderPayment = async (req, res) => {
+	const { orderId, token, zipCode } = req.body;
+
+	try {
+		const order = await Order.findById(orderId).exec();
+		if (!order) {
+			return res.status(404).json({ error: "Order not found" });
+		}
+
+		// Process payment
+		const paymentResult = await processSquarePayment(
+			order.totalAmount,
+			token,
+			zipCode,
+			order.customerDetails
+		);
+
+		// Update order status
+		order.paymentStatus = "Paid Via Link";
+		order.paymentDetails = paymentResult;
+		await order.save();
+
+		// Convert BigInt values to strings before emitting the event
+		const sanitizedOrder = convertBigIntToString(order.toObject());
+
+		// Emit WebSocket event for order update
+		const io = req.app.get("io");
+		io.emit("orderUpdated", sanitizedOrder);
+
+		res.json(sanitizedOrder);
+	} catch (error) {
+		console.error("Error processing order payment:", error);
+		res.status(400).json({ error: "Payment processing failed" });
+	}
+};
+
 exports.usersHistoryOrders = async (req, res) => {
 	try {
 		const { userId } = req.params;
