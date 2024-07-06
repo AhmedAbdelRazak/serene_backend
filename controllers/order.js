@@ -358,10 +358,13 @@ const processSquarePayment = async (
 		},
 	};
 
+	console.log("Square Request Body:", requestBody);
+
 	try {
 		const response = await squareClient.paymentsApi.createPayment(requestBody);
 		return response.result;
 	} catch (error) {
+		console.log(error.message, "Square error.message");
 		throw new Error(error.message);
 	}
 };
