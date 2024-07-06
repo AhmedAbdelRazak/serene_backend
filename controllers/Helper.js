@@ -368,7 +368,7 @@ const formatOrderEmailPOS = async (order) => {
 							${productRowsWithVariables}
 						</tbody>
 					</table>
-					<h2>Total Amount: $${Number(order.totalAmount).toFixed(2)}</h2>
+					<h2>Total Amount: $${Number(order.totalAmountAfterDiscount).toFixed(2)}</h2>
 				</div>
 				<div class="footer">
 					<img src="${shopLogo}" alt="Shop Logo">
@@ -549,7 +549,7 @@ const formatPaymentLinkEmail = (order, paymentLink) => {
 						</table>`
 							: ""
 					}
-					<h2>Total Amount: $${Number(order.totalAmount).toFixed(2)}</h2>
+					<h2>Total Amount: $${Number(order.totalAmountAfterDiscount).toFixed(2)}</h2>
 				</div>
 				<div class="footer">
 					<img src="${shopLogo}" alt="Shop Logo">

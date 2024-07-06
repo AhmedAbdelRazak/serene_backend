@@ -676,7 +676,7 @@ exports.processOrderPayment = async (req, res) => {
 
 		// Process payment
 		const paymentResult = await processSquarePayment(
-			order.totalAmount,
+			order.totalAmountAfterDiscount,
 			token,
 			zipCode,
 			order.customerDetails
