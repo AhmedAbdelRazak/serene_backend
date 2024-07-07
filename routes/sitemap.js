@@ -12,7 +12,9 @@ router.get("/generate-sitemap", async (req, res) => {
 	let links = [];
 
 	// Fetch data from MongoDB
-	const products = await Product.find().populate("category");
+	const products = await Product.find({ activeProduct: true }).populate(
+		"category"
+	);
 
 	// Get current date
 	const currentDate = new Date().toISOString();
