@@ -66,6 +66,10 @@ const OrderSchema = new mongoose.Schema(
 			default: {},
 		},
 		forAI: {},
+		privacyPolicyAgreement: {
+			type: Boolean,
+			default: false,
+		},
 	},
 	{ timestamps: true }
 );
