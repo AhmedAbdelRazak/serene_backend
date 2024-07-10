@@ -391,7 +391,6 @@ exports.gettingSpecificSetOfProducts = (req, res, next) => {
 	const { featured, newArrivals, sortByRate, offers, records } = req.params;
 
 	let query = { activeProduct: true };
-	let sort = {};
 	let pipeline = [];
 
 	// For featured products
@@ -399,9 +398,10 @@ exports.gettingSpecificSetOfProducts = (req, res, next) => {
 		query.featuredProduct = true;
 	}
 
-	// For new arrivals
+	// For new arrivals, no need to modify the query, we'll handle sorting later
 	if (newArrivals === "1") {
-		sort.createdAt = -1; // Sort by created date descending
+		// If newArrivals is requested, it will be handled in the sorting stage
+		pipeline.push({ $sort: { createdAt: -1 } });
 	}
 
 	// Handle sorting by rating
@@ -421,18 +421,8 @@ exports.gettingSpecificSetOfProducts = (req, res, next) => {
 		];
 	}
 
-	// Adding common elements to the pipeline
-	if (!sortByRate || (sortByRate === "1" && pipeline.length === 0)) {
-		pipeline.push({ $match: query });
-		if (Object.keys(sort).length) {
-			pipeline.push({ $sort: sort });
-		}
-	}
-
-	// Limit records if not sorting by rate or if no specific sorting applied
-	if (records && (!sortByRate || pipeline.length === 0)) {
-		pipeline.push({ $limit: parseInt(records) });
-	}
+	// Add the match stage
+	pipeline.push({ $match: query });
 
 	// Add the lookup stage to populate the category
 	pipeline.push({
@@ -446,6 +436,11 @@ exports.gettingSpecificSetOfProducts = (req, res, next) => {
 
 	// Unwind the category array
 	pipeline.push({ $unwind: "$category" });
+
+	// Limit the number of records if specified
+	if (records) {
+		pipeline.push({ $limit: parseInt(records) });
+	}
 
 	// Execute the aggregation pipeline
 	Product.aggregate(pipeline)

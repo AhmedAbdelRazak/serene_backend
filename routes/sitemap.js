@@ -53,9 +53,30 @@ router.get("/generate-sitemap", async (req, res) => {
 
 	// Generate product URLs
 	for (let product of products) {
+		if (product.category && product.category.categoryStatus) {
+			links.push({
+				url: `/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`,
+				lastmod: product.updatedAt.toISOString(),
+				changefreq: "weekly",
+				priority: 0.8,
+			});
+		}
+	}
+
+	// Generate category filter URLs based on product categories
+	const categoryUrls = new Set();
+	for (let product of products) {
+		if (product.category && product.category.categoryStatus) {
+			categoryUrls.add(
+				`/our-products?category=${product.category.categorySlug}`
+			);
+		}
+	}
+
+	for (let url of categoryUrls) {
 		links.push({
-			url: `/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`,
-			lastmod: product.updatedAt.toISOString(),
+			url,
+			lastmod: currentDate,
 			changefreq: "weekly",
 			priority: 0.8,
 		});
