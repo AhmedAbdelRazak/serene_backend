@@ -823,6 +823,9 @@ exports.filteredProducts = async (req, res, next) => {
 					product.productAttributes &&
 					product.productAttributes.length > 0
 				) {
+					// Store all attributes
+					const overallProductAttributes = [...product.productAttributes];
+
 					// Filter product attributes by color and size if provided
 					const filteredAttributes = product.productAttributes.filter(
 						(attr) => {
@@ -846,6 +849,7 @@ exports.filteredProducts = async (req, res, next) => {
 						const newProduct = {
 							...product,
 							productAttributes: filteredAttributes,
+							overallProductAttributes, // Add overall attributes to the product object
 						};
 						finalProducts.push(newProduct);
 					}
@@ -856,17 +860,18 @@ exports.filteredProducts = async (req, res, next) => {
 			})
 			.flat();
 
-		// Process and separate products with and without variables
 		processedProducts.forEach((product) => {
 			if (product) {
 				if (product.addVariables) {
 					// For products with variables, consider the attribute logic
+					const overallProductAttributes = [...product.productAttributes]; // Store all attributes
 					product.productAttributes.forEach((attr) => {
 						const key = `${product._id}-${attr.color}-${attr.size}`;
 						if (!uniqueProductsMap[key]) {
 							uniqueProductsMap[key] = {
 								...product,
 								productAttributes: [attr],
+								overallProductAttributes, // Add overall attributes to the product object
 							};
 							finalProducts.push(uniqueProductsMap[key]);
 						}
