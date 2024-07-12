@@ -13,10 +13,10 @@ const productSchema = new mongoose.Schema(
 			text: true,
 			lowercase: true,
 		},
+
 		productName_Arabic: {
 			type: String,
 			trim: true,
-			required: true,
 			maxlength: 200,
 			text: true,
 			lowercase: true,
@@ -46,7 +46,6 @@ const productSchema = new mongoose.Schema(
 			unique: true,
 			lowercase: true,
 			index: true,
-			required: true,
 		},
 		description: {
 			type: String,
@@ -55,7 +54,6 @@ const productSchema = new mongoose.Schema(
 		},
 		description_Arabic: {
 			type: String,
-			required: true,
 			maxlength: 2000,
 			text: true,
 		},
@@ -160,7 +158,6 @@ const productSchema = new mongoose.Schema(
 		gender: {
 			type: ObjectId,
 			ref: "Gender",
-			required: true,
 			default: null,
 		},
 		addedByEmployee: {
@@ -174,6 +171,11 @@ const productSchema = new mongoose.Schema(
 			default: null,
 		},
 		quantity: Number,
+
+		scent: {
+			type: String,
+			default: "",
+		},
 
 		sold: {
 			type: Number,
@@ -291,6 +293,19 @@ const productSchema = new mongoose.Schema(
 		sizeChart: {
 			type: Object,
 			default: {},
+		},
+
+		isPrintifyProduct: {
+			type: Boolean,
+			default: false, //Here it should be true if it's a printify
+		},
+
+		printifyProductDetails: {
+			type: Object,
+			default: {
+				//it should here contain relevant parts of the printifyProduct object
+				//It should contain the likes of the price, description and images and other relevant product
+			},
 		},
 
 		likes: [{ type: ObjectId, ref: "User" }],

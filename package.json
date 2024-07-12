@@ -33,6 +33,7 @@
 		"puppeteer": "^22.9.0",
 		"querystring": "^0.2.1",
 		"sitemap": "^8.0.0",
+		"slugify": "^1.6.6",
 		"socket.io": "^4.7.5",
 		"square": "^37.0.0",
 		"square-connect": "^6.20201216.0",
