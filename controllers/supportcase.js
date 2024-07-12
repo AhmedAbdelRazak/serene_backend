@@ -207,8 +207,8 @@ exports.createNewSupportCase = async (req, res) => {
 			await orderStatusSMS.messages.create({
 				body: smsText,
 				from: fromPhoneNumber,
-				to: adminPhoneNumber2,
-				// to: adminPhoneNumber,
+				// to: adminPhoneNumber2,
+				to: adminPhoneNumber,
 			});
 			console.log(`SMS sent to ${adminPhoneNumber}`);
 		} catch (smsError) {
