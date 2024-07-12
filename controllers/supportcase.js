@@ -1,5 +1,12 @@
 const SupportCase = require("../models/supportcase");
 
+const twilio = require("twilio");
+
+const orderStatusSMS = twilio(
+	process.env.TWILIO_ACCOUNT_SID,
+	process.env.TWILIO_AUTH_TOKEN
+);
+
 // Create a new support case
 exports.createSupportCase = async (req, res) => {
 	try {
@@ -169,7 +176,7 @@ exports.createNewSupportCase = async (req, res) => {
 		console.log("Received Payload:", req.body); // Add this line
 
 		// Validate the required fields
-		if (!customerName || !customerEmail || !inquiryAbout || !inquiryDetails) {
+		if (!customerName || !inquiryAbout || !inquiryDetails) {
 			return res.status(400).json({ error: "All fields are required" });
 		}
 
@@ -188,6 +195,25 @@ exports.createNewSupportCase = async (req, res) => {
 
 		// Emit new chat event
 		req.io.emit("newChat", newCase);
+
+		// Send SMS notification to admin
+		const adminPhoneNumber = "+19515657568";
+		const adminPhoneNumber2 = "+19512591528";
+		const fromPhoneNumber = "+19094884148";
+		const smsText =
+			"Hi Sally, Please login to your admin dashboard, there's a client needs help.";
+
+		try {
+			await orderStatusSMS.messages.create({
+				body: smsText,
+				from: fromPhoneNumber,
+				to: adminPhoneNumber2,
+				// to: adminPhoneNumber,
+			});
+			console.log(`SMS sent to ${adminPhoneNumber}`);
+		} catch (smsError) {
+			console.error(`Error sending SMS to ${adminPhoneNumber}:`, smsError);
+		}
 
 		res.status(201).json(newCase);
 	} catch (error) {
