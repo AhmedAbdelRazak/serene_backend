@@ -199,7 +199,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 					) {
 						// Handle candles with variables as separate products
 						if (addVariables) {
-							for (const variant of printifyProduct.variants.slice(0, 30)) {
+							for (const variant of printifyProduct.variants) {
+								if (!variant.is_enabled) continue;
+
 								// Extract scent if available
 								const scentOption = printifyProduct.options.find(
 									(option) => option.type === "scent"
@@ -213,6 +215,10 @@ exports.syncPrintifyProducts = async (req, res) => {
 										  ).title
 										: null
 									: null;
+
+								const variantImages = printifyProduct.images
+									.filter((image) => image.variant_ids.includes(variant.id))
+									.slice(0, 5);
 
 								const productData = {
 									productName: `${printifyProduct.title} - ${variant.title}`,
@@ -233,20 +239,14 @@ exports.syncPrintifyProducts = async (req, res) => {
 									),
 									gender: "6635ab22898104005c96250a",
 									chosenSeason: "all",
-									thumbnailImage: printifyProduct.images
-										.slice(0, 5)
-										.sort(() => 0.5 - Math.random()) // Shuffle images
-										.map((image) => ({
-											public_id: image.variant_ids.join("_"),
-											url: image.src,
-											images: printifyProduct.images
-												.slice(0, 5)
-												.sort(() => 0.5 - Math.random())
-												.map((img) => ({
-													public_id: img.variant_ids.join("_"),
-													url: img.src,
-												})),
+									thumbnailImage: variantImages.map((image) => ({
+										public_id: image.variant_ids.join("_"),
+										url: image.src,
+										images: variantImages.map((img) => ({
+											public_id: img.variant_ids.join("_"),
+											url: img.src,
 										})),
+									})),
 									isPrintifyProduct: true,
 									addVariables: false,
 									printifyProductDetails: {
@@ -460,7 +460,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 								description: printifyProduct.description,
 								tags: printifyProduct.tags,
 								options: printifyProduct.options,
-								variants: printifyProduct.variants,
+								variants: printifyProduct.variants.filter(
+									(variant) => variant.is_enabled
+								),
 								images: printifyProduct.images,
 								created_at: printifyProduct.created_at,
 								updated_at: printifyProduct.updated_at,
@@ -484,55 +486,61 @@ exports.syncPrintifyProducts = async (req, res) => {
 									printifyProduct.is_economy_shipping_enabled,
 							},
 							productAttributes: addVariables
-								? printifyProduct.variants.slice(0, 30).map((variant) => {
-										const sizeOption = printifyProduct.options.find(
-											(option) => option.type === "size"
-										);
-										const scentOption = printifyProduct.options.find(
-											(option) => option.type === "scent"
-										);
+								? printifyProduct.variants
+										.filter((variant) => variant.is_enabled)
+										.slice(0, 30)
+										.map((variant) => {
+											const sizeOption = printifyProduct.options.find(
+												(option) => option.type === "size"
+											);
+											const scentOption = printifyProduct.options.find(
+												(option) => option.type === "scent"
+											);
 
-										return {
-											PK: `${variant.options.join("#")}`,
-											color: closestColor.hexa,
-											size: sizeOption
-												? sizeOption.values.find(
-														(value) => value.id === variant.options[1]
-												  )
+											const variantImages = printifyProduct.images
+												.filter((image) =>
+													image.variant_ids.includes(variant.id)
+												)
+												.slice(0, 5);
+
+											return {
+												PK: `${variant.options.join("#")}`,
+												color: closestColor.hexa,
+												size: sizeOption
 													? sizeOption.values.find(
 															(value) => value.id === variant.options[1]
-													  ).title
-													: null
-												: null,
-											scent: scentOption
-												? scentOption.values.find(
-														(value) => value.id === variant.options[0]
-												  )
+													  )
+														? sizeOption.values.find(
+																(value) => value.id === variant.options[1]
+														  ).title
+														: null
+													: null,
+												scent: scentOption
 													? scentOption.values.find(
 															(value) => value.id === variant.options[0]
-													  ).title
-													: null
-												: null,
-											SubSKU: variant.sku,
-											quantity: 10,
-											price: variant.price / 100,
-											priceAfterDiscount: variant.price / 100,
-											MSRP: Number((variant.price / 100) * 1.75).toFixed(2),
-											WholeSalePrice: Number(
-												(variant.price / 100) * 0.75
-											).toFixed(2), // Assuming a wholesale price calculation
-											DropShippingPrice: Number(
-												(variant.price / 100) * 0.85
-											).toFixed(2), // Assuming a dropshipping price calculation
-											productImages: printifyProduct.images
-												.slice(0, 5)
-												.sort(() => 0.5 - Math.random()) // Shuffle images
-												.map((image) => ({
+													  )
+														? scentOption.values.find(
+																(value) => value.id === variant.options[0]
+														  ).title
+														: null
+													: null,
+												SubSKU: variant.sku,
+												quantity: 10,
+												price: variant.price / 100,
+												priceAfterDiscount: variant.price / 100,
+												MSRP: Number((variant.price / 100) * 1.75).toFixed(2),
+												WholeSalePrice: Number(
+													(variant.price / 100) * 0.75
+												).toFixed(2), // Assuming a wholesale price calculation
+												DropShippingPrice: Number(
+													(variant.price / 100) * 0.85
+												).toFixed(2), // Assuming a dropshipping price calculation
+												productImages: variantImages.map((image) => ({
 													public_id: image.variant_ids.join("_"),
 													url: image.src,
 												})),
-										};
-								  })
+											};
+										})
 								: [],
 						};
 
