@@ -239,7 +239,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 									),
 									gender: "6635ab22898104005c96250a",
 									chosenSeason: "all",
-									thumbnailImage: variantImages.map((image) => ({
+									thumbnailImage: variantImages.slice(0, 1).map((image) => ({
 										public_id: image.variant_ids.join("_"),
 										url: image.src,
 										images: variantImages.map((img) => ({
@@ -412,15 +412,6 @@ exports.syncPrintifyProducts = async (req, res) => {
 							colorValue = colorMatch ? colorMatch.title : null;
 						}
 
-						const closestColor = colorValue
-							? getClosestColor(colorValue, colors)
-							: null;
-
-						if (!closestColor) {
-							failedProducts.push(printifyProduct.title);
-							continue; // Skip this product if no matching color is found
-						}
-
 						const productData = {
 							productName: printifyProduct.title,
 							description: printifyProduct.description,
@@ -438,20 +429,17 @@ exports.syncPrintifyProducts = async (req, res) => {
 							), // Assign matching subcategory IDs
 							gender: "6635ab22898104005c96250a",
 							chosenSeason: "all",
-							thumbnailImage: printifyProduct.images
-								.slice(0, 5)
-								.sort(() => 0.5 - Math.random()) // Shuffle images
-								.map((image) => ({
-									public_id: image.variant_ids.join("_"),
-									url: image.src,
+							thumbnailImage: [
+								{
 									images: printifyProduct.images
 										.slice(0, 5)
-										.sort(() => 0.5 - Math.random())
-										.map((img) => ({
-											public_id: img.variant_ids.join("_"),
-											url: img.src,
+										.sort(() => 0.5 - Math.random()) // Shuffle images
+										.map((image) => ({
+											public_id: image.variant_ids.join("_"),
+											url: image.src,
 										})),
-								})),
+								},
+							],
 							isPrintifyProduct: true,
 							addVariables: addVariables,
 							printifyProductDetails: {
@@ -493,6 +481,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 											const sizeOption = printifyProduct.options.find(
 												(option) => option.type === "size"
 											);
+											const colorOption = printifyProduct.options.find(
+												(option) => option.type === "color"
+											);
 											const scentOption = printifyProduct.options.find(
 												(option) => option.type === "scent"
 											);
@@ -503,9 +494,17 @@ exports.syncPrintifyProducts = async (req, res) => {
 												)
 												.slice(0, 5);
 
+											const colorMatch = colorOption
+												? colorOption.values.find(
+														(value) => value.id === variant.options[0]
+												  )
+												: null;
+
+											const colorHex = colorMatch ? colorMatch.colors[0] : null;
+
 											return {
 												PK: `${variant.options.join("#")}`,
-												color: closestColor.hexa,
+												color: colorHex,
 												size: sizeOption
 													? sizeOption.values.find(
 															(value) => value.id === variant.options[1]
