@@ -386,6 +386,86 @@ const convertBigIntToString = (obj) => {
 	return obj;
 };
 
+const postOrderToPrintify = async (order) => {
+	const headers = {
+		Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+		"Content-Type": "application/json",
+	};
+
+	const products = [
+		...order.productsNoVariable,
+		...order.chosenProductQtyWithVariables,
+	];
+
+	for (const product of products) {
+		if (product.isPrintifyProduct) {
+			let variantId;
+			if (product.chosenAttributes && product.chosenAttributes.SubSKU) {
+				const matchedVariant = product.printifyProductDetails.variants.find(
+					(variant) => variant.sku === product.chosenAttributes.SubSKU
+				);
+				variantId = matchedVariant
+					? matchedVariant.id
+					: product.printifyProductDetails.variants[0].id;
+			} else {
+				variantId = product.printifyProductDetails.variants[0].id;
+			}
+
+			const printifyOrder = {
+				line_items: [
+					{
+						product_id: product.printifyProductDetails.id,
+						variant_id: variantId,
+						quantity: product.ordered_quantity,
+						print_provider_id: product.printifyProductDetails.print_provider_id,
+						blueprint_id: product.printifyProductDetails.blueprint_id,
+					},
+				],
+				address_to: {
+					first_name: order.customerDetails.name.split(" ")[0],
+					last_name: order.customerDetails.name.split(" ").slice(1).join(" "),
+					email: order.customerDetails.email,
+					phone: order.customerDetails.phone,
+					country: "US", // Change as needed
+					region: order.customerDetails.state,
+					city: order.customerDetails.city,
+					address1: order.customerDetails.address,
+					postal_code: order.customerDetails.zipcode,
+				},
+			};
+
+			console.log(
+				"Sending the following order to Printify:",
+				JSON.stringify(printifyOrder, null, 2)
+			);
+
+			try {
+				const response = await axios.post(
+					`https://api.printify.com/v1/shops/${product.printifyProductDetails.shop_id}/orders.json`,
+					printifyOrder,
+					{ headers }
+				);
+
+				console.log(`Order posted to Printify: ${response.data.id}`);
+
+				// Save the Printify order details to the MongoDB Order document
+				await Order.findByIdAndUpdate(order._id, {
+					$set: {
+						printifyOrderDetails: response.data,
+					},
+				});
+
+				console.log(`Printify order details saved for order: ${order._id}`);
+			} catch (error) {
+				console.error(`Error posting order to Printify: ${error.message}`);
+				if (error.response) {
+					console.error("Printify API response:", error.response.data);
+				}
+			}
+		}
+	}
+};
+
 exports.create = async (req, res) => {
 	try {
 		const { paymentToken, orderData, zipCode } = req.body;
@@ -424,6 +504,9 @@ exports.create = async (req, res) => {
 		const data = await order.save();
 
 		await updateStock(order);
+
+		// Post order to Printify
+		await postOrderToPrintify(order);
 
 		// Send email and SMS, but do not block the response in case of an error
 		sendOrderConfirmationEmail(order).catch((error) => {

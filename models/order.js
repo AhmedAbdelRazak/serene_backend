@@ -49,6 +49,12 @@ const OrderSchema = new mongoose.Schema(
 		shippingFees: Number,
 		appliedShippingFees: Number,
 		totalAmountAfterExchange: Number,
+
+		printifyOrderDetails: {
+			type: Object,
+			default: {},
+		},
+
 		returnedItems: {
 			type: Array,
 			default: [],

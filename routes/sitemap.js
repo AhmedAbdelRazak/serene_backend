@@ -23,6 +23,12 @@ router.get("/generate-sitemap", async (req, res) => {
 	const staticLinks = [
 		{ url: "/", lastmod: currentDate, changefreq: "weekly", priority: 0.8 },
 		{
+			url: "/our-products?offers=jannatoffers",
+			lastmod: currentDate,
+			changefreq: "weekly",
+			priority: 0.8,
+		},
+		{
 			url: "/about",
 			lastmod: currentDate,
 			changefreq: "yearly",
@@ -46,6 +52,13 @@ router.get("/generate-sitemap", async (req, res) => {
 			changefreq: "weekly",
 			priority: 0.8,
 		},
+		{
+			url: "/our-products?offers=jannatoffers",
+			lastmod: currentDate,
+			changefreq: "weekly",
+			priority: 0.8,
+		},
+
 		// Add other static links as necessary
 	];
 

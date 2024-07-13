@@ -513,7 +513,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 												: null,
 											SubSKU: variant.sku,
 											quantity: 10,
-											price: (variant.price / 100) * 1.75,
+											price: (variant.price / 100) * 1.5,
 											priceAfterDiscount: variant.price / 100,
 											MSRP: Number((variant.price / 100) * 0.75).toFixed(2),
 											WholeSalePrice: Number(
