@@ -77,6 +77,8 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 	}
 };
 
+const sizeOrder = ["S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL"];
+
 exports.syncPrintifyProducts = async (req, res) => {
 	try {
 		// Fetch all categories and subcategories sorted by createdAt in descending order
@@ -153,13 +155,13 @@ exports.syncPrintifyProducts = async (req, res) => {
 					const addVariables =
 						printifyProduct.options && printifyProduct.options.length > 0;
 
+					// Handle candles with variables as separate products
 					if (
 						printifyProduct.title.toLowerCase().includes("candle") ||
 						printifyProduct.tags.some((tag) =>
 							tag.toLowerCase().includes("candles")
 						)
 					) {
-						// Handle candles with variables as separate products
 						if (addVariables) {
 							for (const variant of printifyProduct.variants) {
 								if (!variant.is_enabled) continue;
@@ -178,16 +180,16 @@ exports.syncPrintifyProducts = async (req, res) => {
 										: null
 									: null;
 
-								const variantImages = printifyProduct.images
-									.filter((image) => image.variant_ids.includes(variant.id))
-									.slice(0, 5);
+								const variantImages = printifyProduct.images.filter((image) =>
+									image.variant_ids.includes(variant.id)
+								);
 
 								const productData = {
 									productName: `${printifyProduct.title} - ${variant.title}`,
 									description: printifyProduct.description,
-									price: variant.price / 100,
+									price: (variant.price / 100) * 1.75,
 									priceAfterDiscount: variant.price / 100,
-									MSRPPriceBasic: Number((variant.price / 100) * 1.75).toFixed(
+									MSRPPriceBasic: Number((variant.price / 100) * 0.75).toFixed(
 										2
 									),
 									quantity: 10,
@@ -274,10 +276,10 @@ exports.syncPrintifyProducts = async (req, res) => {
 							const productData = {
 								productName: printifyProduct.title,
 								description: printifyProduct.description,
-								price: printifyProduct.variants[0].price / 100,
+								price: (printifyProduct.variants[0].price / 100) * 1.75,
 								priceAfterDiscount: printifyProduct.variants[0].price / 100,
 								MSRPPriceBasic: Number(
-									(printifyProduct.variants[0].price / 100) * 1.75
+									(printifyProduct.variants[0].price / 100) * 0.75
 								).toFixed(2),
 								quantity: 10,
 								slug: productSlug,
@@ -378,13 +380,30 @@ exports.syncPrintifyProducts = async (req, res) => {
 							continue; // Skip this product if no matching color is found
 						}
 
+						// Sorting sizes based on the defined order
+						const sortedVariants = printifyProduct.variants
+							.filter((variant) => variant.is_enabled)
+							.sort((a, b) => {
+								const sizeA = sizeOrder.indexOf(
+									printifyProduct.options
+										.find((option) => option.type === "size")
+										.values.find((value) => value.id === a.options[1]).title
+								);
+								const sizeB = sizeOrder.indexOf(
+									printifyProduct.options
+										.find((option) => option.type === "size")
+										.values.find((value) => value.id === b.options[1]).title
+								);
+								return sizeA - sizeB;
+							});
+
 						const productData = {
 							productName: printifyProduct.title,
 							description: printifyProduct.description,
-							price: printifyProduct.variants[0].price / 100,
-							priceAfterDiscount: printifyProduct.variants[0].price / 100,
+							price: (sortedVariants[0].price / 100) * 1.75,
+							priceAfterDiscount: sortedVariants[0].price / 100,
 							MSRPPriceBasic: Number(
-								(printifyProduct.variants[0].price / 100) * 1.75
+								(sortedVariants[0].price / 100) * 0.75
 							).toFixed(2),
 							quantity: 10,
 							slug: productSlug,
@@ -421,9 +440,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 								description: printifyProduct.description,
 								tags: printifyProduct.tags,
 								options: printifyProduct.options,
-								variants: printifyProduct.variants.filter(
-									(variant) => variant.is_enabled
-								),
+								variants: sortedVariants,
 								images: printifyProduct.images,
 								created_at: printifyProduct.created_at,
 								updated_at: printifyProduct.updated_at,
@@ -447,75 +464,70 @@ exports.syncPrintifyProducts = async (req, res) => {
 									printifyProduct.is_economy_shipping_enabled,
 							},
 							productAttributes: addVariables
-								? printifyProduct.variants
-										.filter((variant) => variant.is_enabled)
-										.slice(0, 30)
-										.map((variant) => {
-											const sizeOption = printifyProduct.options.find(
-												(option) => option.type === "size"
-											);
-											const scentOption = printifyProduct.options.find(
-												(option) => option.type === "scent"
-											);
+								? sortedVariants.map((variant) => {
+										const sizeOption = printifyProduct.options.find(
+											(option) => option.type === "size"
+										);
+										const scentOption = printifyProduct.options.find(
+											(option) => option.type === "scent"
+										);
 
-											const variantImages = printifyProduct.images
-												.filter((image) =>
-													image.variant_ids.includes(variant.id)
-												)
-												.slice(0, 5);
+										const variantImages = printifyProduct.images
+											.filter((image) => image.variant_ids.includes(variant.id))
+											.slice(0, 8); // Limit to 8 images
 
-											const color = printifyProduct.options.find(
-												(option) => option.type === "color"
-											);
+										const color = printifyProduct.options.find(
+											(option) => option.type === "color"
+										);
 
-											const colorValue = color
+										const colorValue = color
+											? color.values.find(
+													(value) => value.id === variant.options[0]
+											  )
 												? color.values.find(
 														(value) => value.id === variant.options[0]
-												  )
-													? color.values.find(
-															(value) => value.id === variant.options[0]
-													  ).colors[0]
-													: null
-												: null;
+												  ).colors[0]
+												: null
+											: null;
 
-											return {
-												PK: `${variant.options.join("#")}`,
-												color: colorValue,
-												size: sizeOption
+										return {
+											PK: `${variant.options.join("#")}`,
+											color: colorValue,
+											size: sizeOption
+												? sizeOption.values.find(
+														(value) => value.id === variant.options[1]
+												  )
 													? sizeOption.values.find(
 															(value) => value.id === variant.options[1]
-													  )
-														? sizeOption.values.find(
-																(value) => value.id === variant.options[1]
-														  ).title
-														: null
-													: null,
-												scent: scentOption
+													  ).title
+													: null
+												: null,
+											scent: scentOption
+												? scentOption.values.find(
+														(value) => value.id === variant.options[0]
+												  )
 													? scentOption.values.find(
 															(value) => value.id === variant.options[0]
-													  )
-														? scentOption.values.find(
-																(value) => value.id === variant.options[0]
-														  ).title
-														: null
-													: null,
-												SubSKU: variant.sku,
-												quantity: 10,
-												price: variant.price / 100,
-												priceAfterDiscount: variant.price / 100,
-												MSRP: Number((variant.price / 100) * 1.75).toFixed(2),
-												WholeSalePrice: Number(
-													(variant.price / 100) * 0.75
-												).toFixed(2), // Assuming a wholesale price calculation
-												DropShippingPrice: Number(
-													(variant.price / 100) * 0.85
-												).toFixed(2), // Assuming a dropshipping price calculation
-												productImages: variantImages.map((image) => ({
-													public_id: image.variant_ids.join("_"),
-													url: image.src,
-												})),
-											};
-										})
+													  ).title
+													: null
+												: null,
+											SubSKU: variant.sku,
+											quantity: 10,
+											price: (variant.price / 100) * 1.75,
+											priceAfterDiscount: variant.price / 100,
+											MSRP: Number((variant.price / 100) * 0.75).toFixed(2),
+											WholeSalePrice: Number(
+												(variant.price / 100) * 0.75
+											).toFixed(2), // Assuming a wholesale price calculation
+											DropShippingPrice: Number(
+												(variant.price / 100) * 0.85
+											).toFixed(2), // Assuming a dropshipping price calculation
+											productImages: variantImages.map((image) => ({
+												public_id: image.variant_ids.join("_"),
+												url: image.src,
+											})),
+										};
+								  })
 								: [],
 						};
 

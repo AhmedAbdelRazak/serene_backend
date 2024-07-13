@@ -602,63 +602,91 @@ exports.getDistinctCategoriesActiveProducts = (req, res, next) => {
 
 exports.filteredProducts = async (req, res, next) => {
 	const { page, records, filters } = req.params;
-	let { color, priceMin, priceMax, category, size, gender, searchTerm } =
-		querystring.parse(filters);
+	let {
+		color,
+		priceMin,
+		priceMax,
+		category,
+		size,
+		gender,
+		searchTerm,
+		offers,
+	} = querystring.parse(filters);
+
+	console.log(offers, "offersoffersoffers");
 
 	// Decode the color parameter
 	color = querystring.unescape(color);
 
 	let query = { activeProduct: true };
 
-	// Filter by color
-	if (color) {
-		console.log(`Filtering by color: ${color}`);
-		query.$or = [{ color: color }, { "productAttributes.color": color }];
-	}
-
-	// Filter by price range
-	if (priceMin && priceMax) {
-		console.log(`Filtering by price range: ${priceMin} - ${priceMax}`);
-		query.priceAfterDiscount = {
-			$gte: Number(priceMin),
-			$lte: Number(priceMax),
-		};
-	} else if (priceMin) {
-		console.log(`Filtering by minimum price: ${priceMin}`);
-		query.priceAfterDiscount = { $gte: Number(priceMin) };
-	} else if (priceMax) {
-		console.log(`Filtering by maximum price: ${priceMax}`);
-		query.priceAfterDiscount = { $lte: Number(priceMax) };
-	}
-
-	// Filter by category
-	if (category) {
-		console.log(`Filtering by category: ${category}`);
-		query.category = new mongoose.Types.ObjectId(category);
+	if (offers === "jannatoffers") {
+		console.log("Jannat Offers Was Triggered");
+		// query.category.categoryStatus = true;
+		query.$or = [
+			{
+				$expr: { $lt: ["$priceAfterDiscount", "$price"] },
+			},
+			{
+				$expr: {
+					$lt: [
+						"$productAttributes.priceAfterDiscount",
+						"$productAttributes.price",
+					],
+				},
+			},
+		];
 	} else {
-		console.log(`No category filter applied`);
-	}
-
-	// Filter by size
-	if (size) {
-		console.log(`Filtering by size: ${size}`);
-		query.$or = [{ size: size }, { "productAttributes.size": size }];
-	}
-
-	// Filter by gender
-	if (gender) {
-		console.log(`Filtering by gender: ${gender}`);
-		if (mongoose.Types.ObjectId.isValid(gender)) {
-			query.gender = new mongoose.Types.ObjectId(gender);
-		} else {
-			return res.status(400).json({ error: "Invalid gender ID" });
+		// Filter by color
+		if (color) {
+			console.log(`Filtering by color: ${color}`);
+			query.$or = [{ color: color }, { "productAttributes.color": color }];
 		}
-	}
 
-	// Search term filter
-	if (searchTerm) {
-		console.log(`Filtering by search term: ${searchTerm}`);
-		query.$text = { $search: searchTerm };
+		// Filter by price range
+		if (priceMin && priceMax) {
+			console.log(`Filtering by price range: ${priceMin} - ${priceMax}`);
+			query.priceAfterDiscount = {
+				$gte: Number(priceMin),
+				$lte: Number(priceMax),
+			};
+		} else if (priceMin) {
+			console.log(`Filtering by minimum price: ${priceMin}`);
+			query.priceAfterDiscount = { $gte: Number(priceMin) };
+		} else if (priceMax) {
+			console.log(`Filtering by maximum price: ${priceMax}`);
+			query.priceAfterDiscount = { $lte: Number(priceMax) };
+		}
+
+		// Filter by category
+		if (category) {
+			console.log(`Filtering by category: ${category}`);
+			query.category = new mongoose.Types.ObjectId(category);
+		} else {
+			console.log(`No category filter applied`);
+		}
+
+		// Filter by size
+		if (size) {
+			console.log(`Filtering by size: ${size}`);
+			query.$or = [{ size: size }, { "productAttributes.size": size }];
+		}
+
+		// Filter by gender
+		if (gender) {
+			console.log(`Filtering by gender: ${gender}`);
+			if (mongoose.Types.ObjectId.isValid(gender)) {
+				query.gender = new mongoose.Types.ObjectId(gender);
+			} else {
+				return res.status(400).json({ error: "Invalid gender ID" });
+			}
+		}
+
+		// Search term filter
+		if (searchTerm) {
+			console.log(`Filtering by search term: ${searchTerm}`);
+			query.$text = { $search: searchTerm };
+		}
 	}
 
 	// Pagination
