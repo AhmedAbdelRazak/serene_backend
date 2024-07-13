@@ -197,37 +197,133 @@ exports.syncPrintifyProducts = async (req, res) => {
 							tag.toLowerCase().includes("candles")
 						)
 					) {
-						// Handle candles as separate products
-						for (const variant of printifyProduct.variants.slice(0, 30)) {
-							// Extract scent if available
-							const scentOption = printifyProduct.options.find(
-								(option) => option.type === "scent"
-							);
-							const scent = scentOption
-								? scentOption.values.find(
-										(value) => value.id === variant.options[0]
-								  )
+						// Handle candles with variables as separate products
+						if (addVariables) {
+							for (const variant of printifyProduct.variants.slice(0, 30)) {
+								// Extract scent if available
+								const scentOption = printifyProduct.options.find(
+									(option) => option.type === "scent"
+								);
+								const scent = scentOption
 									? scentOption.values.find(
 											(value) => value.id === variant.options[0]
-									  ).title
-									: null
-								: null;
+									  )
+										? scentOption.values.find(
+												(value) => value.id === variant.options[0]
+										  ).title
+										: null
+									: null;
 
+								const productData = {
+									productName: `${printifyProduct.title} - ${variant.title}`,
+									description: printifyProduct.description,
+									price: variant.price / 100,
+									priceAfterDiscount: variant.price / 100,
+									MSRPPriceBasic: Number((variant.price / 100) * 1.75).toFixed(
+										2
+									),
+									quantity: 10,
+									slug: `${productSlug}-${variant.options.join("-")}`,
+									slug_Arabic: `${productSlugArabic}-${variant.options.join(
+										"-"
+									)}`,
+									category: matchingCategory._id,
+									subcategory: matchingSubcategories.map(
+										(subcategory) => subcategory._id
+									),
+									gender: "6635ab22898104005c96250a",
+									chosenSeason: "all",
+									thumbnailImage: printifyProduct.images
+										.slice(0, 5)
+										.sort(() => 0.5 - Math.random()) // Shuffle images
+										.map((image) => ({
+											public_id: image.variant_ids.join("_"),
+											url: image.src,
+											images: printifyProduct.images
+												.slice(0, 5)
+												.sort(() => 0.5 - Math.random())
+												.map((img) => ({
+													public_id: img.variant_ids.join("_"),
+													url: img.src,
+												})),
+										})),
+									isPrintifyProduct: true,
+									addVariables: false,
+									printifyProductDetails: {
+										id: printifyProduct.id,
+										title: printifyProduct.title,
+										description: printifyProduct.description,
+										tags: printifyProduct.tags,
+										options: printifyProduct.options,
+										variants: [variant],
+										images: printifyProduct.images,
+										created_at: printifyProduct.created_at,
+										updated_at: printifyProduct.updated_at,
+										visible: printifyProduct.visible,
+										is_locked: printifyProduct.is_locked,
+										blueprint_id: printifyProduct.blueprint_id,
+										user_id: printifyProduct.user_id,
+										shop_id: printifyProduct.shop_id,
+										print_provider_id: printifyProduct.print_provider_id,
+										print_areas: printifyProduct.print_areas,
+										print_details: printifyProduct.print_details,
+										sales_channel_properties:
+											printifyProduct.sales_channel_properties,
+										is_printify_express_eligible:
+											printifyProduct.is_printify_express_eligible,
+										is_printify_express_enabled:
+											printifyProduct.is_printify_express_enabled,
+										is_economy_shipping_eligible:
+											printifyProduct.is_economy_shipping_eligible,
+										is_economy_shipping_enabled:
+											printifyProduct.is_economy_shipping_enabled,
+									},
+									scent: scent,
+									productAttributes: [],
+								};
+
+								// Find product by SKU
+								let product = await Product.findOne({
+									productSKU: variant.sku,
+								});
+
+								if (product) {
+									// Update existing product
+									await Product.updateOne({ _id: product._id }, productData);
+									addedProducts.push(
+										`Updated product: ${productData.productName}`
+									);
+								} else {
+									// Create new product
+									const newProduct = new Product({
+										productSKU: variant.sku,
+										...productData,
+										// Add other necessary fields with default or empty values
+									});
+
+									await newProduct.save();
+									addedProducts.push(
+										`Added product: ${newProduct.productName}`
+									);
+								}
+							}
+						} else {
+							// Handle candles without variables normally
 							const productData = {
-								productName: `${printifyProduct.title} - ${variant.title}`,
+								productName: printifyProduct.title,
 								description: printifyProduct.description,
-								price: variant.price / 100,
-								priceAfterDiscount: variant.price / 100,
-								MSRPPriceBasic: Number((variant.price / 100) * 1.75).toFixed(2),
+								price: printifyProduct.variants[0].price / 100,
+								priceAfterDiscount: printifyProduct.variants[0].price / 100,
+								MSRPPriceBasic: Number(
+									(printifyProduct.variants[0].price / 100) * 1.75
+								).toFixed(2),
 								quantity: 10,
-								slug: `${productSlug}-${variant.options.join("-")}`,
-								slug_Arabic: `${productSlugArabic}-${variant.options.join(
-									"-"
-								)}`,
-								category: matchingCategory._id,
+								slug: productSlug,
+								slug_Arabic: productSlugArabic,
+								category: matchingCategory._id, // Assign the matching category ID
 								subcategory: matchingSubcategories.map(
 									(subcategory) => subcategory._id
-								),
+								), // Assign matching subcategory IDs
 								gender: "6635ab22898104005c96250a",
 								chosenSeason: "all",
 								thumbnailImage: printifyProduct.images
@@ -252,7 +348,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 									description: printifyProduct.description,
 									tags: printifyProduct.tags,
 									options: printifyProduct.options,
-									variants: [variant],
+									variants: printifyProduct.variants,
 									images: printifyProduct.images,
 									created_at: printifyProduct.created_at,
 									updated_at: printifyProduct.updated_at,
@@ -275,37 +371,12 @@ exports.syncPrintifyProducts = async (req, res) => {
 									is_economy_shipping_enabled:
 										printifyProduct.is_economy_shipping_enabled,
 								},
-								scent: scent,
-								productAttributes: [
-									{
-										PK: `${variant.options.join("#")}`,
-										color: null,
-										size: variant.title,
-										SubSKU: variant.sku,
-										quantity: 10,
-										price: variant.price / 100,
-										priceAfterDiscount: variant.price / 100,
-										MSRP: Number((variant.price / 100) * 1.75).toFixed(2),
-										WholeSalePrice: Number(
-											(variant.price / 100) * 0.75
-										).toFixed(2),
-										DropShippingPrice: Number(
-											(variant.price / 100) * 0.85
-										).toFixed(2),
-										productImages: printifyProduct.images
-											.slice(0, 5)
-											.sort(() => 0.5 - Math.random()) // Shuffle images
-											.map((image) => ({
-												public_id: image.variant_ids.join("_"),
-												url: image.src,
-											})),
-									},
-								],
+								productAttributes: [],
 							};
 
 							// Find product by SKU
 							let product = await Product.findOne({
-								productSKU: variant.sku,
+								productSKU: printifyProduct.variants[0].sku,
 							});
 
 							if (product) {
@@ -317,7 +388,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 							} else {
 								// Create new product
 								const newProduct = new Product({
-									productSKU: variant.sku,
+									productSKU: printifyProduct.variants[0].sku,
 									...productData,
 									// Add other necessary fields with default or empty values
 								});
