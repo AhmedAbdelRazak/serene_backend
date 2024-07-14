@@ -6,6 +6,8 @@
 // require("dotenv").config();
 // const http = require("http");
 // const socketIo = require("socket.io");
+// const cron = require("node-cron");
+// const axios = require("axios");
 
 // // app
 // const app = express();
@@ -41,6 +43,19 @@
 
 // // routes middlewares
 // readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
+
+// // Schedule task to run every 15 minutes
+// cron.schedule("*/90 * * * *", async () => {
+// 	try {
+// 		console.log("Running scheduled task to fetch Printify orders");
+// 		const response = await axios.get(
+// 			"http://localhost:8101/api/get-printify-orders"
+// 		);
+// 		console.log("Orders Updated From Printify");
+// 	} catch (error) {
+// 		console.error("Error during scheduled task:");
+// 	}
+// });
 
 // const port = process.env.PORT || 8101;
 
@@ -83,6 +98,8 @@ require("dotenv").config();
 const https = require("https");
 const fs = require("fs");
 const socketIo = require("socket.io");
+const cron = require("node-cron");
+const axios = require("axios");
 
 // app
 const app = express();
@@ -136,6 +153,19 @@ app.set("io", io);
 
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
+
+// Schedule task to run every 15 minutes
+cron.schedule("*/10 * * * *", async () => {
+	try {
+		console.log("Running scheduled task to fetch Printify orders");
+		const response = await axios.get(
+			"https://serenejannat.com/api/get-printify-orders"
+		);
+		console.log("Scheduled Task for Printify");
+	} catch (error) {
+		console.error("Error during scheduled task:");
+	}
+});
 
 const port = process.env.PORT || 8101;
 

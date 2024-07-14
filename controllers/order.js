@@ -430,7 +430,9 @@ const postOrderToPrintify = async (order) => {
 					region: order.customerDetails.state,
 					city: order.customerDetails.city,
 					address1: order.customerDetails.address,
-					postal_code: order.customerDetails.zipcode,
+					postal_code:
+						Number(order.customerDetails.zipcode) ||
+						order.customerDetails.zipcode,
 				},
 			};
 

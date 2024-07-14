@@ -4,6 +4,7 @@ const Product = require("../models/product");
 const slugify = require("slugify");
 const Subcategory = require("../models/subcategory");
 const Colors = require("../models/colors");
+const { Order } = require("../models/order");
 
 exports.printifyProducts = async (req, res) => {
 	try {
@@ -74,6 +75,103 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 	} catch (error) {
 		console.error("Error removing Printify products:", error);
 		return res.status(500).json({ error: "Error removing Printify products" });
+	}
+};
+
+exports.printifyOrders = async (req, res) => {
+	try {
+		// Fetch orders from MongoDB excluding "delivered" and "cancelled"
+		const ordersToCheck = await Order.find({
+			status: { $nin: ["delivered", "cancelled"] },
+			"printifyOrderDetails.id": { $exists: true },
+		});
+
+		// Create a map of order IDs from MongoDB for quick lookup
+		const orderMap = new Map();
+		ordersToCheck.forEach((order) => {
+			orderMap.set(order.printifyOrderDetails.id, order);
+		});
+
+		// Fetch the Shop ID from Printify API
+		const shopResponse = await axios.get(
+			"https://api.printify.com/v1/shops.json",
+			{
+				headers: {
+					Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+				},
+			}
+		);
+
+		// Check if there are shops in the response
+		if (shopResponse.data && shopResponse.data.length > 0) {
+			const shopId = shopResponse.data[0].id; // Assuming you want the first shop ID
+
+			// Fetch the orders for the Shop ID
+			const ordersResponse = await axios.get(
+				`https://api.printify.com/v1/shops/${shopId}/orders.json`,
+				{
+					headers: {
+						Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+					},
+				}
+			);
+
+			// Log the response from Printify API
+			console.log("Orders Response Data:", ordersResponse.data);
+
+			// Check if there are orders in the response
+			if (
+				ordersResponse.data &&
+				ordersResponse.data.data &&
+				ordersResponse.data.data.length > 0
+			) {
+				const orders = ordersResponse.data.data;
+
+				for (const printifyOrder of orders) {
+					const existingOrder = orderMap.get(printifyOrder.id);
+
+					if (existingOrder) {
+						const updatedFields = {};
+
+						// Check and update the status if it's different
+						if (existingOrder.status !== printifyOrder.status) {
+							updatedFields.status = printifyOrder.status;
+						}
+
+						// Check and update the tracking number if it's different
+						const trackingNumber = printifyOrder.printify_connect
+							? printifyOrder.printify_connect.url
+							: null;
+						if (existingOrder.trackingNumber !== trackingNumber) {
+							updatedFields.trackingNumber = trackingNumber;
+						}
+
+						// Update the order if there are changes
+						if (Object.keys(updatedFields).length > 0) {
+							await Order.updateOne(
+								{ _id: existingOrder._id },
+								{ $set: updatedFields }
+							);
+						}
+					}
+				}
+
+				return res.json({
+					shopId,
+					message: "Orders have been successfully synced with Printify.",
+				});
+			} else {
+				return res.status(404).json({ error: "No orders found for the shop" });
+			}
+		} else {
+			return res.status(404).json({ error: "No shops found" });
+		}
+	} catch (error) {
+		console.error("Error fetching orders:", error.message);
+		if (error.response) {
+			console.error("Printify API response:", error.response.data);
+		}
+		return res.status(500).json({ error: "Error fetching orders" });
 	}
 };
 
