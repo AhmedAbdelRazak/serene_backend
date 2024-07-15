@@ -24,7 +24,7 @@ router.delete(
 	requireSignin,
 	isAuth,
 	isAdmin,
-	remove,
+	remove
 );
 
 router.get("/coupon/byname/:coupon", getSingleCoupon);

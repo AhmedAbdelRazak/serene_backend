@@ -486,7 +486,7 @@ exports.create = async (req, res) => {
 
 		// Process payment with Square
 		const paymentResult = await processSquarePayment(
-			orderData.totalAmount,
+			orderData.totalAmountAfterDiscount,
 			paymentToken,
 			zipCode,
 			orderData.customerDetails
@@ -604,7 +604,9 @@ const createPdfBufferPOS = (order) => {
 		doc.moveDown();
 		doc
 			.fontSize(16)
-			.text(`Total Amount: $${Number(order.totalAmount).toFixed(2)}`);
+			.text(
+				`Total Amount: $${Number(order.totalAmountAfterDiscount).toFixed(2)}`
+			);
 
 		doc.end();
 	});
