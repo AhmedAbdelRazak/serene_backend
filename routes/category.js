@@ -24,7 +24,7 @@ router.put(
 	requireSignin,
 	isAuth,
 	isAdmin,
-	update,
+	update
 );
 
 router.delete(
@@ -32,7 +32,7 @@ router.delete(
 	requireSignin,
 	isAuth,
 	isAdmin,
-	remove,
+	remove
 );
 
 router.get("/categories", list);
