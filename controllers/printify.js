@@ -285,7 +285,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 								const productData = {
 									productName: `${printifyProduct.title} - ${variant.title}`,
 									description: printifyProduct.description,
-									price: (variant.price / 100) * 1.5,
+									price: (variant.price / 100) * 1.2,
 									priceAfterDiscount: variant.price / 100,
 									MSRPPriceBasic: Number((variant.price / 100) * 0.75).toFixed(
 										2
@@ -374,7 +374,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 							const productData = {
 								productName: printifyProduct.title,
 								description: printifyProduct.description,
-								price: (printifyProduct.variants[0].price / 100) * 1.5,
+								price: (printifyProduct.variants[0].price / 100) * 1.2,
 								priceAfterDiscount: printifyProduct.variants[0].price / 100,
 								MSRPPriceBasic: Number(
 									(printifyProduct.variants[0].price / 100) * 0.75
@@ -498,7 +498,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						const productData = {
 							productName: printifyProduct.title,
 							description: printifyProduct.description,
-							price: (sortedVariants[0].price / 100) * 1.5,
+							price: (sortedVariants[0].price / 100) * 1.2,
 							priceAfterDiscount: sortedVariants[0].price / 100,
 							MSRPPriceBasic: Number(
 								(sortedVariants[0].price / 100) * 0.75
@@ -611,7 +611,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 												: null,
 											SubSKU: variant.sku,
 											quantity: 10,
-											price: (variant.price / 100) * 1.5,
+											price: (variant.price / 100) * 1.2,
 											priceAfterDiscount: variant.price / 100,
 											MSRP: Number((variant.price / 100) * 0.75).toFixed(2),
 											WholeSalePrice: Number(
