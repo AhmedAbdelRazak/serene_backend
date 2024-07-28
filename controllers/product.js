@@ -7,6 +7,7 @@ const Subcategory = require("../models/subcategory"); // Adjust paths as necessa
 const Gender = require("../models/gender"); // Adjust paths as necessary
 const querystring = require("querystring");
 const mongoose = require("mongoose");
+const axios = require("axios");
 
 exports.productById = async (req, res, next, id) => {
 	try {
@@ -101,6 +102,12 @@ exports.update = async (req, res) => {
 		const productId = req.product._id;
 		const updateFields = req.body.product;
 
+		// Find the existing product
+		const existingProduct = await Product.findById(productId);
+		if (!existingProduct) {
+			return res.status(404).json({ error: "Product not found" });
+		}
+
 		// Update the product document with the provided fields
 		const updatedProduct = await Product.findByIdAndUpdate(
 			productId,
@@ -110,6 +117,102 @@ exports.update = async (req, res) => {
 
 		if (!updatedProduct) {
 			return res.status(404).json({ error: "Product not found" });
+		}
+
+		// Check if the product is a Printify product
+		if (existingProduct.isPrintifyProduct) {
+			try {
+				// Fetch the Shop ID from Printify API
+				const shopResponse = await axios.get(
+					"https://api.printify.com/v1/shops.json",
+					{
+						headers: {
+							Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+						},
+					}
+				);
+
+				if (shopResponse.data && shopResponse.data.length > 0) {
+					const shopId = shopResponse.data[0].id; // Assuming you want the first shop ID
+
+					// Construct the payload for Printify update
+					const printifyUpdatePayload = {
+						title: updatedProduct.productName,
+						description: updatedProduct.description,
+						tags: updatedProduct.printifyProductDetails.tags,
+						options: updatedProduct.printifyProductDetails.options,
+						variants: updatedProduct.printifyProductDetails.variants.map(
+							(variant) => ({
+								...variant,
+								price: updatedProduct.priceAfterDiscount * 100, // Printify expects the price in cents
+							})
+						),
+						visible: updatedProduct.printifyProductDetails.visible,
+					};
+
+					const printifyProductId = updatedProduct.printifyProductDetails.id;
+					const printifyProductUrl = `https://api.printify.com/v1/shops/${shopId}/products/${printifyProductId}.json`;
+
+					// First attempt to unlock the product
+					try {
+						await axios.put(
+							printifyProductUrl,
+							{ is_locked: false },
+							{
+								headers: {
+									Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+								},
+							}
+						);
+					} catch (unlockError) {
+						console.error(
+							"Error unlocking Printify product:",
+							unlockError.response?.data || unlockError.message
+						);
+						return res.status(200).json(updatedProduct);
+					}
+
+					// Update the Printify product via their API
+					try {
+						await axios.put(printifyProductUrl, printifyUpdatePayload, {
+							headers: {
+								Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+							},
+						});
+					} catch (updateError) {
+						console.error(
+							"Error updating Printify product:",
+							updateError.response?.data || updateError.message
+						);
+						return res.status(200).json(updatedProduct);
+					}
+
+					// Publish the product
+					try {
+						await axios.put(
+							printifyProductUrl,
+							{ visible: true },
+							{
+								headers: {
+									Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+								},
+							}
+						);
+					} catch (publishError) {
+						console.error(
+							"Error publishing Printify product:",
+							publishError.response?.data || publishError.message
+						);
+						return res.status(200).json(updatedProduct);
+					}
+				}
+			} catch (printifyError) {
+				console.error(
+					"Error handling Printify product:",
+					printifyError.response?.data || printifyError.message
+				);
+				return res.status(200).json(updatedProduct);
+			}
 		}
 
 		res.json(updatedProduct);

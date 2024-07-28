@@ -588,27 +588,35 @@ exports.syncPrintifyProducts = async (req, res) => {
 												: null
 											: null;
 
-										return {
-											PK: `${variant.options.join("#")}`,
-											color: colorValue,
-											size: sizeOption
+										const sizeValue = sizeOption
+											? sizeOption.values.find(
+													(value) => value.id === variant.options[1]
+											  )
 												? sizeOption.values.find(
 														(value) => value.id === variant.options[1]
-												  )
-													? sizeOption.values.find(
-															(value) => value.id === variant.options[1]
-													  ).title
-													: null
-												: null,
-											scent: scentOption
+												  ).title
+												: null
+											: null;
+
+										const scentValue = scentOption
+											? scentOption.values.find(
+													(value) => value.id === variant.options[0]
+											  )
 												? scentOption.values.find(
 														(value) => value.id === variant.options[0]
-												  )
-													? scentOption.values.find(
-															(value) => value.id === variant.options[0]
-													  ).title
-													: null
-												: null,
+												  ).title
+												: null
+											: null;
+
+										const primaryKey = sizeValue
+											? `${sizeValue}${colorValue}`
+											: `${scentValue}${colorValue}`;
+
+										return {
+											PK: primaryKey,
+											color: colorValue,
+											size: sizeValue,
+											scent: scentValue,
 											SubSKU: variant.sku,
 											quantity: 10,
 											price: (variant.price / 100) * 1.2,
