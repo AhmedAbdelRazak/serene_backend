@@ -212,6 +212,61 @@ exports.syncPrintifyProducts = async (req, res) => {
 				const failedProducts = [];
 				const addedProducts = [];
 
+				// Function to handle MongoDB product update/creation and Printify publishing
+				const handleProductSync = async (
+					productData,
+					variantSKU,
+					printifyProduct
+				) => {
+					// Find product by SKU
+					let product = await Product.findOne({ productSKU: variantSKU });
+
+					if (product) {
+						// Update existing product
+						await Product.updateOne({ _id: product._id }, productData);
+						addedProducts.push(`Updated product: ${productData.productName}`);
+					} else {
+						// Create new product
+						const newProduct = new Product({
+							productSKU: variantSKU,
+							...productData,
+							// Add other necessary fields with default or empty values
+						});
+
+						await newProduct.save();
+						addedProducts.push(`Added product: ${newProduct.productName}`);
+					}
+
+					// Ensure the Printify product is published
+					try {
+						await axios.post(
+							`https://api.printify.com/v1/shops/${shopId}/products/${printifyProduct.id}/publish.json`,
+							{
+								title: true,
+								description: true,
+								images: true,
+								variants: true,
+								tags: true,
+								keyFeatures: true,
+								shipping_template: true,
+							},
+							{
+								headers: {
+									Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+								},
+							}
+						);
+						console.log(
+							`Product ${printifyProduct.id} published successfully on Printify`
+						);
+					} catch (publishError) {
+						console.error(
+							`Error publishing Printify product ${printifyProduct.id}:`,
+							publishError.response?.data || publishError.message
+						);
+					}
+				};
+
 				// Loop through each product and either update or create in the database
 				for (const printifyProduct of printifyProducts) {
 					// Find matching category
@@ -344,30 +399,11 @@ exports.syncPrintifyProducts = async (req, res) => {
 									productAttributes: [],
 								};
 
-								// Find product by SKU
-								let product = await Product.findOne({
-									productSKU: variant.sku,
-								});
-
-								if (product) {
-									// Update existing product
-									await Product.updateOne({ _id: product._id }, productData);
-									addedProducts.push(
-										`Updated product: ${productData.productName}`
-									);
-								} else {
-									// Create new product
-									const newProduct = new Product({
-										productSKU: variant.sku,
-										...productData,
-										// Add other necessary fields with default or empty values
-									});
-
-									await newProduct.save();
-									addedProducts.push(
-										`Added product: ${newProduct.productName}`
-									);
-								}
+								await handleProductSync(
+									productData,
+									variant.sku,
+									printifyProduct
+								);
 							}
 						} else {
 							// Handle candles without variables normally
@@ -433,28 +469,11 @@ exports.syncPrintifyProducts = async (req, res) => {
 								productAttributes: [],
 							};
 
-							// Find product by SKU
-							let product = await Product.findOne({
-								productSKU: printifyProduct.variants[0].sku,
-							});
-
-							if (product) {
-								// Update existing product
-								await Product.updateOne({ _id: product._id }, productData);
-								addedProducts.push(
-									`Updated product: ${productData.productName}`
-								);
-							} else {
-								// Create new product
-								const newProduct = new Product({
-									productSKU: printifyProduct.variants[0].sku,
-									...productData,
-									// Add other necessary fields with default or empty values
-								});
-
-								await newProduct.save();
-								addedProducts.push(`Added product: ${newProduct.productName}`);
-							}
+							await handleProductSync(
+								productData,
+								printifyProduct.variants[0].sku,
+								printifyProduct
+							);
 						}
 					} else {
 						// Handle other products normally
@@ -637,26 +656,11 @@ exports.syncPrintifyProducts = async (req, res) => {
 								: [],
 						};
 
-						// Find product by SKU
-						let product = await Product.findOne({
-							productSKU: printifyProduct.variants[0].sku,
-						});
-
-						if (product) {
-							// Update existing product
-							await Product.updateOne({ _id: product._id }, productData);
-							addedProducts.push(`Updated product: ${productData.productName}`);
-						} else {
-							// Create new product
-							const newProduct = new Product({
-								productSKU: printifyProduct.variants[0].sku,
-								...productData,
-								// Add other necessary fields with default or empty values
-							});
-
-							await newProduct.save();
-							addedProducts.push(`Added product: ${newProduct.productName}`);
-						}
+						await handleProductSync(
+							productData,
+							printifyProduct.variants[0].sku,
+							printifyProduct
+						);
 					}
 				}
 

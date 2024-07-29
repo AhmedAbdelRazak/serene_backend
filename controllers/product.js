@@ -119,6 +119,8 @@ exports.update = async (req, res) => {
 			return res.status(404).json({ error: "Product not found" });
 		}
 
+		console.log("MongoDB update successful:", updatedProduct);
+
 		// Check if the product is a Printify product
 		if (existingProduct.isPrintifyProduct) {
 			try {
@@ -147,29 +149,62 @@ exports.update = async (req, res) => {
 								price: updatedProduct.priceAfterDiscount * 100, // Printify expects the price in cents
 							})
 						),
-						visible: updatedProduct.printifyProductDetails.visible,
 					};
 
 					const printifyProductId = updatedProduct.printifyProductDetails.id;
 					const printifyProductUrl = `https://api.printify.com/v1/shops/${shopId}/products/${printifyProductId}.json`;
 
-					// First attempt to unlock the product
+					// Publish the product first
 					try {
-						await axios.put(
-							printifyProductUrl,
-							{ is_locked: false },
+						await axios.post(
+							`https://api.printify.com/v1/shops/${shopId}/products/${printifyProductId}/publish.json`,
+							{
+								title: true,
+								description: true,
+								images: true,
+								variants: true,
+								tags: true,
+								keyFeatures: true,
+								shipping_template: true,
+							},
 							{
 								headers: {
 									Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
 								},
 							}
 						);
+						console.log("Product published successfully on Printify");
+					} catch (publishError) {
+						console.error(
+							"Error publishing Printify product:",
+							publishError.response?.data || publishError.message
+						);
+						return res.status(200).json(updatedProduct); // Continue with MongoDB update success
+					}
+
+					// Attempt to unlock the product
+					try {
+						await axios.post(
+							`https://api.printify.com/v1/shops/${shopId}/products/${printifyProductId}/publishing_succeeded.json`,
+							{
+								external: {
+									id: updatedProduct._id.toString(),
+									handle: `https://serenejannat.com/products/${updatedProduct.slug}`,
+								},
+							},
+							{
+								headers: {
+									Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+								},
+							}
+						);
+						console.log("Product unlocked successfully on Printify");
 					} catch (unlockError) {
 						console.error(
 							"Error unlocking Printify product:",
 							unlockError.response?.data || unlockError.message
 						);
-						return res.status(200).json(updatedProduct);
+						// Continue even if unlocking fails
 					}
 
 					// Update the Printify product via their API
@@ -179,31 +214,66 @@ exports.update = async (req, res) => {
 								Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
 							},
 						});
+						console.log("Product updated successfully on Printify");
 					} catch (updateError) {
 						console.error(
 							"Error updating Printify product:",
 							updateError.response?.data || updateError.message
 						);
-						return res.status(200).json(updatedProduct);
+						return res.status(200).json(updatedProduct); // Continue with MongoDB update success
 					}
 
-					// Publish the product
+					// Ensure the product is published again
 					try {
-						await axios.put(
-							printifyProductUrl,
-							{ visible: true },
+						await axios.post(
+							`https://api.printify.com/v1/shops/${shopId}/products/${printifyProductId}/publish.json`,
+							{
+								title: true,
+								description: true,
+								images: true,
+								variants: true,
+								tags: true,
+								keyFeatures: true,
+								shipping_template: true,
+							},
 							{
 								headers: {
 									Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
 								},
 							}
 						);
-					} catch (publishError) {
+						console.log("Product re-published successfully on Printify");
+					} catch (republishError) {
 						console.error(
-							"Error publishing Printify product:",
-							publishError.response?.data || publishError.message
+							"Error re-publishing Printify product:",
+							republishError.response?.data || republishError.message
 						);
-						return res.status(200).json(updatedProduct);
+						return res.status(200).json(updatedProduct); // Continue with MongoDB update success
+					}
+
+					// Set product publish status to succeeded
+					try {
+						await axios.post(
+							`https://api.printify.com/v1/shops/${shopId}/products/${printifyProductId}/publishing_succeeded.json`,
+							{
+								external: {
+									id: updatedProduct._id.toString(),
+									handle: `https://serenejannat.com/products/${updatedProduct.slug}`,
+								},
+							},
+							{
+								headers: {
+									Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
+								},
+							}
+						);
+						console.log("Product publish status set to succeeded on Printify");
+					} catch (succeededError) {
+						console.error(
+							"Error setting publish status to succeeded:",
+							succeededError.response?.data || succeededError.message
+						);
+						return res.status(200).json(updatedProduct); // Continue with MongoDB update success
 					}
 				}
 			} catch (printifyError) {
@@ -211,7 +281,7 @@ exports.update = async (req, res) => {
 					"Error handling Printify product:",
 					printifyError.response?.data || printifyError.message
 				);
-				return res.status(200).json(updatedProduct);
+				return res.status(200).json(updatedProduct); // Continue with MongoDB update success
 			}
 		}
 
