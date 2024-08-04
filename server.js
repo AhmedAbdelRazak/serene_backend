@@ -145,6 +145,13 @@ app.get("/test", (req, res) => {
 	res.send("Server is working");
 });
 
+// Add detailed logging for /api/categories
+app.get("/api/categories", (req, res) => {
+	console.log("Categories endpoint hit");
+	// Simulate fetching categories
+	res.json({ categories: ["Category 1", "Category 2"] });
+});
+
 // Create the io instance
 const io = socketIo(server, {
 	cors: {
