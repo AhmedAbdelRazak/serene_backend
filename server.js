@@ -135,21 +135,7 @@ app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
 app.get("/", (req, res) => {
-	console.log("Root endpoint hit");
 	res.send("Hello From ecommerce API");
-});
-
-// Add a test route
-app.get("/test", (req, res) => {
-	console.log("Test endpoint hit");
-	res.send("Server is working");
-});
-
-// Add detailed logging for /api/categories
-app.get("/api/categories", (req, res) => {
-	console.log("Categories endpoint hit");
-	// Simulate fetching categories
-	res.json({ categories: ["Category 1", "Category 2"] });
 });
 
 // Create the io instance
@@ -168,7 +154,7 @@ app.set("io", io);
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
 
-// Schedule task to run every 10 minutes
+// Schedule task to run every 15 minutes
 cron.schedule("*/10 * * * *", async () => {
 	try {
 		console.log("Running scheduled task to fetch Printify orders");
@@ -177,18 +163,14 @@ cron.schedule("*/10 * * * *", async () => {
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
-		console.error("Error during scheduled task:", error);
+		console.error("Error during scheduled task:");
 	}
 });
 
 const port = process.env.PORT || 8101;
 
-server.listen(port, "0.0.0.0", (err) => {
-	if (err) {
-		console.error(`Failed to start server on port ${port}:`, err);
-	} else {
-		console.log(`Server is running on port ${port}`);
-	}
+server.listen(port, () => {
+	console.log(`Server is running on port ${port}`);
 });
 
 io.on("connection", (socket) => {
