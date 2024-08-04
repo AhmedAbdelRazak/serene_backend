@@ -96,6 +96,7 @@ const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
 const https = require("https");
+const http = require("http");
 const fs = require("fs");
 const socketIo = require("socket.io");
 const cron = require("node-cron");
@@ -121,7 +122,9 @@ const ca = fs.readFileSync(
 const credentials = { key: privateKey, cert: certificate, ca: ca };
 
 // Create HTTPS server
-const server = https.createServer(credentials, app);
+const httpsServer = https.createServer(credentials, app);
+// Create HTTP server
+const httpServer = http.createServer(app);
 
 // db
 mongoose
@@ -138,13 +141,14 @@ app.get("/", (req, res) => {
 	res.send("Hello From ecommerce API");
 });
 
-// Add a test route for verification
+// Add a test route
 app.get("/test", (req, res) => {
+	console.log("Test endpoint hit");
 	res.send("Test endpoint working!");
 });
 
 // Create the io instance
-const io = socketIo(server, {
+const io = socketIo(httpsServer, {
 	cors: {
 		origin: "*",
 		methods: ["GET", "POST"],
@@ -157,7 +161,10 @@ const io = socketIo(server, {
 app.set("io", io);
 
 // routes middlewares
-readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
+readdirSync("./routes").map((r) => {
+	console.log(`Loading route ${r}`);
+	app.use("/api", require(`./routes/${r}`));
+});
 
 // Schedule task to run every 10 minutes
 cron.schedule("*/10 * * * *", async () => {
@@ -172,10 +179,15 @@ cron.schedule("*/10 * * * *", async () => {
 	}
 });
 
-const port = process.env.PORT || 8101;
+const httpsPort = process.env.HTTPS_PORT || 8101;
+const httpPort = process.env.HTTP_PORT || 8000;
 
-server.listen(port, () => {
-	console.log(`Server is running on port ${port}`);
+httpsServer.listen(httpsPort, () => {
+	console.log(`HTTPS Server is running on port ${httpsPort}`);
+});
+
+httpServer.listen(httpPort, () => {
+	console.log(`HTTP Server is running on port ${httpPort}`);
 });
 
 io.on("connection", (socket) => {
