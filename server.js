@@ -183,8 +183,13 @@ cron.schedule("*/10 * * * *", async () => {
 
 const port = process.env.PORT || 8101;
 
-server.listen(port, () => {
-	console.log(`Server is running on port ${port}`);
+// Add detailed logging for server listening
+server.listen(port, (err) => {
+	if (err) {
+		console.error(`Failed to start server on port ${port}:`, err);
+	} else {
+		console.log(`Server is running on port ${port}`);
+	}
 });
 
 io.on("connection", (socket) => {
