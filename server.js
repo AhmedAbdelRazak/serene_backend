@@ -135,11 +135,13 @@ app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
 app.get("/", (req, res) => {
+	console.log("Root endpoint hit");
 	res.send("Hello From ecommerce API");
 });
 
 // Add a test route
 app.get("/test", (req, res) => {
+	console.log("Test endpoint hit");
 	res.send("Server is working");
 });
 
