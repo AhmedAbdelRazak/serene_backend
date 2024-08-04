@@ -138,6 +138,11 @@ app.get("/", (req, res) => {
 	res.send("Hello From ecommerce API");
 });
 
+// Add a test route
+app.get("/test", (req, res) => {
+	res.send("Server is working");
+});
+
 // Create the io instance
 const io = socketIo(server, {
 	cors: {
@@ -154,7 +159,7 @@ app.set("io", io);
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
 
-// Schedule task to run every 15 minutes
+// Schedule task to run every 10 minutes
 cron.schedule("*/10 * * * *", async () => {
 	try {
 		console.log("Running scheduled task to fetch Printify orders");
@@ -163,7 +168,7 @@ cron.schedule("*/10 * * * *", async () => {
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
-		console.error("Error during scheduled task:");
+		console.error("Error during scheduled task:", error);
 	}
 });
 
