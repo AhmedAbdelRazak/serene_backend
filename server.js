@@ -114,7 +114,7 @@ const certificate = fs.readFileSync(
 	"utf8"
 );
 const ca = fs.readFileSync(
-	"/home/infiniteappsadmin/SereneJannat/certs/chain.pem",
+	"/home/infiniteappsadmin/SereneJannat/certs/fullchain.pem",
 	"utf8"
 );
 
