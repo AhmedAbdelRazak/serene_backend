@@ -106,15 +106,15 @@ const app = express();
 
 // SSL Certificates
 const privateKey = fs.readFileSync(
-	"/etc/letsencrypt/live/serenejannat.com/privkey.pem",
+	"/home/infiniteappsadmin/SereneJannat/certs/privkey.pem",
 	"utf8"
 );
 const certificate = fs.readFileSync(
-	"/etc/letsencrypt/live/serenejannat.com/cert.pem",
+	"/home/infiniteappsadmin/SereneJannat/certs/cert.pem",
 	"utf8"
 );
 const ca = fs.readFileSync(
-	"/etc/letsencrypt/live/serenejannat.com/chain.pem",
+	"/home/infiniteappsadmin/SereneJannat/certs/chain.pem",
 	"utf8"
 );
 
