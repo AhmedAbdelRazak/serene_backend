@@ -96,7 +96,6 @@ const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
 const https = require("https");
-const http = require("http");
 const fs = require("fs");
 const socketIo = require("socket.io");
 const cron = require("node-cron");
@@ -122,9 +121,7 @@ const ca = fs.readFileSync(
 const credentials = { key: privateKey, cert: certificate, ca: ca };
 
 // Create HTTPS server
-const httpsServer = https.createServer(credentials, app);
-// Create HTTP server
-const httpServer = http.createServer(app);
+const server = https.createServer(credentials, app);
 
 // db
 mongoose
@@ -141,22 +138,8 @@ app.get("/", (req, res) => {
 	res.send("Hello From ecommerce API");
 });
 
-app.get("/api/testing", (req, res) => {
-	res.json({ message: "Testing endpoint is working" });
-});
-
-// Create the io instance for HTTPS
-const io = socketIo(httpsServer, {
-	cors: {
-		origin: "*",
-		methods: ["GET", "POST"],
-		allowedHeaders: ["Authorization"],
-		credentials: true,
-	},
-});
-
-// Create the io instance for HTTP
-const ioHttp = socketIo(httpServer, {
+// Create the io instance
+const io = socketIo(server, {
 	cors: {
 		origin: "*",
 		methods: ["GET", "POST"],
@@ -180,19 +163,14 @@ cron.schedule("*/10 * * * *", async () => {
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
-		console.error("Error during scheduled task:", error);
+		console.error("Error during scheduled task:");
 	}
 });
 
 const port = process.env.PORT || 8101;
-const httpPort = 8102;
 
-httpsServer.listen(port, () => {
-	console.log(`HTTPS Server is running on port ${port}`);
-});
-
-httpServer.listen(httpPort, () => {
-	console.log(`HTTP Server is running on port ${httpPort}`);
+server.listen(port, () => {
+	console.log(`Server is running on port ${port}`);
 });
 
 io.on("connection", (socket) => {
@@ -209,31 +187,6 @@ io.on("connection", (socket) => {
 
 	socket.on("stopTyping", (data) => {
 		io.emit("stopTyping", data);
-	});
-
-	socket.on("disconnect", (reason) => {
-		console.log(`A user disconnected: ${reason}`);
-	});
-
-	socket.on("connect_error", (error) => {
-		console.error(`Connection error: ${error.message}`);
-	});
-});
-
-ioHttp.on("connection", (socket) => {
-	console.log("A user connected");
-
-	socket.on("sendMessage", (message) => {
-		console.log("Message received: ", message);
-		ioHttp.emit("receiveMessage", message);
-	});
-
-	socket.on("typing", (data) => {
-		ioHttp.emit("typing", data);
-	});
-
-	socket.on("stopTyping", (data) => {
-		ioHttp.emit("stopTyping", data);
 	});
 
 	socket.on("disconnect", (reason) => {
