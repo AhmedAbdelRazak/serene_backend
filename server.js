@@ -96,6 +96,7 @@ const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
 const https = require("https");
+const http = require("http");
 const fs = require("fs");
 const socketIo = require("socket.io");
 const cron = require("node-cron");
@@ -121,7 +122,9 @@ const ca = fs.readFileSync(
 const credentials = { key: privateKey, cert: certificate, ca: ca };
 
 // Create HTTPS server
-const server = https.createServer(credentials, app);
+const httpsServer = https.createServer(credentials, app);
+// Create HTTP server
+const httpServer = http.createServer(app);
 
 // db
 mongoose
@@ -138,8 +141,12 @@ app.get("/", (req, res) => {
 	res.send("Hello From ecommerce API");
 });
 
+app.get("/api/testing", (req, res) => {
+	res.json({ message: "Testing endpoint is working" });
+});
+
 // Create the io instance
-const io = socketIo(server, {
+const io = socketIo(httpsServer, {
 	cors: {
 		origin: "*",
 		methods: ["GET", "POST"],
@@ -163,14 +170,18 @@ cron.schedule("*/10 * * * *", async () => {
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
-		console.error("Error during scheduled task:");
+		console.error("Error during scheduled task:", error);
 	}
 });
 
 const port = process.env.PORT || 8101;
 
-server.listen(port, () => {
-	console.log(`Server is running on port ${port}`);
+httpsServer.listen(port, () => {
+	console.log(`HTTPS Server is running on port ${port}`);
+});
+
+httpServer.listen(8080, () => {
+	console.log(`HTTP Server is running on port 8080`);
 });
 
 io.on("connection", (socket) => {
