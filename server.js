@@ -142,7 +142,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/api/testing", (req, res) => {
-	res.json({ message: "Testing endpoint is working" });
+	res.json({ message: "testing endpoint is working" });
 });
 
 // Create the io instance
