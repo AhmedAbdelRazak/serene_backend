@@ -145,8 +145,18 @@ app.get("/api/testing", (req, res) => {
 	res.json({ message: "Testing endpoint is working" });
 });
 
-// Create the io instance
+// Create the io instance for HTTPS
 const io = socketIo(httpsServer, {
+	cors: {
+		origin: "*",
+		methods: ["GET", "POST"],
+		allowedHeaders: ["Authorization"],
+		credentials: true,
+	},
+});
+
+// Create the io instance for HTTP
+const ioHttp = socketIo(httpServer, {
 	cors: {
 		origin: "*",
 		methods: ["GET", "POST"],
@@ -161,12 +171,12 @@ app.set("io", io);
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
 
-// Schedule task to run every 10 minutes
+// Schedule task to run every 15 minutes
 cron.schedule("*/10 * * * *", async () => {
 	try {
 		console.log("Running scheduled task to fetch Printify orders");
 		const response = await axios.get(
-			"http://localhost:8101/api/get-printify-orders"
+			"https://serenejannat.com:8101/api/get-printify-orders"
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
@@ -174,11 +184,11 @@ cron.schedule("*/10 * * * *", async () => {
 	}
 });
 
-const httpsPort = process.env.HTTPS_PORT || 8101;
-const httpPort = process.env.HTTP_PORT || 8101;
+const port = process.env.PORT || 8101;
+const httpPort = 8102;
 
-httpsServer.listen(httpsPort, () => {
-	console.log(`HTTPS Server is running on port ${httpsPort}`);
+httpsServer.listen(port, () => {
+	console.log(`HTTPS Server is running on port ${port}`);
 });
 
 httpServer.listen(httpPort, () => {
@@ -199,6 +209,31 @@ io.on("connection", (socket) => {
 
 	socket.on("stopTyping", (data) => {
 		io.emit("stopTyping", data);
+	});
+
+	socket.on("disconnect", (reason) => {
+		console.log(`A user disconnected: ${reason}`);
+	});
+
+	socket.on("connect_error", (error) => {
+		console.error(`Connection error: ${error.message}`);
+	});
+});
+
+ioHttp.on("connection", (socket) => {
+	console.log("A user connected");
+
+	socket.on("sendMessage", (message) => {
+		console.log("Message received: ", message);
+		ioHttp.emit("receiveMessage", message);
+	});
+
+	socket.on("typing", (data) => {
+		ioHttp.emit("typing", data);
+	});
+
+	socket.on("stopTyping", (data) => {
+		ioHttp.emit("stopTyping", data);
 	});
 
 	socket.on("disconnect", (reason) => {
