@@ -119,19 +119,6 @@ app.get("/", (req, res) => {
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
 
-// Schedule task to run every 15 minutes
-cron.schedule("*/10 * * * *", async () => {
-	try {
-		console.log("Running scheduled task to fetch Printify orders");
-		const response = await axios.get(
-			"https://serenejannat.com:8101/api/get-printify-orders"
-		);
-		console.log("Scheduled Task for Printify");
-	} catch (error) {
-		console.error("Error during scheduled task:");
-	}
-});
-
 const port = process.env.PORT || 8101;
 
 app.listen(port, () => {
