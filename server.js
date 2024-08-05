@@ -176,7 +176,7 @@ cron.schedule("*/10 * * * *", async () => {
 	try {
 		console.log("Running scheduled task to fetch Printify orders");
 		const response = await axios.get(
-			"https://serenejannat.com:8101/api/get-printify-orders"
+			"https://serenejannat.com/api/get-printify-orders"
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
