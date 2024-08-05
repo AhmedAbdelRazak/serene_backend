@@ -96,6 +96,7 @@ const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
 const https = require("https");
+const http = require("http");
 const fs = require("fs");
 const socketIo = require("socket.io");
 const cron = require("node-cron");
@@ -104,24 +105,26 @@ const axios = require("axios");
 // app
 const app = express();
 
-// SSL Certificates
+// SSL Certificates from Let's Encrypt
 const privateKey = fs.readFileSync(
-	"/home/infiniteappsadmin/SereneJannat/certs/privkey.pem",
+	"/etc/letsencrypt/live/serenejannat.com/privkey.pem",
 	"utf8"
 );
 const certificate = fs.readFileSync(
-	"/home/infiniteappsadmin/SereneJannat/certs/cert.pem",
+	"/etc/letsencrypt/live/serenejannat.com/cert.pem",
 	"utf8"
 );
 const ca = fs.readFileSync(
-	"/home/infiniteappsadmin/SereneJannat/certs/chain.pem",
+	"/etc/letsencrypt/live/serenejannat.com/chain.pem",
 	"utf8"
 );
 
 const credentials = { key: privateKey, cert: certificate, ca: ca };
 
 // Create HTTPS server
-const server = https.createServer(credentials, app);
+const httpsServer = https.createServer(credentials, app);
+// Create HTTP server
+const httpServer = http.createServer(app);
 
 // db
 mongoose
@@ -138,8 +141,22 @@ app.get("/", (req, res) => {
 	res.send("Hello From ecommerce API");
 });
 
-// Create the io instance
-const io = socketIo(server, {
+app.get("/api/testing", (req, res) => {
+	res.json({ message: "Testing endpoint is working" });
+});
+
+// Create the io instance for HTTPS
+const ioHttps = socketIo(httpsServer, {
+	cors: {
+		origin: "*",
+		methods: ["GET", "POST"],
+		allowedHeaders: ["Authorization"],
+		credentials: true,
+	},
+});
+
+// Create the io instance for HTTP
+const ioHttp = socketIo(httpServer, {
 	cors: {
 		origin: "*",
 		methods: ["GET", "POST"],
@@ -149,7 +166,7 @@ const io = socketIo(server, {
 });
 
 // Pass the io instance to the app
-app.set("io", io);
+app.set("io", ioHttps);
 
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
@@ -163,37 +180,47 @@ cron.schedule("*/10 * * * *", async () => {
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
-		console.error("Error during scheduled task:");
+		console.error("Error during scheduled task:", error);
 	}
 });
 
-const port = process.env.PORT || 8101;
+const httpsPort = process.env.HTTPS_PORT || 8101;
+const httpPort = process.env.HTTP_PORT || 8102;
 
-server.listen(port, () => {
-	console.log(`Server is running on port ${port}`);
+httpsServer.listen(httpsPort, () => {
+	console.log(`HTTPS Server is running on port ${httpsPort}`);
 });
 
-io.on("connection", (socket) => {
-	console.log("A user connected");
-
-	socket.on("sendMessage", (message) => {
-		console.log("Message received: ", message);
-		io.emit("receiveMessage", message);
-	});
-
-	socket.on("typing", (data) => {
-		io.emit("typing", data);
-	});
-
-	socket.on("stopTyping", (data) => {
-		io.emit("stopTyping", data);
-	});
-
-	socket.on("disconnect", (reason) => {
-		console.log(`A user disconnected: ${reason}`);
-	});
-
-	socket.on("connect_error", (error) => {
-		console.error(`Connection error: ${error.message}`);
-	});
+httpServer.listen(httpPort, () => {
+	console.log(`HTTP Server is running on port ${httpPort}`);
 });
+
+const ioHandlers = (io) => {
+	io.on("connection", (socket) => {
+		console.log("A user connected");
+
+		socket.on("sendMessage", (message) => {
+			console.log("Message received: ", message);
+			io.emit("receiveMessage", message);
+		});
+
+		socket.on("typing", (data) => {
+			io.emit("typing", data);
+		});
+
+		socket.on("stopTyping", (data) => {
+			io.emit("stopTyping", data);
+		});
+
+		socket.on("disconnect", (reason) => {
+			console.log(`A user disconnected: ${reason}`);
+		});
+
+		socket.on("connect_error", (error) => {
+			console.error(`Connection error: ${error.message}`);
+		});
+	});
+};
+
+ioHandlers(ioHttps);
+ioHandlers(ioHttp);
