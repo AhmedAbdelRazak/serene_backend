@@ -131,7 +131,7 @@ mongoose
 
 // middlewares
 app.use(morgan("dev"));
-app.use(cors());
+app.use(cors({ origin: "https://serenejannat.com" }));
 app.use(express.json({ limit: "50mb" }));
 
 app.get("/", (req, res) => {
