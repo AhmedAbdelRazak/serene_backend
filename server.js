@@ -95,32 +95,11 @@ const morgan = require("morgan");
 const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
-const https = require("https");
-const fs = require("fs");
 const cron = require("node-cron");
 const axios = require("axios");
 
 // app
 const app = express();
-
-// SSL Certificates
-const privateKey = fs.readFileSync(
-	"/home/infiniteappsadmin/SereneJannat/certs/privkey.pem",
-	"utf8"
-);
-const certificate = fs.readFileSync(
-	"/home/infiniteappsadmin/SereneJannat/certs/cert.pem",
-	"utf8"
-);
-const ca = fs.readFileSync(
-	"/home/infiniteappsadmin/SereneJannat/certs/fullchain.pem",
-	"utf8"
-);
-
-const credentials = { key: privateKey, cert: certificate, ca: ca };
-
-// Create HTTPS server
-const server = https.createServer(credentials, app);
 
 // db
 mongoose
@@ -155,6 +134,6 @@ cron.schedule("*/10 * * * *", async () => {
 
 const port = process.env.PORT || 8101;
 
-server.listen(port, () => {
+app.listen(port, () => {
 	console.log(`Server is running on port ${port}`);
 });
