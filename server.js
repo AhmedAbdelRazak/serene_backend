@@ -96,7 +96,6 @@ const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
 const https = require("https");
-const http = require("http");
 const fs = require("fs");
 const socketIo = require("socket.io");
 const cron = require("node-cron");
@@ -105,26 +104,24 @@ const axios = require("axios");
 // app
 const app = express();
 
-// SSL Certificates from Let's Encrypt
+// SSL Certificates
 const privateKey = fs.readFileSync(
-	"/etc/letsencrypt/live/serenejannat.com/privkey.pem",
+	"/home/infiniteappsadmin/SereneJannat/certs/privkey.pem",
 	"utf8"
 );
 const certificate = fs.readFileSync(
-	"/etc/letsencrypt/live/serenejannat.com/cert.pem",
+	"/home/infiniteappsadmin/SereneJannat/certs/cert.pem",
 	"utf8"
 );
 const ca = fs.readFileSync(
-	"/etc/letsencrypt/live/serenejannat.com/chain.pem",
+	"/home/infiniteappsadmin/SereneJannat/certs/chain.pem",
 	"utf8"
 );
 
 const credentials = { key: privateKey, cert: certificate, ca: ca };
 
 // Create HTTPS server
-const httpsServer = https.createServer(credentials, app);
-// Create HTTP server
-const httpServer = http.createServer(app);
+const server = https.createServer(credentials, app);
 
 // db
 mongoose
@@ -141,22 +138,8 @@ app.get("/", (req, res) => {
 	res.send("Hello From ecommerce API");
 });
 
-app.get("/api/testing", (req, res) => {
-	res.json({ message: "Testing endpoint is working" });
-});
-
-// Create the io instance for HTTPS
-const ioHttps = socketIo(httpsServer, {
-	cors: {
-		origin: "*",
-		methods: ["GET", "POST"],
-		allowedHeaders: ["Authorization"],
-		credentials: true,
-	},
-});
-
-// Create the io instance for HTTP
-const ioHttp = socketIo(httpServer, {
+// Create the io instance
+const io = socketIo(server, {
 	cors: {
 		origin: "*",
 		methods: ["GET", "POST"],
@@ -166,7 +149,7 @@ const ioHttp = socketIo(httpServer, {
 });
 
 // Pass the io instance to the app
-app.set("io", ioHttps);
+app.set("io", io);
 
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
@@ -176,51 +159,41 @@ cron.schedule("*/10 * * * *", async () => {
 	try {
 		console.log("Running scheduled task to fetch Printify orders");
 		const response = await axios.get(
-			"https://serenejannat.com/api/get-printify-orders"
+			"https://serenejannat.com:8101/api/get-printify-orders"
 		);
 		console.log("Scheduled Task for Printify");
 	} catch (error) {
-		console.error("Error during scheduled task:", error);
+		console.error("Error during scheduled task:");
 	}
 });
 
-const httpsPort = process.env.HTTPS_PORT || 8101;
-const httpPort = process.env.HTTP_PORT || 8102;
+const port = process.env.PORT || 8101;
 
-httpsServer.listen(httpsPort, () => {
-	console.log(`HTTPS Server is running on port ${httpsPort}`);
+server.listen(port, () => {
+	console.log(`Server is running on port ${port}`);
 });
 
-httpServer.listen(httpPort, () => {
-	console.log(`HTTP Server is running on port ${httpPort}`);
-});
+io.on("connection", (socket) => {
+	console.log("A user connected");
 
-const ioHandlers = (io) => {
-	io.on("connection", (socket) => {
-		console.log("A user connected");
-
-		socket.on("sendMessage", (message) => {
-			console.log("Message received: ", message);
-			io.emit("receiveMessage", message);
-		});
-
-		socket.on("typing", (data) => {
-			io.emit("typing", data);
-		});
-
-		socket.on("stopTyping", (data) => {
-			io.emit("stopTyping", data);
-		});
-
-		socket.on("disconnect", (reason) => {
-			console.log(`A user disconnected: ${reason}`);
-		});
-
-		socket.on("connect_error", (error) => {
-			console.error(`Connection error: ${error.message}`);
-		});
+	socket.on("sendMessage", (message) => {
+		console.log("Message received: ", message);
+		io.emit("receiveMessage", message);
 	});
-};
 
-ioHandlers(ioHttps);
-ioHandlers(ioHttp);
+	socket.on("typing", (data) => {
+		io.emit("typing", data);
+	});
+
+	socket.on("stopTyping", (data) => {
+		io.emit("stopTyping", data);
+	});
+
+	socket.on("disconnect", (reason) => {
+		console.log(`A user disconnected: ${reason}`);
+	});
+
+	socket.on("connect_error", (error) => {
+		console.error(`Connection error: ${error.message}`);
+	});
+});
