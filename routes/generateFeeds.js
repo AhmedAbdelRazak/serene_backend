@@ -35,7 +35,7 @@ router.get("/generate-feeds", async (req, res) => {
 			const brand = "Serene Jannat"; // Replace with your brand or derive from product if available
 			const imageLink = product.thumbnailImage[0]?.images[0]?.url || "";
 			const googleProductCategory =
-				product.category.categoryName || "YOUR_DEFAULT_GOOGLE_CATEGORY_ID";
+				product.category.categoryName || "Serene Jannat";
 			const productUrl = `https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`;
 			const categoryName = product.category.categoryName; // Properly populated categoryName
 
@@ -54,44 +54,42 @@ router.get("/generate-feeds", async (req, res) => {
 					? product.comments
 							.map(
 								(comment) => `
-                    <g:review>
-                        <g:reviewer>
-                            <g:name>${escapeJsonString(
+                    <review>
+                        <reviewer>
+                            <name>${escapeJsonString(
 															comment.postedBy
 																? comment.postedBy.name
 																: "Anonymous"
-														)}</g:name>
-                        </g:reviewer>
-                        <g:reviewBody>${escapeJsonString(
+														)}</name>
+                        </reviewer>
+                        <reviewBody>${escapeJsonString(
 													comment.text
-												)}</g:reviewBody>
-                        <g:reviewRating>
-                            <g:ratingValue>${
-															comment.rating || 5
-														}</g:ratingValue>
-                            <g:bestRating>5</g:bestRating>
-                            <g:worstRating>1</g:worstRating>
-                        </g:reviewRating>
-                        <g:datePublished>${new Date(
+												)}</reviewBody>
+                        <reviewRating>
+                            <ratingValue>${comment.rating || 5}</ratingValue>
+                            <bestRating>5</bestRating>
+                            <worstRating>1</worstRating>
+                        </reviewRating>
+                        <datePublished>${new Date(
 													comment.created
-												).toISOString()}</g:datePublished>
-                    </g:review>
+												).toISOString()}</datePublished>
+                    </review>
                 `
 							)
 							.join("")
 					: `
-                    <g:review>
-                        <g:reviewer>
-                            <g:name>Anonymous</g:name>
-                        </g:reviewer>
-                        <g:reviewBody>Excellent product!</g:reviewBody>
-                        <g:reviewRating>
-                            <g:ratingValue>5</g:ratingValue>
-                            <g:bestRating>5</g:bestRating>
-                            <g:worstRating>1</g:worstRating>
-                        </g:reviewRating>
-                        <g:datePublished>${new Date().toISOString()}</g:datePublished>
-                    </g:review>
+                    <review>
+                        <reviewer>
+                            <name>Anonymous</name>
+                        </reviewer>
+                        <reviewBody>Excellent product!</reviewBody>
+                        <reviewRating>
+                            <ratingValue>5</ratingValue>
+                            <bestRating>5</bestRating>
+                            <worstRating>1</worstRating>
+                        </reviewRating>
+                        <datePublished>${new Date().toISOString()}</datePublished>
+                    </review>
                 `;
 
 			// Generate the <item> entry for Google XML
@@ -110,9 +108,8 @@ router.get("/generate-feeds", async (req, res) => {
                     <g:brand>${brand}</g:brand>
                     <g:condition>${condition}</g:condition>
                     <g:google_product_category>${googleProductCategory}</g:google_product_category>
-                    <g:product_type><![CDATA[${categoryName}]]></g:product_type> <!-- Use the populated categoryName -->
-                    <g:mpn><![CDATA[${product.productSKU}]]></g:mpn>
-                    <g:identifier_exists>false</g:identifier_exists>
+                    <g:product_type><![CDATA[${categoryName}]]></g:product_type>
+                    <g:identifier_exists>false</g:identifier_exists> <!-- Explicitly tell Google no GTIN/MPN -->
                     <g:shipping>
                         <g:country>US</g:country>
                         <g:service>Standard</g:service>
@@ -129,35 +126,34 @@ router.get("/generate-feeds", async (req, res) => {
             `;
 			googleItems.push(googleItem);
 
-			// Generate the <item> entry for Facebook XML
+			// Generate the <item> entry for Facebook XML (no g: prefix)
 			const facebookItem = `
                 <item>
-                    <g:id>${product._id}</g:id>
-                    <g:title><![CDATA[${product.productName}]]></g:title>
-                    <g:description><![CDATA[${product.description.replace(
+                    <id>${product._id}</id>
+                    <title><![CDATA[${product.productName}]]></title>
+                    <description><![CDATA[${product.description.replace(
 											/<[^>]+>/g,
 											""
-										)}]]></g:description>
-                    <g:link>${productUrl}</g:link>
-                    <g:image_link>${imageLink}</g:image_link>
-                    <g:availability>${availability}</g:availability>
-                    <g:price>${price.toFixed(2)} USD</g:price>
-                    <g:brand>${brand}</g:brand>
-                    <g:condition>${condition}</g:condition>
-                    <g:product_type><![CDATA[${categoryName}]]></g:product_type> <!-- Use the populated categoryName -->
-                    <g:mpn><![CDATA[${product.productSKU}]]></g:mpn>
-                    <g:identifier_exists>false</g:identifier_exists>
-                    <g:shipping>
-                        <g:country>US</g:country>
-                        <g:service>Standard</g:service>
-                        <g:price>5.00 USD</g:price>
-                    </g:shipping>
-                    <g:shipping_weight>0.5 kg</g:shipping_weight>
-                    <g:shipping_length>10 cm</g:shipping_length>
-                    <g:shipping_width>10 cm</g:shipping_width>
-                    <g:shipping_height>15 cm</g:shipping_height>
-                    <g:ratingValue>${ratingValue}</g:ratingValue>
-                    <g:reviewCount>${reviewCount}</g:reviewCount>
+										)}]]></description>
+                    <link>${productUrl}</link>
+                    <image_link>${imageLink}</image_link>
+                    <availability>${availability}</availability>
+                    <price>${price.toFixed(2)} USD</price>
+                    <brand>${brand}</brand>
+                    <condition>${condition}</condition>
+                    <product_type><![CDATA[${categoryName}]]></product_type>
+                    <identifier_exists>false</identifier_exists> <!-- Explicitly tell Facebook no GTIN/MPN -->
+                    <shipping>
+                        <country>US</country>
+                        <service>Standard</service>
+                        <price>5.00 USD</price>
+                    </shipping>
+                    <shipping_weight>0.5 kg</shipping_weight>
+                    <shipping_length>10 cm</shipping_length>
+                    <shipping_width>10 cm</shipping_width>
+                    <shipping_height>15 cm</shipping_height>
+                    <ratingValue>${ratingValue}</ratingValue>
+                    <reviewCount>${reviewCount}</reviewCount>
                     ${reviews}
                 </item>
             `;
@@ -197,7 +193,7 @@ router.get("/generate-feeds", async (req, res) => {
 
 	// Wrap items in the RSS feed structure for Facebook
 	const facebookFeedContent = `
-        <rss xmlns="http://www.facebook.com/2008/fbml" version="2.0">
+        <rss version="2.0">
             <channel>
                 <title>Serene Jannat Products</title>
                 <link>https://serenejannat.com</link>
