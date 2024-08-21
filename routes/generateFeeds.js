@@ -39,7 +39,38 @@ router.get("/generate-feeds", async (req, res) => {
 			const productUrl = `https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`;
 			const categoryName = product.category.categoryName; // Properly populated categoryName
 
-			// Reviews and ratings (from ShopPageHelmet)
+			// Generate the <item> entry for Google XML
+			const googleItem = `
+                <item>
+                    <g:id>${product._id}</g:id>
+                    <g:title><![CDATA[${product.productName}]]></g:title>
+                    <g:description><![CDATA[${product.description.replace(
+											/<[^>]+>/g,
+											""
+										)}]]></g:description>
+                    <g:link>${productUrl}</g:link>
+                    <g:image_link>${imageLink}</g:image_link>
+                    <g:availability>${availability}</g:availability>
+                    <g:price>${price.toFixed(2)} USD</g:price>
+                    <g:brand>${brand}</g:brand>
+                    <g:condition>${condition}</g:condition>
+                    <g:google_product_category>${googleProductCategory}</g:google_product_category>
+                    <g:product_type><![CDATA[${categoryName}]]></g:product_type>
+                    <g:identifier_exists>false</g:identifier_exists> <!-- Explicitly tell Google no GTIN/MPN -->
+                    <g:shipping>
+                        <g:country>US</g:country>
+                        <g:service>Standard</g:service>
+                        <g:price>5.00 USD</g:price>
+                    </g:shipping>
+                    <g:shipping_weight>0.5 kg</g:shipping_weight>
+                    <g:shipping_length>10 cm</g:shipping_length>
+                    <g:shipping_width>10 cm</g:shipping_width>
+                    <g:shipping_height>15 cm</g:shipping_height>
+                </item>
+            `;
+			googleItems.push(googleItem);
+
+			// Reviews and ratings (from ShopPageHelmet) - Keep these only for Facebook
 			const ratingValue =
 				product.ratings.length > 0
 					? (
@@ -91,40 +122,6 @@ router.get("/generate-feeds", async (req, res) => {
                         <datePublished>${new Date().toISOString()}</datePublished>
                     </review>
                 `;
-
-			// Generate the <item> entry for Google XML
-			const googleItem = `
-                <item>
-                    <g:id>${product._id}</g:id>
-                    <g:title><![CDATA[${product.productName}]]></g:title>
-                    <g:description><![CDATA[${product.description.replace(
-											/<[^>]+>/g,
-											""
-										)}]]></g:description>
-                    <g:link>${productUrl}</g:link>
-                    <g:image_link>${imageLink}</g:image_link>
-                    <g:availability>${availability}</g:availability>
-                    <g:price>${price.toFixed(2)} USD</g:price>
-                    <g:brand>${brand}</g:brand>
-                    <g:condition>${condition}</g:condition>
-                    <g:google_product_category>${googleProductCategory}</g:google_product_category>
-                    <g:product_type><![CDATA[${categoryName}]]></g:product_type>
-                    <g:identifier_exists>false</g:identifier_exists> <!-- Explicitly tell Google no GTIN/MPN -->
-                    <g:shipping>
-                        <g:country>US</g:country>
-                        <g:service>Standard</g:service>
-                        <g:price>5.00 USD</g:price>
-                    </g:shipping>
-                    <g:shipping_weight>0.5 kg</g:shipping_weight>
-                    <g:shipping_length>10 cm</g:shipping_length>
-                    <g:shipping_width>10 cm</g:shipping_width>
-                    <g:shipping_height>15 cm</g:shipping_height>
-                    <g:ratingValue>${ratingValue}</g:ratingValue>
-                    <g:reviewCount>${reviewCount}</g:reviewCount>
-                    ${reviews}
-                </item>
-            `;
-			googleItems.push(googleItem);
 
 			// Generate the <item> entry for Facebook XML (no g: prefix)
 			const facebookItem = `
