@@ -19,6 +19,24 @@ const categoryMapping = {
 	votives: "Home & Garden > Decor > Candles > Votive Candles",
 };
 
+// Function to escape XML special characters
+function escapeXml(unsafe) {
+	return unsafe.replace(/[<>&'"]/g, function (c) {
+		switch (c) {
+			case "<":
+				return "&lt;";
+			case ">":
+				return "&gt;";
+			case "&":
+				return "&amp;";
+			case "'":
+				return "&apos;";
+			case '"':
+				return "&quot;";
+		}
+	});
+}
+
 router.get("/generate-feeds", async (req, res) => {
 	let googleItems = [];
 	let facebookItems = [];
@@ -43,7 +61,7 @@ router.get("/generate-feeds", async (req, res) => {
 				  )
 				: product.quantity;
 
-			// Use supported values for availability
+			// Ensure availability uses supported values
 			const availabilityOptions = [
 				"in stock",
 				"out of stock",
@@ -57,30 +75,36 @@ router.get("/generate-feeds", async (req, res) => {
 
 			const condition = "new";
 			const brand = "Serene Jannat"; // Replace with your brand or derive from product if available
-			const imageLink = product.thumbnailImage[0]?.images[0]?.url || "";
+			const imageLink = escapeXml(
+				product.thumbnailImage[0]?.images[0]?.url || ""
+			);
 
 			// Use the category mapping to set the Google Product Category
-			const googleProductCategory =
+			const googleProductCategory = escapeXml(
 				categoryMapping[product.category.categoryName.toLowerCase()] ||
-				"Serene Jannat";
-			const productUrl = `https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`;
-			const categoryName = product.category.categoryName; // Properly populated categoryName
+					"Serene Jannat"
+			);
+			const productUrl = escapeXml(
+				`https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`
+			);
+			const categoryName = escapeXml(product.category.categoryName); // Properly populated categoryName
 
 			// Generate the <item> entry for Google XML
 			const googleItem = `
                 <item>
-                    <g:id>${product._id}</g:id>
-                    <g:title><![CDATA[${product.productName}]]></g:title>
-                    <g:description><![CDATA[${product.description.replace(
-											/<[^>]+>/g,
-											""
+                    <g:id>${escapeXml(product._id.toString())}</g:id>
+                    <g:title><![CDATA[${escapeXml(
+											product.productName
+										)}]]></g:title>
+                    <g:description><![CDATA[${escapeXml(
+											product.description.replace(/<[^>]+>/g, "")
 										)}]]></g:description>
                     <g:link>${productUrl}</g:link>
                     <g:image_link>${imageLink}</g:image_link>
                     <g:availability>${availability}</g:availability>
                     <g:price>${price.toFixed(2)} USD</g:price>
-                    <g:brand>${brand}</g:brand>
-                    <g:condition>${condition}</g:condition>
+                    <g:brand>${escapeXml(brand)}</g:brand>
+                    <g:condition>${escapeXml(condition)}</g:condition>
                     <g:google_product_category>${googleProductCategory}</g:google_product_category>
                     <g:product_type><![CDATA[${categoryName}]]></g:product_type>
                     <g:identifier_exists>false</g:identifier_exists> <!-- Explicitly tell Google no GTIN/MPN -->
@@ -114,17 +138,17 @@ router.get("/generate-feeds", async (req, res) => {
 								(comment) => `
                     <review>
                         <reviewer>
-                            <name>${escapeJsonString(
+                            <name>${escapeXml(
 															comment.postedBy
 																? comment.postedBy.name
 																: "Anonymous"
 														)}</name>
                         </reviewer>
-                        <reviewBody>${escapeJsonString(
-													comment.text
-												)}</reviewBody>
+                        <reviewBody>${escapeXml(comment.text)}</reviewBody>
                         <reviewRating>
-                            <ratingValue>${comment.rating || 5}</ratingValue>
+                            <ratingValue>${escapeXml(
+															comment.rating || 5
+														)}</ratingValue>
                             <bestRating>5</bestRating>
                             <worstRating>1</worstRating>
                         </reviewRating>
@@ -153,18 +177,17 @@ router.get("/generate-feeds", async (req, res) => {
 			// Generate the <item> entry for Facebook XML (no g: prefix)
 			const facebookItem = `
                 <item>
-                    <id>${product._id}</id>
-                    <title><![CDATA[${product.productName}]]></title>
-                    <description><![CDATA[${product.description.replace(
-											/<[^>]+>/g,
-											""
+                    <id>${escapeXml(product._id.toString())}</id>
+                    <title><![CDATA[${escapeXml(product.productName)}]]></title>
+                    <description><![CDATA[${escapeXml(
+											product.description.replace(/<[^>]+>/g, "")
 										)}]]></description>
                     <link>${productUrl}</link>
                     <image_link>${imageLink}</image_link>
                     <availability>${availability}</availability>
                     <price>${price.toFixed(2)} USD</price>
-                    <brand>${brand}</brand>
-                    <condition>${condition}</condition>
+                    <brand>${escapeXml(brand)}</brand>
+                    <condition>${escapeXml(condition)}</condition>
                     <product_type><![CDATA[${categoryName}]]></product_type>
                     <identifier_exists>false</identifier_exists> <!-- Explicitly tell Facebook no GTIN/MPN -->
                     <shipping>
@@ -172,7 +195,7 @@ router.get("/generate-feeds", async (req, res) => {
                         <service>Standard</service>
                         <price>5.00 USD</price>
                     </shipping>
-                    <shipping_weight>0.5 kg</shipping_weight>
+                    <shipping_weight>0.5 kg</g:shipping_weight>
                     <shipping_length>10 cm</g:shipping_length>
                     <shipping_width>10 cm</g:shipping_width>
                     <shipping_height>15 cm</g:shipping_height>
