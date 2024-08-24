@@ -7,6 +7,18 @@ require("dotenv").config();
 // Import the Product model
 const Product = require("../models/product");
 
+// Mapping of your categories to Google Product Categories
+const categoryMapping = {
+	vases: "Home & Garden > Decor > Vases",
+	planters: "Home & Garden > Lawn & Garden > Planters",
+	candles: "Home & Garden > Decor > Candles",
+	"home decor": "Home & Garden > Decor",
+	outdoors: "Home & Garden > Lawn & Garden",
+	"t shirts": "Apparel & Accessories > Clothing > Shirts & Tops > T-Shirts",
+	seasonal: "Home & Garden > Holiday & Seasonal Decor",
+	votives: "Home & Garden > Decor > Candles > Votive Candles",
+};
+
 router.get("/generate-feeds", async (req, res) => {
 	let googleItems = [];
 	let facebookItems = [];
@@ -30,12 +42,27 @@ router.get("/generate-feeds", async (req, res) => {
 						0
 				  )
 				: product.quantity;
-			const availability = quantity > 0 ? "in stock" : "out of stock";
+
+			// Use supported values for availability
+			const availabilityOptions = [
+				"in stock",
+				"out of stock",
+				"preorder",
+				"backorder",
+			];
+			let availability = quantity > 0 ? "in stock" : "out of stock";
+			if (!availabilityOptions.includes(availability)) {
+				availability = "in stock"; // Default to "in stock" if an unsupported value is found
+			}
+
 			const condition = "new";
 			const brand = "Serene Jannat"; // Replace with your brand or derive from product if available
 			const imageLink = product.thumbnailImage[0]?.images[0]?.url || "";
+
+			// Use the category mapping to set the Google Product Category
 			const googleProductCategory =
-				product.category.categoryName || "Serene Jannat";
+				categoryMapping[product.category.categoryName.toLowerCase()] ||
+				"Serene Jannat";
 			const productUrl = `https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`;
 			const categoryName = product.category.categoryName; // Properly populated categoryName
 
@@ -146,9 +173,9 @@ router.get("/generate-feeds", async (req, res) => {
                         <price>5.00 USD</price>
                     </shipping>
                     <shipping_weight>0.5 kg</shipping_weight>
-                    <shipping_length>10 cm</shipping_length>
-                    <shipping_width>10 cm</shipping_width>
-                    <shipping_height>15 cm</shipping_height>
+                    <shipping_length>10 cm</g:shipping_length>
+                    <shipping_width>10 cm</g:shipping_width>
+                    <shipping_height>15 cm</g:shipping_height>
                     <ratingValue>${ratingValue}</ratingValue>
                     <reviewCount>${reviewCount}</reviewCount>
                     ${reviews}
