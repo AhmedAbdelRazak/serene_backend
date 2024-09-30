@@ -31,10 +31,40 @@ function escapeXml(unsafe) {
 				return "&amp;";
 			case "'":
 				return "&apos;";
-			case '"':
+			case '"': // corrected case statement
 				return "&quot;";
 		}
 	});
+}
+
+// Function to generate image links for products with or without attributes
+function generateImageLinks(product) {
+	let images = [];
+	if (product.productAttributes && product.productAttributes.length > 0) {
+		// For products with attributes, include all images from product attributes
+		product.productAttributes.forEach((attr) => {
+			if (attr.productImages && attr.productImages.length > 0) {
+				images.push(...attr.productImages.map((img) => escapeXml(img.url)));
+			}
+		});
+	} else {
+		// For products without attributes, include all images from thumbnailImage array
+		if (product.thumbnailImage && product.thumbnailImage.length > 0) {
+			images.push(
+				...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
+			);
+		}
+	}
+	return images;
+}
+
+// Conversion functions
+function convertLbsToKg(lbs) {
+	return (lbs * 0.453592).toFixed(2); // Convert lbs to kg
+}
+
+function convertInchesToCm(inches) {
+	return (inches * 2.54).toFixed(2); // Convert inches to cm
 }
 
 router.get("/generate-feeds", async (req, res) => {
@@ -51,9 +81,18 @@ router.get("/generate-feeds", async (req, res) => {
 		if (product.category && product.category.categoryStatus) {
 			const hasVariables =
 				product.productAttributes && product.productAttributes.length > 0;
-			const price = hasVariables
+
+			// Handle price and sale price logic
+			const originalPrice = hasVariables
+				? product.productAttributes[0].price
+				: product.price;
+			const priceAfterDiscount = hasVariables
 				? product.productAttributes[0].priceAfterDiscount
 				: product.priceAfterDiscount;
+
+			const finalPrice =
+				priceAfterDiscount < originalPrice ? priceAfterDiscount : originalPrice;
+
 			const quantity = hasVariables
 				? product.productAttributes.reduce(
 						(acc, attr) => acc + attr.quantity,
@@ -75,9 +114,8 @@ router.get("/generate-feeds", async (req, res) => {
 
 			const condition = "new";
 			const brand = "Serene Jannat"; // Replace with your brand or derive from product if available
-			const imageLink = escapeXml(
-				product.thumbnailImage[0]?.images[0]?.url || ""
-			);
+			const images = generateImageLinks(product); // Use the function to get images
+			const imageLink = images.length > 0 ? images[0] : ""; // Use first image as the main image
 
 			// Use the category mapping to set the Google Product Category
 			const googleProductCategory = escapeXml(
@@ -88,6 +126,24 @@ router.get("/generate-feeds", async (req, res) => {
 				`https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`
 			);
 			const categoryName = escapeXml(product.category.categoryName); // Properly populated categoryName
+
+			// For products with attributes, include size and color info
+			let size = "";
+			let color = "";
+			if (hasVariables) {
+				const attribute = product.productAttributes[0];
+				size = attribute.size || "";
+				color =
+					attribute.color && attribute.color.startsWith("#")
+						? "" // Skip hex codes
+						: attribute.color || "";
+			}
+
+			// Extract dimensions from geodata and convert to kg/cm
+			const weight = convertLbsToKg(product.geodata.weight || 0);
+			const length = convertInchesToCm(product.geodata.length || 0);
+			const width = convertInchesToCm(product.geodata.width || 0);
+			const height = convertInchesToCm(product.geodata.height || 0);
 
 			// Generate the <item> entry for Google XML
 			const googleItem = `
@@ -101,27 +157,38 @@ router.get("/generate-feeds", async (req, res) => {
 										)}]]></g:description>
                     <g:link>${productUrl}</g:link>
                     <g:image_link>${imageLink}</g:image_link>
+                    ${images
+											.slice(1)
+											.map(
+												(img) =>
+													`<g:additional_image_link>${img}</g:additional_image_link>`
+											)
+											.join("\n")}
                     <g:availability>${availability}</g:availability>
-                    <g:price>${price.toFixed(2)} USD</g:price>
+                    <g:price>${finalPrice.toFixed(2)} USD</g:price>
+                    ${
+											priceAfterDiscount < originalPrice
+												? `<g:sale_price>${priceAfterDiscount.toFixed(
+														2
+												  )} USD</g:sale_price>`
+												: ""
+										}
                     <g:brand>${escapeXml(brand)}</g:brand>
                     <g:condition>${escapeXml(condition)}</g:condition>
                     <g:google_product_category>${googleProductCategory}</g:google_product_category>
                     <g:product_type><![CDATA[${categoryName}]]></g:product_type>
+                    ${size ? `<g:size>${size}</g:size>` : ""}
+                    ${color ? `<g:color>${color}</g:color>` : ""}
                     <g:identifier_exists>false</g:identifier_exists> <!-- Explicitly tell Google no GTIN/MPN -->
-                    <g:shipping>
-                        <g:country>US</g:country>
-                        <g:service>Standard</g:service>
-                        <g:price>5.00 USD</g:price>
-                    </g:shipping>
-                    <g:shipping_weight>0.5 kg</g:shipping_weight>
-                    <g:shipping_length>10 cm</g:shipping_length>
-                    <g:shipping_width>10 cm</g:shipping_width>
-                    <g:shipping_height>15 cm</g:shipping_height>
+                    <g:shipping_weight>${weight} kg</g:shipping_weight>
+                    <g:shipping_length>${length} cm</g:shipping_length>
+                    <g:shipping_width>${width} cm</g:shipping_width>
+                    <g:shipping_height>${height} cm</g:shipping_height>
                 </item>
             `;
 			googleItems.push(googleItem);
 
-			// Reviews and ratings (from ShopPageHelmet) - Keep these only for Facebook
+			// Reviews and ratings - Keep these only for Facebook
 			const ratingValue =
 				product.ratings.length > 0
 					? (
@@ -185,20 +252,15 @@ router.get("/generate-feeds", async (req, res) => {
                     <link>${productUrl}</link>
                     <image_link>${imageLink}</image_link>
                     <availability>${availability}</availability>
-                    <price>${price.toFixed(2)} USD</price>
+                    <price>${finalPrice.toFixed(2)} USD</price>
                     <brand>${escapeXml(brand)}</brand>
                     <condition>${escapeXml(condition)}</condition>
                     <product_type><![CDATA[${categoryName}]]></product_type>
                     <identifier_exists>false</identifier_exists> <!-- Explicitly tell Facebook no GTIN/MPN -->
-                    <shipping>
-                        <country>US</country>
-                        <service>Standard</service>
-                        <price>5.00 USD</price>
-                    </shipping>
-                    <shipping_weight>0.5 kg</g:shipping_weight>
-                    <shipping_length>10 cm</g:shipping_length>
-                    <shipping_width>10 cm</g:shipping_width>
-                    <shipping_height>15 cm</g:shipping_height>
+                    <shipping_weight>${weight} kg</shipping_weight>
+                    <shipping_length>${length} cm</shipping_length>
+                    <shipping_width>${width} cm</shipping_width>
+                    <shipping_height>${height} cm</shipping_height>
                     <ratingValue>${ratingValue}</ratingValue>
                     <reviewCount>${reviewCount}</reviewCount>
                     ${reviews}
