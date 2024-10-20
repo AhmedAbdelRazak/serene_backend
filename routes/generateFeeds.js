@@ -120,16 +120,17 @@ router.get("/generate-feeds", async (req, res) => {
 			// Use the category mapping to set the Google Product Category
 			const googleProductCategory = escapeXml(
 				categoryMapping[product.category.categoryName.toLowerCase()] ||
-					"Serene Jannat"
+					"Home & Garden" // Provide a default valid Google Product Category
 			);
 			const productUrl = escapeXml(
 				`https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`
 			);
 			const categoryName = escapeXml(product.category.categoryName); // Properly populated categoryName
 
-			// For products with attributes, include size and color info
+			// For products with attributes, include size, color, and age_group info
 			let size = "";
 			let color = "";
+			let ageGroup = "adult"; // Default to adult if no age group is provided
 			if (hasVariables) {
 				const attribute = product.productAttributes[0];
 				size = attribute.size || "";
@@ -137,6 +138,7 @@ router.get("/generate-feeds", async (req, res) => {
 					attribute.color && attribute.color.startsWith("#")
 						? "" // Skip hex codes
 						: attribute.color || "";
+				ageGroup = attribute.ageGroup || "adult"; // Default age group
 			}
 
 			// Extract dimensions from geodata and convert to kg/cm
@@ -144,6 +146,11 @@ router.get("/generate-feeds", async (req, res) => {
 			const length = convertInchesToCm(product.geodata.length || 0);
 			const width = convertInchesToCm(product.geodata.width || 0);
 			const height = convertInchesToCm(product.geodata.height || 0);
+
+			// Ensure valid real numbers for shipping dimensions
+			const validHeight = isNaN(height) ? "0.00" : height;
+			const validLength = isNaN(length) ? "0.00" : length;
+			const validWidth = isNaN(width) ? "0.00" : width;
 
 			// Generate the <item> entry for Google XML
 			const googleItem = `
@@ -179,11 +186,22 @@ router.get("/generate-feeds", async (req, res) => {
                     <g:product_type><![CDATA[${categoryName}]]></g:product_type>
                     ${size ? `<g:size>${size}</g:size>` : ""}
                     ${color ? `<g:color>${color}</g:color>` : ""}
+                    <g:age_group>${ageGroup}</g:age_group>
                     <g:identifier_exists>false</g:identifier_exists> <!-- Explicitly tell Google no GTIN/MPN -->
                     <g:shipping_weight>${weight} kg</g:shipping_weight>
-                    <g:shipping_length>${length} cm</g:shipping_length>
-                    <g:shipping_width>${width} cm</g:shipping_width>
-                    <g:shipping_height>${height} cm</g:shipping_height>
+                    <g:shipping_length>${validLength} cm</g:shipping_length>
+                    <g:shipping_width>${validWidth} cm</g:shipping_width>
+                    <g:shipping_height>${validHeight} cm</g:shipping_height>
+                    <g:tax>
+                        <g:country>US</g:country>
+                        <g:rate>0.00</g:rate> <!-- Adjust based on tax rate if applicable -->
+                        <g:tax_ship>true</g:tax_ship>
+                    </g:tax>
+                    <g:shipping>
+                        <g:country>US</g:country>
+                        <g:service>Standard shipping</g:service>
+                        <g:price>0.00 USD</g:price> <!-- Adjust based on shipping cost -->
+                    </g:shipping>
                 </item>
             `;
 			googleItems.push(googleItem);
@@ -258,9 +276,9 @@ router.get("/generate-feeds", async (req, res) => {
                     <product_type><![CDATA[${categoryName}]]></product_type>
                     <identifier_exists>false</identifier_exists> <!-- Explicitly tell Facebook no GTIN/MPN -->
                     <shipping_weight>${weight} kg</shipping_weight>
-                    <shipping_length>${length} cm</shipping_length>
-                    <shipping_width>${width} cm</shipping_width>
-                    <shipping_height>${height} cm</shipping_height>
+                    <shipping_length>${validLength} cm</shipping_length>
+                    <shipping_width>${validWidth} cm</shipping_width>
+                    <shipping_height>${validHeight} cm</shipping_height>
                     <ratingValue>${ratingValue}</ratingValue>
                     <reviewCount>${reviewCount}</reviewCount>
                     ${reviews}
