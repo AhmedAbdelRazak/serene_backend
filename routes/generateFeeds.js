@@ -106,7 +106,7 @@ router.get("/generate-feeds", async (req, res) => {
 			const imageLink =
 				images.length > 0
 					? images[0]
-					: "https://example.com/placeholder-image.jpg";
+					: "https://res.cloudinary.com/infiniteapps/image/upload/v1719198504/serene_janat/1719198503886.png";
 
 			const googleProductCategory = escapeXml(
 				categoryMapping[product.category.categoryName.toLowerCase()] ||
