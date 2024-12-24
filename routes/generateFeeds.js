@@ -31,31 +31,30 @@ function escapeXml(unsafe) {
 				return "&amp;";
 			case "'":
 				return "&apos;";
-			case '"': // corrected case statement
+			case '"':
 				return "&quot;";
 		}
 	});
 }
 
-// Function to generate image links for products with or without attributes
+// Function to generate image links for products
 function generateImageLinks(product) {
 	let images = [];
 	if (product.productAttributes && product.productAttributes.length > 0) {
-		// For products with attributes, include all images from product attributes
+		// Include all images from product attributes
 		product.productAttributes.forEach((attr) => {
 			if (attr.productImages && attr.productImages.length > 0) {
 				images.push(...attr.productImages.map((img) => escapeXml(img.url)));
 			}
 		});
-	} else {
-		// For products without attributes, include all images from thumbnailImage array
-		if (product.thumbnailImage && product.thumbnailImage.length > 0) {
-			images.push(
-				...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
-			);
-		}
+	} else if (product.thumbnailImage && product.thumbnailImage.length > 0) {
+		// Include all images from thumbnailImage array
+		images.push(
+			...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
+		);
 	}
-	return images;
+	// Filter for valid formats (JPEG, PNG, GIF)
+	return images.filter((img) => /\.(jpg|jpeg|png|gif)$/i.test(img));
 }
 
 // Conversion functions
@@ -71,25 +70,24 @@ router.get("/generate-feeds", async (req, res) => {
 	let googleItems = [];
 	let facebookItems = [];
 
-	// Fetch active products from MongoDB and populate the category field
+	// Fetch active products from MongoDB
 	const products = await Product.find({ activeProduct: true }).populate(
 		"category"
 	);
 
-	// Generate product items for both feeds
+	// Generate product items for feeds
 	for (let product of products) {
 		if (product.category && product.category.categoryStatus) {
 			const hasVariables =
 				product.productAttributes && product.productAttributes.length > 0;
 
-			// Handle price and sale price logic
+			// Price and availability logic
 			const originalPrice = hasVariables
 				? product.productAttributes[0].price
 				: product.price;
 			const priceAfterDiscount = hasVariables
 				? product.productAttributes[0].priceAfterDiscount
 				: product.priceAfterDiscount;
-
 			const finalPrice =
 				priceAfterDiscount < originalPrice ? priceAfterDiscount : originalPrice;
 
@@ -100,59 +98,44 @@ router.get("/generate-feeds", async (req, res) => {
 				  )
 				: product.quantity;
 
-			// Ensure availability uses supported values
-			const availabilityOptions = [
-				"in stock",
-				"out of stock",
-				"preorder",
-				"backorder",
-			];
-			let availability = quantity > 0 ? "in stock" : "out of stock";
-			if (!availabilityOptions.includes(availability)) {
-				availability = "in stock"; // Default to "in stock" if an unsupported value is found
-			}
-
+			const availability = quantity > 0 ? "in stock" : "out of stock";
 			const condition = "new";
-			const brand = "Serene Jannat"; // Replace with your brand or derive from product if available
-			const images = generateImageLinks(product); // Use the function to get images
-			const imageLink = images.length > 0 ? images[0] : ""; // Use first image as the main image
+			const brand = "Serene Jannat";
+			const images = generateImageLinks(product);
+			const imageLink = images.length > 0 ? images[0] : "";
 
-			// Use the category mapping to set the Google Product Category
+			// Google Product Category
 			const googleProductCategory = escapeXml(
 				categoryMapping[product.category.categoryName.toLowerCase()] ||
-					"Home & Garden" // Provide a default valid Google Product Category
+					"Home & Garden"
 			);
-			const productUrl = escapeXml(
-				`https://serenejannat.com/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`
-			);
-			const categoryName = escapeXml(product.category.categoryName); // Properly populated categoryName
 
-			// For products with attributes, include size, color, and age_group info
+			// Additional Attributes for Variants
 			let size = "";
-			let color = "";
-			let ageGroup = "adult"; // Default to adult if no age group is provided
+			let color = "unspecified"; // Default to unspecified if missing
+			let ageGroup = "adult"; // Default to adult
 			if (hasVariables) {
 				const attribute = product.productAttributes[0];
 				size = attribute.size || "";
 				color =
 					attribute.color && attribute.color.startsWith("#")
-						? "" // Skip hex codes
-						: attribute.color || "";
-				ageGroup = attribute.ageGroup || "adult"; // Default age group
+						? "unspecified"
+						: attribute.color || "unspecified";
+				ageGroup = attribute.ageGroup || "adult";
 			}
 
-			// Extract dimensions from geodata and convert to kg/cm
+			// Shipping Dimensions
 			const weight = convertLbsToKg(product.geodata.weight || 0);
 			const length = convertInchesToCm(product.geodata.length || 0);
 			const width = convertInchesToCm(product.geodata.width || 0);
 			const height = convertInchesToCm(product.geodata.height || 0);
 
-			// Ensure valid real numbers for shipping dimensions
+			// Ensure valid shipping dimensions
 			const validHeight = isNaN(height) ? "0.00" : height;
 			const validLength = isNaN(length) ? "0.00" : length;
 			const validWidth = isNaN(width) ? "0.00" : width;
 
-			// Generate the <item> entry for Google XML
+			// Generate Google Item XML
 			const googleItem = `
                 <item>
                     <g:id>${escapeXml(product._id.toString())}</g:id>
@@ -162,7 +145,11 @@ router.get("/generate-feeds", async (req, res) => {
                     <g:description><![CDATA[${escapeXml(
 											product.description.replace(/<[^>]+>/g, "")
 										)}]]></g:description>
-                    <g:link>${productUrl}</g:link>
+                    <g:link>https://serenejannat.com/single-product/${escapeXml(
+											product.slug
+										)}/${escapeXml(product.category.categorySlug)}/${
+				product._id
+			}</g:link>
                     <g:image_link>${imageLink}</g:image_link>
                     ${images
 											.slice(1)
@@ -183,83 +170,27 @@ router.get("/generate-feeds", async (req, res) => {
                     <g:brand>${escapeXml(brand)}</g:brand>
                     <g:condition>${escapeXml(condition)}</g:condition>
                     <g:google_product_category>${googleProductCategory}</g:google_product_category>
-                    <g:product_type><![CDATA[${categoryName}]]></g:product_type>
-                    ${size ? `<g:size>${size}</g:size>` : ""}
-                    ${color ? `<g:color>${color}</g:color>` : ""}
-                    <g:age_group>${ageGroup}</g:age_group>
-                    <g:identifier_exists>false</g:identifier_exists> <!-- Explicitly tell Google no GTIN/MPN -->
+                    <g:product_type><![CDATA[${escapeXml(
+											product.category.categoryName
+										)}]]></g:product_type>
+                    <g:size>${escapeXml(size)}</g:size>
+                    <g:color>${escapeXml(color)}</g:color>
+                    <g:age_group>${escapeXml(ageGroup)}</g:age_group>
+                    <g:identifier_exists>false</g:identifier_exists>
                     <g:shipping_weight>${weight} kg</g:shipping_weight>
                     <g:shipping_length>${validLength} cm</g:shipping_length>
                     <g:shipping_width>${validWidth} cm</g:shipping_width>
                     <g:shipping_height>${validHeight} cm</g:shipping_height>
                     <g:tax>
                         <g:country>US</g:country>
-                        <g:rate>0.00</g:rate> <!-- Adjust based on tax rate if applicable -->
+                        <g:rate>0.00</g:rate>
                         <g:tax_ship>true</g:tax_ship>
                     </g:tax>
-                    <g:shipping>
-                        <g:country>US</g:country>
-                        <g:service>Standard shipping</g:service>
-                        <g:price>0.00 USD</g:price> <!-- Adjust based on shipping cost -->
-                    </g:shipping>
                 </item>
             `;
 			googleItems.push(googleItem);
 
-			// Reviews and ratings - Keep these only for Facebook
-			const ratingValue =
-				product.ratings.length > 0
-					? (
-							product.ratings.reduce((acc, rating) => acc + rating.star, 0) /
-							product.ratings.length
-					  ).toFixed(1)
-					: "5.0";
-			const reviewCount =
-				product.ratings.length > 0 ? product.ratings.length : 1;
-			const reviews =
-				product.comments.length > 0
-					? product.comments
-							.map(
-								(comment) => `
-                    <review>
-                        <reviewer>
-                            <name>${escapeXml(
-															comment.postedBy
-																? comment.postedBy.name
-																: "Anonymous"
-														)}</name>
-                        </reviewer>
-                        <reviewBody>${escapeXml(comment.text)}</reviewBody>
-                        <reviewRating>
-                            <ratingValue>${escapeXml(
-															comment.rating || 5
-														)}</ratingValue>
-                            <bestRating>5</bestRating>
-                            <worstRating>1</worstRating>
-                        </reviewRating>
-                        <datePublished>${new Date(
-													comment.created
-												).toISOString()}</datePublished>
-                    </review>
-                `
-							)
-							.join("")
-					: `
-                    <review>
-                        <reviewer>
-                            <name>Anonymous</name>
-                        </reviewer>
-                        <reviewBody>Excellent product!</reviewBody>
-                        <reviewRating>
-                            <ratingValue>5</ratingValue>
-                            <bestRating>5</bestRating>
-                            <worstRating>1</worstRating>
-                        </reviewRating>
-                        <datePublished>${new Date().toISOString()}</datePublished>
-                    </review>
-                `;
-
-			// Generate the <item> entry for Facebook XML (no g: prefix)
+			// Generate Facebook Item XML
 			const facebookItem = `
                 <item>
                     <id>${escapeXml(product._id.toString())}</id>
@@ -267,40 +198,40 @@ router.get("/generate-feeds", async (req, res) => {
                     <description><![CDATA[${escapeXml(
 											product.description.replace(/<[^>]+>/g, "")
 										)}]]></description>
-                    <link>${productUrl}</link>
+                    <link>https://serenejannat.com/single-product/${escapeXml(
+											product.slug
+										)}/${escapeXml(product.category.categorySlug)}/${
+				product._id
+			}</link>
                     <image_link>${imageLink}</image_link>
                     <availability>${availability}</availability>
                     <price>${finalPrice.toFixed(2)} USD</price>
                     <brand>${escapeXml(brand)}</brand>
                     <condition>${escapeXml(condition)}</condition>
-                    <product_type><![CDATA[${categoryName}]]></product_type>
-                    <identifier_exists>false</identifier_exists> <!-- Explicitly tell Facebook no GTIN/MPN -->
+                    <product_type><![CDATA[${escapeXml(
+											product.category.categoryName
+										)}]]></product_type>
                     <shipping_weight>${weight} kg</shipping_weight>
                     <shipping_length>${validLength} cm</shipping_length>
                     <shipping_width>${validWidth} cm</shipping_width>
                     <shipping_height>${validHeight} cm</shipping_height>
-                    <ratingValue>${ratingValue}</ratingValue>
-                    <reviewCount>${reviewCount}</reviewCount>
-                    ${reviews}
                 </item>
             `;
 			facebookItems.push(facebookItem);
 		}
 	}
 
-	// Wrap items in the RSS feed structure for Google
+	// Generate Google Feed XML
 	const googleFeedContent = `
         <rss xmlns:g="http://base.google.com/ns/1.0" version="2.0">
             <channel>
                 <title>Serene Jannat Products</title>
                 <link>https://serenejannat.com</link>
-                <description>Product feed for Serene Jannat Gift Store</description>
+                <description>High-quality product feed for Google Merchant Center</description>
                 ${googleItems.join("\n")}
             </channel>
         </rss>
     `;
-
-	// Write the Google XML content to a file in the public directory
 	const googleWriteStream = createWriteStream(
 		resolve(__dirname, "../../serene_frontend/public/merchant-center-feed.xml"),
 		{ flags: "w" }
@@ -309,28 +240,17 @@ router.get("/generate-feeds", async (req, res) => {
 	googleWriteStream.write(googleFeedContent, "utf-8");
 	googleWriteStream.end();
 
-	googleWriteStream.on("error", (err) => {
-		console.error(err);
-		res.status(500).end();
-	});
-
-	googleWriteStream.on("finish", () => {
-		console.log("Google Merchant Center feed has been generated");
-	});
-
-	// Wrap items in the RSS feed structure for Facebook
+	// Generate Facebook Feed XML
 	const facebookFeedContent = `
         <rss version="2.0">
             <channel>
                 <title>Serene Jannat Products</title>
                 <link>https://serenejannat.com</link>
-                <description>Product feed for Serene Jannat Gift Store</description>
+                <description>High-quality product feed for Facebook</description>
                 ${facebookItems.join("\n")}
             </channel>
         </rss>
     `;
-
-	// Write the Facebook XML content to a file in the public directory
 	const facebookWriteStream = createWriteStream(
 		resolve(__dirname, "../../serene_frontend/public/facebook-feed.xml"),
 		{ flags: "w" }
@@ -339,14 +259,12 @@ router.get("/generate-feeds", async (req, res) => {
 	facebookWriteStream.write(facebookFeedContent, "utf-8");
 	facebookWriteStream.end();
 
-	facebookWriteStream.on("error", (err) => {
-		console.error(err);
-		res.status(500).end();
+	googleWriteStream.on("finish", () => {
+		console.log("Google Merchant Center feed generated successfully");
 	});
-
 	facebookWriteStream.on("finish", () => {
-		console.log("Facebook feed has been generated");
-		res.send("Feeds have been generated successfully");
+		console.log("Facebook feed generated successfully");
+		res.send("Feeds for Google and Facebook generated successfully.");
 	});
 });
 
