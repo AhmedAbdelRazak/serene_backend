@@ -21,12 +21,12 @@ router.get("/generate-sitemap", async (req, res) => {
 
 	// Add static links
 	const staticLinks = [
-		{ url: "/", lastmod: currentDate, changefreq: "weekly", priority: 0.8 },
+		{ url: "/", lastmod: currentDate, changefreq: "weekly", priority: 1.0 },
 		{
-			url: "/our-products?offers=jannatoffers",
+			url: "/our-products",
 			lastmod: currentDate,
 			changefreq: "weekly",
-			priority: 0.8,
+			priority: 0.9,
 		},
 		{
 			url: "/about",
@@ -44,35 +44,31 @@ router.get("/generate-sitemap", async (req, res) => {
 			url: "/signup",
 			lastmod: currentDate,
 			changefreq: "monthly",
-			priority: 1,
+			priority: 1.0,
 		},
-		{
-			url: "/our-products",
-			lastmod: currentDate,
-			changefreq: "weekly",
-			priority: 0.8,
-		},
-		{
-			url: "/our-products?offers=jannatoffers",
-			lastmod: currentDate,
-			changefreq: "weekly",
-			priority: 0.8,
-		},
-
-		// Add other static links as necessary
 	];
 
 	links.push(...staticLinks);
 
-	// Generate product URLs
+	// Generate product URLs with images
 	for (let product of products) {
 		if (product.category && product.category.categoryStatus) {
-			links.push({
+			const productLink = {
 				url: `/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`,
 				lastmod: product.updatedAt.toISOString(),
 				changefreq: "weekly",
 				priority: 0.8,
-			});
+			};
+
+			// Include images in sitemap
+			if (product.thumbnailImage && product.thumbnailImage.length > 0) {
+				productLink.img = product.thumbnailImage[0].images.map((img) => ({
+					url: img.url,
+					title: product.productName,
+				}));
+			}
+
+			links.push(productLink);
 		}
 	}
 
@@ -91,18 +87,24 @@ router.get("/generate-sitemap", async (req, res) => {
 			url,
 			lastmod: currentDate,
 			changefreq: "weekly",
-			priority: 0.8,
+			priority: 0.9,
 		});
 	}
 
 	// Create a stream to pass to SitemapStream
 	const sitemapStream = new SitemapStream({
-		hostname: "https://serenejannat.com", // replace with your actual hostname
+		hostname: "https://serenejannat.com", // Replace with your actual hostname
 	});
 
-	// Add URLs to the sitemap
+	// Add URLs and images to the sitemap
 	for (let link of links) {
-		sitemapStream.write(link);
+		sitemapStream.write({
+			url: link.url,
+			lastmod: link.lastmod,
+			changefreq: link.changefreq,
+			priority: link.priority,
+			img: link.img, // Add image data (if available)
+		});
 	}
 
 	sitemapStream.end();
