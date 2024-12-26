@@ -16,7 +16,7 @@ const categoryMapping = {
 	outdoors: "Home & Garden > Lawn & Garden > Gardening > Gardening Accessories",
 	"t shirts": "Apparel & Accessories > Clothing > Shirts & Tops",
 	seasonal: "Home & Garden > Decor > Seasonal & Holiday Decorations",
-	votives: "Home & Garden > Decor > Candles > Votive Candles",
+	votives: "Home & Garden > Decor > Home Fragrances > Candles",
 };
 
 // Function to escape XML special characters
