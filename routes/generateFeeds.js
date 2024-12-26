@@ -53,8 +53,19 @@ function generateImageLinks(product) {
 			...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
 		);
 	}
-	// Filter for valid formats (JPEG, PNG, GIF) and limit to max 5 images
-	return images.filter((img) => /\.(jpg|jpeg|png|gif)$/i.test(img)).slice(0, 5);
+	// Filter for valid formats (JPEG, PNG, GIF, WebP, BMP, TIFF) and limit to max 5 images
+	const validImages = images.filter((img) =>
+		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(img)
+	);
+
+	// Add a fallback if no valid images are found
+	if (validImages.length === 0) {
+		validImages.push(
+			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
+		); // Replace with your default valid image URL
+	}
+
+	return validImages.slice(0, 5); // Limit to 5 images
 }
 
 // Conversion functions
@@ -106,7 +117,7 @@ router.get("/generate-feeds", async (req, res) => {
 			const imageLink =
 				images.length > 0
 					? images[0]
-					: "https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/1723694290986.png";
+					: "https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"; // Default valid image
 
 			const googleProductCategory = escapeXml(
 				categoryMapping[product.category.categoryName.toLowerCase()] ||
