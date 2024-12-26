@@ -10,7 +10,7 @@ const Product = require("../models/product");
 // Mapping of your categories to Google Product Categories
 const categoryMapping = {
 	vases: "Home & Garden > Decor > Vases",
-	planters: "Home & Garden > Lawn & Garden > Planters",
+	planters: "Home & Garden > Lawn & Garden > Gardening > Pot & Planter Liners",
 	candles: "Home & Garden > Decor > Candles",
 	"home decor": "Home & Garden > Decor",
 	outdoors: "Home & Garden > Lawn & Garden > Gardening > Gardening Accessories",
