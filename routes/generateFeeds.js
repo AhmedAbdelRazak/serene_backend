@@ -13,9 +13,9 @@ const categoryMapping = {
 	planters: "Home & Garden > Lawn & Garden > Planters",
 	candles: "Home & Garden > Decor > Candles",
 	"home decor": "Home & Garden > Decor",
-	outdoors: "Home & Garden > Lawn & Garden",
-	"t shirts": "Apparel & Accessories > Clothing > Shirts & Tops > T-Shirts",
-	seasonal: "Home & Garden > Holiday & Seasonal Decor",
+	outdoors: "Home & Garden > Lawn & Garden > Gardening > Gardening Accessories",
+	"t shirts": "Apparel & Accessories > Clothing > Shirts & Tops",
+	seasonal: "Home & Garden > Decor > Seasonal & Holiday Decorations",
 	votives: "Home & Garden > Decor > Candles > Votive Candles",
 };
 
@@ -53,17 +53,17 @@ function generateImageLinks(product) {
 			...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
 		);
 	}
-	// Filter for valid formats (JPEG, PNG, GIF)
-	return images.filter((img) => /\.(jpg|jpeg|png|gif)$/i.test(img));
+	// Filter for valid formats (JPEG, PNG, GIF) and limit to max 5 images
+	return images.filter((img) => /\.(jpg|jpeg|png|gif)$/i.test(img)).slice(0, 5);
 }
 
 // Conversion functions
 function convertLbsToKg(lbs) {
-	return lbs > 0 ? (lbs * 0.453592).toFixed(2) : "0.00"; // Convert lbs to kg
+	return lbs > 0 ? (lbs * 0.453592).toFixed(2) : "Not available"; // Convert lbs to kg or set as "Not available"
 }
 
 function convertInchesToCm(inches) {
-	return inches > 0 ? (inches * 2.54).toFixed(2) : "0.00"; // Convert inches to cm
+	return inches > 0 ? (inches * 2.54).toFixed(2) : "Not available"; // Convert inches to cm or set as "Not available"
 }
 
 router.get("/generate-feeds", async (req, res) => {
@@ -106,7 +106,7 @@ router.get("/generate-feeds", async (req, res) => {
 			const imageLink =
 				images.length > 0
 					? images[0]
-					: "https://res.cloudinary.com/infiniteapps/image/upload/v1719198504/serene_janat/1719198503886.png";
+					: "https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/1723694290986.png";
 
 			const googleProductCategory = escapeXml(
 				categoryMapping[product.category.categoryName.toLowerCase()] ||
@@ -117,12 +117,12 @@ router.get("/generate-feeds", async (req, res) => {
 			let size = "";
 			let color = "unspecified"; // Default if missing
 			let ageGroup = "adult"; // Default if missing
+			const gender = "both"; // Default to "both" for all products
 
 			if (hasVariants) {
 				const attribute = product.productAttributes[0];
 				size = attribute.size || "";
 				color = attribute.color || "unspecified";
-				ageGroup = attribute.ageGroup || "adult";
 			}
 
 			const weight = convertLbsToKg(product.geodata?.weight || 0);
@@ -167,8 +167,9 @@ router.get("/generate-feeds", async (req, res) => {
           <g:size>${escapeXml(size)}</g:size>
           <g:color>${escapeXml(color)}</g:color>
           <g:age_group>${escapeXml(ageGroup)}</g:age_group>
+          <g:gender>${escapeXml(gender)}</g:gender>
           <g:identifier_exists>false</g:identifier_exists>
-          <g:shipping_weight>${weight} kg</g:shipping_weight>
+          <g:shipping_weight>${weight}</g:shipping_weight>
           <g:shipping_length>${length} cm</g:shipping_length>
           <g:shipping_width>${width} cm</g:shipping_width>
           <g:shipping_height>${height} cm</g:shipping_height>
