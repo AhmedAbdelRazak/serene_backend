@@ -45,6 +45,20 @@ function capitalizeWords(string) {
 		.replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
 }
 
+// Function to ensure valid dimensions and weight
+function validateDimension(value, defaultValue) {
+	const numericValue = parseFloat(value);
+	return !isNaN(numericValue) && numericValue > 0
+		? numericValue.toFixed(2)
+		: defaultValue;
+}
+
+// Default values for dimensions and weight
+const DEFAULT_WEIGHT = "1.00"; // Default to 1 kg if not provided
+const DEFAULT_LENGTH = "10.00"; // Default to 10 cm if not provided
+const DEFAULT_WIDTH = "10.00"; // Default to 10 cm if not provided
+const DEFAULT_HEIGHT = "10.00"; // Default to 10 cm if not provided
+
 // Function to extract the first valid numeric value from strings
 function extractFirstNumber(value) {
 	if (!value) return "Not available";
@@ -114,6 +128,16 @@ router.get("/generate-feeds", async (req, res) => {
 			const condition = "new";
 			const brand = "Serene Jannat";
 
+			function validateGender(gender) {
+				const validGenders = ["male", "female", "unisex"];
+				return typeof gender === "string" &&
+					validGenders.includes(gender.toLowerCase())
+					? gender.toLowerCase()
+					: "unisex";
+			}
+
+			const defaultGender = validateGender(product.gender || "unisex");
+
 			const images = generateImageLinks(product);
 			const imageLink =
 				images.length > 0
@@ -136,17 +160,21 @@ router.get("/generate-feeds", async (req, res) => {
 					const variantAvailability =
 						variant.quantity > 0 ? "in stock" : "out of stock";
 
-					const variantWeight = convertLbsToKg(
-						variant.weight || product.geodata?.weight
+					const variantWeight = validateDimension(
+						variant.weight || product.geodata?.weight,
+						DEFAULT_WEIGHT
 					);
-					const variantLength = convertInchesToCm(
-						variant.length || product.geodata?.length
+					const variantLength = validateDimension(
+						variant.length || product.geodata?.length,
+						DEFAULT_LENGTH
 					);
-					const variantWidth = convertInchesToCm(
-						variant.width || product.geodata?.width
+					const variantWidth = validateDimension(
+						variant.width || product.geodata?.width,
+						DEFAULT_WIDTH
 					);
-					const variantHeight = convertInchesToCm(
-						variant.height || product.geodata?.height
+					const variantHeight = validateDimension(
+						variant.height || product.geodata?.height,
+						DEFAULT_HEIGHT
 					);
 
 					const variantItem = `
@@ -175,15 +203,17 @@ router.get("/generate-feeds", async (req, res) => {
               <g:size>${escapeXml(variantSize)}</g:size>
               <g:color>${escapeXml(variantColor)}</g:color>
               <g:age_group>adult</g:age_group>
-              <g:gender>both</g:gender>
+              <g:gender>${defaultGender}</g:gender>
               <g:identifier_exists>false</g:identifier_exists>
               <g:shipping_weight>${variantWeight} kg</g:shipping_weight>
               <g:shipping_length>${variantLength} cm</g:shipping_length>
               <g:shipping_width>${variantWidth} cm</g:shipping_width>
               <g:shipping_height>${variantHeight} cm</g:shipping_height>
+              <g:additional_link>https://serenejannat.com/privacy-policy-terms-conditions</g:additional_link>
             </item>
           `;
 					googleItems.push(variantItem);
+					facebookItems.push(variantItem);
 				}
 			} else {
 				const weight = convertLbsToKg(product.geodata?.weight || 0);
@@ -217,17 +247,19 @@ router.get("/generate-feeds", async (req, res) => {
 							product.category.categoryName
 						)}]]></g:product_type>
             <g:size>Unspecified</g:size>
-            <g:color>unspecified</g:color>
+            <g:color>Unspecified</g:color>
             <g:age_group>adult</g:age_group>
-            <g:gender>both</g:gender>
+            <g:gender>${defaultGender}</g:gender>
             <g:identifier_exists>false</g:identifier_exists>
             <g:shipping_weight>${weight} kg</g:shipping_weight>
             <g:shipping_length>${length} cm</g:shipping_length>
             <g:shipping_width>${width} cm</g:shipping_width>
             <g:shipping_height>${height} cm</g:shipping_height>
+            <g:additional_link>https://serenejannat.com/privacy-policy-terms-conditions</g:additional_link>
           </item>
         `;
 				googleItems.push(googleItem);
+				facebookItems.push(googleItem);
 			}
 		}
 	}
@@ -242,6 +274,17 @@ router.get("/generate-feeds", async (req, res) => {
       </channel>
     </rss>
   `;
+	const facebookFeedContent = `
+    <rss version="2.0">
+      <channel>
+        <title>Serene Jannat Products</title>
+        <link>https://serenejannat.com</link>
+        <description>Facebook Product Feed</description>
+        ${facebookItems.join("\n")}
+      </channel>
+    </rss>
+  `;
+
 	const googleWriteStream = createWriteStream(
 		resolve(__dirname, "../../serene_frontend/public/merchant-center-feed.xml"),
 		{ flags: "w" }
@@ -249,16 +292,6 @@ router.get("/generate-feeds", async (req, res) => {
 	googleWriteStream.write(googleFeedContent, "utf-8");
 	googleWriteStream.end();
 
-	const facebookFeedContent = `
-    <rss version="2.0">
-      <channel>
-        <title>Serene Jannat Products</title>
-        <link>https://serenejannat.com</link>
-        <description>Facebook Product Feed</description>
-        ${googleItems.join("\n")}
-      </channel>
-    </rss>
-  `;
 	const facebookWriteStream = createWriteStream(
 		resolve(__dirname, "../../serene_frontend/public/facebook-feed.xml"),
 		{ flags: "w" }
