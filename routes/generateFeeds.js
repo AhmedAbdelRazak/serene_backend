@@ -220,6 +220,9 @@ router.get("/generate-feeds", async (req, res) => {
 				const length = convertInchesToCm(product.geodata?.length || 0);
 				const width = convertInchesToCm(product.geodata?.width || 0);
 				const height = convertInchesToCm(product.geodata?.height || 0);
+				const size = product.size || "Unspecified";
+				const variantHexColor = product.color || "Unspecified";
+				const resolvedColor = variantHexColor;
 
 				const googleItem = `
           <item>
@@ -246,8 +249,8 @@ router.get("/generate-feeds", async (req, res) => {
             <g:product_type><![CDATA[${escapeXml(
 							product.category.categoryName
 						)}]]></g:product_type>
-            <g:size>Unspecified</g:size>
-            <g:color>Unspecified</g:color>
+            <g:size>${size}</g:size>
+            <g:color>${resolvedColor}</g:color>
             <g:age_group>adult</g:age_group>
             <g:gender>${defaultGender}</g:gender>
             <g:identifier_exists>false</g:identifier_exists>
