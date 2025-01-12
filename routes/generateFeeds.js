@@ -209,7 +209,7 @@ router.get("/generate-feeds", async (req, res) => {
               <g:shipping_length>${variantLength} cm</g:shipping_length>
               <g:shipping_width>${variantWidth} cm</g:shipping_width>
               <g:shipping_height>${variantHeight} cm</g:shipping_height>
-              <g:additional_link>https://serenejannat.com/privacy-policy-terms-conditions</g:additional_link>
+              <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
             </item>
           `;
 					googleItems.push(variantItem);
@@ -258,7 +258,7 @@ router.get("/generate-feeds", async (req, res) => {
             <g:shipping_length>${length} cm</g:shipping_length>
             <g:shipping_width>${width} cm</g:shipping_width>
             <g:shipping_height>${height} cm</g:shipping_height>
-            <g:additional_link>https://serenejannat.com/privacy-policy-terms-conditions</g:additional_link>
+            <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
           </item>
         `;
 				googleItems.push(googleItem);
