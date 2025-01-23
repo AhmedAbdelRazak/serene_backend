@@ -5,6 +5,14 @@ const slugify = require("slugify");
 const Subcategory = require("../models/subcategory");
 const Colors = require("../models/colors");
 const { Order } = require("../models/order");
+const cloudinary = require("cloudinary").v2;
+
+// Configure Cloudinary
+cloudinary.config({
+	cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+	api_key: process.env.CLOUDINARY_API_KEY,
+	api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
 exports.printifyProducts = async (req, res) => {
 	try {
@@ -175,7 +183,24 @@ exports.printifyOrders = async (req, res) => {
 	}
 };
 
-const sizeOrder = ["S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL"];
+const uploadImageToCloudinary = async (imageUrl) => {
+	try {
+		const result = await cloudinary.uploader.upload(imageUrl, {
+			folder: "serene_janat/products", // Optional: specify a folder in Cloudinary
+			resource_type: "image",
+		});
+		return {
+			public_id: result.public_id,
+			url: result.secure_url,
+		};
+	} catch (error) {
+		console.error(`Error uploading image to Cloudinary: ${error.message}`);
+		// Handle the error as needed, e.g., return null or throw
+		return null;
+	}
+};
+
+const sizeOrder = ["S", "M", "L", "XL", "XXL"]; // Ensure this is defined
 
 exports.syncPrintifyProducts = async (req, res) => {
 	try {
@@ -212,12 +237,22 @@ exports.syncPrintifyProducts = async (req, res) => {
 				const failedProducts = [];
 				const addedProducts = [];
 
-				// Function to handle MongoDB product update/creation and Printify publishing
+				/**
+				 * Function to handle MongoDB product update/creation and Printify publishing
+				 * Defined inside syncPrintifyProducts to access addedProducts, failedProducts, and shopId
+				 */
 				const handleProductSync = async (
 					productData,
 					variantSKU,
 					printifyProduct
 				) => {
+					if (!variantSKU) {
+						console.warn(
+							`Variant SKU is missing for product: ${printifyProduct.title}`
+						);
+						return; // Skip processing this product
+					}
+
 					// Find product by SKU
 					let product = await Product.findOne({ productSKU: variantSKU });
 
@@ -230,6 +265,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						const newProduct = new Product({
 							productSKU: variantSKU,
 							...productData,
+							printifyProductId: printifyProduct.id, // Optional: store Printify Product ID
 							// Add other necessary fields with default or empty values
 						});
 
@@ -319,6 +355,15 @@ exports.syncPrintifyProducts = async (req, res) => {
 							for (const variant of printifyProduct.variants) {
 								if (!variant.is_enabled) continue;
 
+								// Ensure variant SKU exists
+								if (!variant.sku) {
+									console.warn(
+										`Variant SKU is missing for product: ${printifyProduct.title}`
+									);
+									failedProducts.push(printifyProduct.title);
+									continue; // Skip this variant
+								}
+
 								// Extract scent if available
 								const scentOption = printifyProduct.options.find(
 									(option) => option.type === "scent"
@@ -333,9 +378,32 @@ exports.syncPrintifyProducts = async (req, res) => {
 										: null
 									: null;
 
+								// Upload variant images to Cloudinary
 								const variantImages = printifyProduct.images.filter((image) =>
 									image.variant_ids.includes(variant.id)
 								);
+
+								const uploadedImages = await Promise.all(
+									variantImages.map(async (image) => {
+										const uploaded = await uploadImageToCloudinary(image.src);
+										if (uploaded) {
+											return {
+												public_id: uploaded.public_id,
+												url: uploaded.url,
+											};
+										} else {
+											// Handle failed upload (e.g., skip or use a placeholder)
+											return null;
+										}
+									})
+								);
+
+								// Filter out any failed uploads
+								const validUploadedImages = uploadedImages.filter(Boolean);
+
+								// **Ensure Unique Slug by Appending SKU**
+								const uniqueSlug = `${productSlug}-${variant.sku}`;
+								const uniqueSlugArabic = `${productSlugArabic}-${variant.sku}`;
 
 								const productData = {
 									productName: `${printifyProduct.title} - ${variant.title}`,
@@ -346,10 +414,8 @@ exports.syncPrintifyProducts = async (req, res) => {
 										2
 									),
 									quantity: 10,
-									slug: `${productSlug}-${variant.options.join("-")}`,
-									slug_Arabic: `${productSlugArabic}-${variant.options.join(
-										"-"
-									)}`,
+									slug: uniqueSlug, // Use unique slug
+									slug_Arabic: uniqueSlugArabic, // Use unique slug for Arabic
 									category: matchingCategory._id,
 									subcategory: matchingSubcategories.map(
 										(subcategory) => subcategory._id
@@ -358,10 +424,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 									chosenSeason: "all",
 									thumbnailImage: [
 										{
-											images: variantImages.map((image) => ({
-												public_id: image.variant_ids.join("_"),
-												url: image.src,
-											})),
+											images: validUploadedImages, // Use Cloudinary URLs
 										},
 									],
 									isPrintifyProduct: true,
@@ -396,17 +459,49 @@ exports.syncPrintifyProducts = async (req, res) => {
 											printifyProduct.is_economy_shipping_enabled,
 									},
 									scent: scent,
-									productAttributes: [],
+									productAttributes: [], // Will handle below if needed
 								};
 
 								await handleProductSync(
 									productData,
-									variant.sku,
+									variant.sku, // Pass variant SKU
 									printifyProduct
 								);
 							}
 						} else {
 							// Handle candles without variables normally
+							// Ensure variant SKU exists
+							if (!printifyProduct.variants[0].sku) {
+								console.warn(
+									`Variant SKU is missing for product: ${printifyProduct.title}`
+								);
+								failedProducts.push(printifyProduct.title);
+								continue; // Skip this product
+							}
+
+							const uploadedImages = await Promise.all(
+								printifyProduct.images
+									.slice(0, 5)
+									.sort(() => 0.5 - Math.random())
+									.map(async (image) => {
+										const uploaded = await uploadImageToCloudinary(image.src);
+										if (uploaded) {
+											return {
+												public_id: uploaded.public_id,
+												url: uploaded.url,
+											};
+										} else {
+											return null;
+										}
+									})
+							);
+
+							const validUploadedImages = uploadedImages.filter(Boolean);
+
+							// **Ensure Unique Slug by Appending Printify Product ID**
+							const uniqueSlug = `${productSlug}-${printifyProduct.id}`;
+							const uniqueSlugArabic = `${productSlugArabic}-${printifyProduct.id}`;
+
 							const productData = {
 								productName: printifyProduct.title,
 								description: printifyProduct.description,
@@ -416,8 +511,8 @@ exports.syncPrintifyProducts = async (req, res) => {
 									(printifyProduct.variants[0].price / 100) * 0.75
 								).toFixed(2),
 								quantity: 10,
-								slug: productSlug,
-								slug_Arabic: productSlugArabic,
+								slug: uniqueSlug, // Use unique slug
+								slug_Arabic: uniqueSlugArabic, // Use unique slug for Arabic
 								category: matchingCategory._id, // Assign the matching category ID
 								subcategory: matchingSubcategories.map(
 									(subcategory) => subcategory._id
@@ -426,13 +521,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 								chosenSeason: "all",
 								thumbnailImage: [
 									{
-										images: printifyProduct.images
-											.slice(0, 5)
-											.sort(() => 0.5 - Math.random()) // Shuffle images
-											.map((image) => ({
-												public_id: image.variant_ids.join("_"),
-												url: image.src,
-											})),
+										images: validUploadedImages, // Use Cloudinary URLs
 									},
 								],
 								isPrintifyProduct: true,
@@ -466,12 +555,12 @@ exports.syncPrintifyProducts = async (req, res) => {
 									is_economy_shipping_enabled:
 										printifyProduct.is_economy_shipping_enabled,
 								},
-								productAttributes: [],
+								productAttributes: [], // No attributes for non-variable products
 							};
 
 							await handleProductSync(
 								productData,
-								printifyProduct.variants[0].sku,
+								printifyProduct.variants[0].sku, // Pass variant SKU
 								printifyProduct
 							);
 						}
@@ -514,6 +603,47 @@ exports.syncPrintifyProducts = async (req, res) => {
 								return sizeA - sizeB;
 							});
 
+						// Upload images to Cloudinary
+						const uploadedImages = await Promise.all(
+							printifyProduct.images
+								.filter((image) =>
+									image.variant_ids.some((id) =>
+										printifyProduct.variants
+											.filter((variant) => variant.is_enabled)
+											.map((v) => v.id)
+											.includes(id)
+									)
+								)
+								.slice(0, 5)
+								.map(async (image) => {
+									const uploaded = await uploadImageToCloudinary(image.src);
+									if (uploaded) {
+										return {
+											public_id: uploaded.public_id,
+											url: uploaded.url, // Cloudinary URL
+										};
+									} else {
+										return null;
+									}
+								})
+						);
+
+						const validUploadedImages = uploadedImages.filter(Boolean);
+
+						// **Ensure Unique Slug by Appending SKU**
+						const uniqueSlug = `${productSlug}-${printifyProduct.variants[0].sku}`;
+						const uniqueSlugArabic = `${productSlugArabic}-${printifyProduct.variants[0].sku}`;
+
+						// Ensure variant SKU exists
+						const variantSKU = printifyProduct.variants[0].sku;
+						if (!variantSKU) {
+							console.warn(
+								`Variant SKU is missing for product: ${printifyProduct.title}`
+							);
+							failedProducts.push(printifyProduct.title);
+							continue; // Skip this product
+						}
+
 						const productData = {
 							productName: printifyProduct.title,
 							description: printifyProduct.description,
@@ -523,8 +653,8 @@ exports.syncPrintifyProducts = async (req, res) => {
 								(sortedVariants[0].price / 100) * 0.75
 							).toFixed(2),
 							quantity: 10,
-							slug: productSlug,
-							slug_Arabic: productSlugArabic,
+							slug: uniqueSlug, // Use unique slug
+							slug_Arabic: uniqueSlugArabic, // Use unique slug for Arabic
 							category: matchingCategory._id, // Assign the matching category ID
 							subcategory: matchingSubcategories.map(
 								(subcategory) => subcategory._id
@@ -533,20 +663,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 							chosenSeason: "all",
 							thumbnailImage: [
 								{
-									images: printifyProduct.images
-										.filter((image) =>
-											image.variant_ids.some((id) =>
-												printifyProduct.variants
-													.filter((variant) => variant.is_enabled)
-													.map((v) => v.id)
-													.includes(id)
-											)
-										)
-										.slice(0, 5)
-										.map((image) => ({
-											public_id: image.variant_ids.join("_"),
-											url: image.src,
-										})),
+									images: validUploadedImages, // Use Cloudinary URLs
 								},
 							],
 							isPrintifyProduct: true,
@@ -581,84 +698,105 @@ exports.syncPrintifyProducts = async (req, res) => {
 									printifyProduct.is_economy_shipping_enabled,
 							},
 							productAttributes: addVariables
-								? sortedVariants.map((variant) => {
-										const sizeOption = printifyProduct.options.find(
-											(option) => option.type === "size"
-										);
-										const scentOption = printifyProduct.options.find(
-											(option) => option.type === "scent"
-										);
+								? await Promise.all(
+										sortedVariants.map(async (variant) => {
+											const sizeOption = printifyProduct.options.find(
+												(option) => option.type === "size"
+											);
+											const scentOption = printifyProduct.options.find(
+												(option) => option.type === "scent"
+											);
 
-										const variantImages = printifyProduct.images
-											.filter((image) => image.variant_ids.includes(variant.id))
-											.slice(0, 8); // Limit to 8 images
+											const variantImages = printifyProduct.images
+												.filter((image) =>
+													image.variant_ids.includes(variant.id)
+												)
+												.slice(0, 8); // Limit to 8 images
 
-										const color = printifyProduct.options.find(
-											(option) => option.type === "color"
-										);
+											const color = printifyProduct.options.find(
+												(option) => option.type === "color"
+											);
 
-										const colorValue = color
-											? color.values.find(
-													(value) => value.id === variant.options[0]
-											  )
+											const colorValue = color
 												? color.values.find(
 														(value) => value.id === variant.options[0]
-												  ).colors[0]
-												: null
-											: null;
+												  )
+													? color.values.find(
+															(value) => value.id === variant.options[0]
+													  ).colors[0]
+													: null
+												: null;
 
-										const sizeValue = sizeOption
-											? sizeOption.values.find(
-													(value) => value.id === variant.options[1]
-											  )
+											const sizeValue = sizeOption
 												? sizeOption.values.find(
 														(value) => value.id === variant.options[1]
-												  ).title
-												: null
-											: null;
+												  )
+													? sizeOption.values.find(
+															(value) => value.id === variant.options[1]
+													  ).title
+													: null
+												: null;
 
-										const scentValue = scentOption
-											? scentOption.values.find(
-													(value) => value.id === variant.options[0]
-											  )
+											const scentValue = scentOption
 												? scentOption.values.find(
 														(value) => value.id === variant.options[0]
-												  ).title
-												: null
-											: null;
+												  )
+													? scentOption.values.find(
+															(value) => value.id === variant.options[0]
+													  ).title
+													: null
+												: null;
 
-										const primaryKey = sizeValue
-											? `${sizeValue}${colorValue}`
-											: `${scentValue}${colorValue}`;
+											const primaryKey = sizeValue
+												? `${sizeValue}${colorValue}`
+												: `${scentValue}${colorValue}`;
 
-										return {
-											PK: primaryKey,
-											color: colorValue,
-											size: sizeValue,
-											scent: scentValue,
-											SubSKU: variant.sku,
-											quantity: 10,
-											price: (variant.price / 100) * 1.2,
-											priceAfterDiscount: variant.price / 100,
-											MSRP: Number((variant.price / 100) * 0.75).toFixed(2),
-											WholeSalePrice: Number(
-												(variant.price / 100) * 0.75
-											).toFixed(2), // Assuming a wholesale price calculation
-											DropShippingPrice: Number(
-												(variant.price / 100) * 0.85
-											).toFixed(2), // Assuming a dropshipping price calculation
-											productImages: variantImages.map((image) => ({
-												public_id: image.variant_ids.join("_"),
-												url: image.src,
-											})),
-										};
-								  })
+											// **Upload productImages to Cloudinary**
+											const uploadedProductImages = await Promise.all(
+												variantImages.map(async (image) => {
+													const uploaded = await uploadImageToCloudinary(
+														image.src
+													);
+													if (uploaded) {
+														return {
+															public_id: uploaded.public_id,
+															url: uploaded.url, // Cloudinary URL
+														};
+													} else {
+														return null;
+													}
+												})
+											);
+
+											const validUploadedProductImages =
+												uploadedProductImages.filter(Boolean);
+
+											return {
+												PK: primaryKey,
+												color: colorValue,
+												size: sizeValue,
+												scent: scentValue,
+												SubSKU: variant.sku,
+												quantity: 10,
+												price: (variant.price / 100) * 1.2,
+												priceAfterDiscount: variant.price / 100,
+												MSRP: Number((variant.price / 100) * 0.75).toFixed(2),
+												WholeSalePrice: Number(
+													(variant.price / 100) * 0.75
+												).toFixed(2),
+												DropShippingPrice: Number(
+													(variant.price / 100) * 0.85
+												).toFixed(2),
+												productImages: validUploadedProductImages,
+											};
+										})
+								  )
 								: [],
 						};
 
 						await handleProductSync(
 							productData,
-							printifyProduct.variants[0].sku,
+							printifyProduct.variants[0].sku, // Pass variant SKU
 							printifyProduct
 						);
 					}
