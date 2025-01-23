@@ -242,7 +242,7 @@ router.get("/generate-feeds", async (req, res) => {
             <g:availability>${
 							product.quantity > 0 ? "in stock" : "out of stock"
 						}</g:availability>
-            <g:price>${product.price.toFixed(2)} USD</g:price>
+            <g:price>${product.priceAfterDiscount.toFixed(2)} USD</g:price>
             <g:brand>${escapeXml(brand)}</g:brand>
             <g:condition>${escapeXml(condition)}</g:condition>
             <g:google_product_category>${googleProductCategory}</g:google_product_category>
