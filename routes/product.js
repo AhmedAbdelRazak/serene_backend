@@ -22,6 +22,7 @@ const {
 	readSingleProduct,
 	filteredProducts,
 	likedProducts,
+	listPODProducts,
 } = require("../controllers/product");
 
 router.post("/product/create/:userId", requireSignin, isAuth, isAdmin, create);
@@ -34,6 +35,7 @@ router.put(
 );
 
 router.get("/products", listProductsNoFilter);
+router.get("/products/pod", listPODProducts);
 router.get("/product/:productId", read);
 router.get("/single-product/:slug/:categorySlug/:productId", readSingleProduct);
 

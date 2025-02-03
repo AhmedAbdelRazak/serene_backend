@@ -49,3 +49,41 @@ exports.removeCommentImage = (req, res) => {
 		res.send("ok");
 	});
 };
+
+exports.uploadForPOD = async (req, res) => {
+	try {
+		const result = await cloudinary.uploader.upload(req.body.image, {
+			public_id: `serene_janat/${Date.now()}`,
+			resource_type: "auto", // let Cloudinary handle the format
+		});
+
+		// Return the public_id & secure_url to the client
+		return res.json({
+			public_id: result.public_id,
+			url: result.secure_url,
+		});
+	} catch (err) {
+		console.error("Cloudinary upload error:", err);
+		return res.status(400).json({ error: "Upload to Cloudinary failed" });
+	}
+};
+
+/**
+ * 3) REMOVE (General)
+ *    Expects req.body.public_id
+ *    Removes the image from Cloudinary
+ */
+exports.removeForPOD = (req, res) => {
+	let image_id = req.body.public_id;
+	// For debugging:
+	console.log("Removing image:", image_id);
+
+	cloudinary.uploader.destroy(image_id, (err, result) => {
+		if (err) {
+			console.error("Cloudinary remove error:", err);
+			return res.json({ success: false, err });
+		}
+		// Or return any JSON you prefer:
+		res.json({ success: true, result });
+	});
+};

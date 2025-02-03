@@ -13,6 +13,8 @@ const {
 	remove,
 	uploadCommentImage,
 	removeCommentImage,
+	uploadForPOD,
+	removeForPOD,
 } = require("../controllers/cloudinary");
 const { userById } = require("../controllers/user");
 router.post(
@@ -20,27 +22,27 @@ router.post(
 	requireSignin,
 	isAuth,
 	isAdmin,
-	upload,
+	upload
 );
 router.post(
 	"/admin/removeimage/:userId",
 	requireSignin,
 	isAuth,
 	isAdmin,
-	remove,
+	remove
 );
 
 router.post(
 	"/admin/uploadimagesimagecomment/:userId",
 	requireSignin,
 	isAuth,
-	uploadCommentImage,
+	uploadCommentImage
 );
 router.post(
 	"/admin/removeimagecomment/:userId",
 	requireSignin,
 	isAuth,
-	removeCommentImage,
+	removeCommentImage
 );
 
 router.post(
@@ -48,15 +50,19 @@ router.post(
 	requireSignin,
 	isAuth,
 	isOperations,
-	upload,
+	upload
 );
 router.post(
 	"/admin/removeimage/operations/:userId",
 	requireSignin,
 	isAuth,
 	isOperations,
-	remove,
+	remove
 );
+
+// For uploading a product image for POD
+router.post("/uploadimage/:userId", uploadForPOD);
+router.post("/removeimage/:userId", removeForPOD);
 
 router.param("userId", userById);
 

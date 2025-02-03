@@ -24,24 +24,24 @@ const orderStatusSMS = require("twilio")(
 	process.env.TWILIO_AUTH_TOKEN
 );
 
-// Square setup
+// ==================== SQUARE SETUP ======================
 const squareClient = new Client({
-	environment: Environment.Production, //Sandbox, Production
+	environment: Environment.Production, // for sandbox 'cnon:...' token
 	accessToken: process.env.SQUARE_ACCESS_TOKEN_TEST,
 });
 
 const BusinessName = "Serene Jannat";
 const fromEmail = "noreply@serenejannat.com";
-const defaultEmail = "ahmed.abdelrazak@infinite-apps.com";
+const defaultEmail = "ahmed.abdelrazak@jannatbooking.com";
 const shopLogo = path.join(__dirname, "../shopLogo/logo.png");
 
+// ========================================================
+// =============== ORDER MIDDLEWARE =======================
 exports.orderById = async (req, res, next, id) => {
 	try {
 		const order = await Order.findById(id).exec();
 		if (!order) {
-			return res.status(404).json({
-				error: "Order not found",
-			});
+			return res.status(404).json({ error: "Order not found" });
 		}
 		req.order = order;
 		next();
@@ -52,6 +52,8 @@ exports.orderById = async (req, res, next, id) => {
 	}
 };
 
+// ========================================================
+// =============== PDF INVOICE CREATION ===================
 const createPdfBuffer = (order) => {
 	return new Promise(async (resolve, reject) => {
 		const doc = new PDFDocument({ margin: 50 });
@@ -66,7 +68,7 @@ const createPdfBuffer = (order) => {
 			reject(err);
 		});
 
-		// Ensure the image path is correct and add the shop logo
+		// If you have a logo file:
 		if (fs.existsSync(shopLogo)) {
 			doc.image(shopLogo, 50, 45, { width: 120 }).moveDown();
 		} else {
@@ -74,7 +76,6 @@ const createPdfBuffer = (order) => {
 			doc.text("Shop Logo Here", 50, 45).moveDown();
 		}
 
-		// Add content to the PDF
 		doc.fontSize(25).text("Order Invoice", { align: "center" });
 		doc.moveDown();
 		doc.fontSize(16).text(`Invoice Number: ${order.invoiceNumber}`);
@@ -93,16 +94,16 @@ const createPdfBuffer = (order) => {
 
 		doc.fontSize(20).text("Product Details:", { underline: true });
 
-		// Handle products without variables
-		order.productsNoVariable.forEach((product, index) => {
+		// No-variable
+		order.productsNoVariable.forEach((p, i) => {
 			doc.moveDown();
-			doc.fontSize(16).text(`Product ${index + 1}`);
-			doc.fontSize(14).text(`Name: ${product.name}`);
-			doc.text(`Quantity: ${product.ordered_quantity}`);
-			doc.text(`Price: ${product.price}`);
+			doc.fontSize(16).text(`Product ${i + 1}`);
+			doc.fontSize(14).text(`Name: ${p.name}`);
+			doc.text(`Quantity: ${p.ordered_quantity}`);
+			doc.text(`Price: ${p.price}`);
 		});
 
-		// Handle products with variables
+		// Variable
 		for (const item of order.chosenProductQtyWithVariables) {
 			const product = await Product.findById(item.productId);
 			if (product) {
@@ -129,6 +130,8 @@ const createPdfBuffer = (order) => {
 	});
 };
 
+// ========================================================
+// ============= EMAIL & SMS NOTIFICATIONS ===============
 const sendOrderConfirmationEmail = async (order) => {
 	try {
 		const pdfBuffer = await createPdfBuffer(order);
@@ -136,6 +139,7 @@ const sendOrderConfirmationEmail = async (order) => {
 
 		const recipientEmail = order.customerDetails.email || defaultEmail;
 		const bccEmails = [
+			{ email: "sally.abdelrazak@serenejannat.com" },
 			{ email: "ahmed.abdelrazak20@gmail.com" },
 			{ email: "ahmedandsally14@gmail.com" },
 		];
@@ -182,7 +186,7 @@ const sendOrderConfirmationSMS = async (order) => {
 		formattedPhone = `+1${formattedPhone}`;
 	}
 
-	console.log(formattedPhone, "formattedPhone");
+	console.log(`Sending SMS to: ${formattedPhone}`);
 
 	try {
 		await orderStatusSMS.messages.create({
@@ -196,56 +200,97 @@ const sendOrderConfirmationSMS = async (order) => {
 	}
 };
 
+// ========================================================
+// =============== STOCK CHECK & UPDATE ===================
 const checkStockAvailability = async (order) => {
+	// productsNoVariable
 	for (const item of order.productsNoVariable) {
-		const product = await Product.findById(item.productId);
-		if (!product) {
-			return `Product not found for ID ${item.productId}`;
-		}
+		if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
+			// POD logic => ensure variant is "available" in printifyProductDetails
+			const cartColor = (item.chosenAttributes?.color || "").toLowerCase();
+			const cartSize = (item.chosenAttributes?.size || "").toLowerCase();
 
-		if (product.quantity < item.ordered_quantity) {
-			return `Insufficient stock for product ${product.productName}. Please remove it from the cart or try another product.`;
+			const matchedVariant = item.printifyProductDetails.variants.find((v) => {
+				const titleLC = v.title.toLowerCase().replace(/["']/g, "");
+				const colorLC = cartColor.replace(/["']/g, "");
+				const sizeLC = cartSize.replace(/["']/g, "");
+				return titleLC.includes(colorLC) && titleLC.includes(sizeLC);
+			});
+
+			if (!matchedVariant) {
+				return `No matching POD variant found for product ${item.name}.`;
+			}
+			if (!matchedVariant.is_available) {
+				return `Variant is not available for product ${item.name}.`;
+			}
+		} else {
+			// normal local logic
+			const product = await Product.findById(item.productId);
+			if (!product) {
+				return `Product not found for ID ${item.productId}`;
+			}
+			if (product.quantity < item.ordered_quantity) {
+				return `Insufficient stock for product ${product.productName}.`;
+			}
 		}
 	}
 
+	// chosenProductQtyWithVariables
 	for (const item of order.chosenProductQtyWithVariables) {
-		const product = await Product.findById(item.productId);
-		if (!product) {
-			return `Product not found for ID ${item.productId}`;
-		}
+		if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
+			// POD logic => ensure variant is "available"
+			const cartColor = (item.chosenAttributes?.color || "").toLowerCase();
+			const cartSize = (item.chosenAttributes?.size || "").toLowerCase();
 
-		const attribute = product.productAttributes.find(
-			(attr) =>
-				attr.color === item.chosenAttributes.color &&
-				attr.size === item.chosenAttributes.size
-		);
+			const matchedVariant = item.printifyProductDetails.variants.find((v) => {
+				const titleLC = v.title.toLowerCase().replace(/["']/g, "");
+				const colorLC = cartColor.replace(/["']/g, "");
+				const sizeLC = cartSize.replace(/["']/g, "");
+				return titleLC.includes(colorLC) && titleLC.includes(sizeLC);
+			});
 
-		if (!attribute) {
-			return `Attribute not found for product ${product.productName}`;
-		}
+			if (!matchedVariant) {
+				return `No matching POD variant found for product ${item.name}.`;
+			}
+			if (!matchedVariant.is_available) {
+				return `Variant is not available for product ${item.name}.`;
+			}
+		} else {
+			// normal local logic
+			const product = await Product.findById(item.productId);
+			if (!product) {
+				return `Product not found for ID ${item.productId}`;
+			}
 
-		if (attribute.quantity < item.ordered_quantity) {
-			const color = await Colors.findOne({ hexa: attribute.color });
-
-			return `Insufficient stock for product ${
-				product.productName
-			} with color ${
-				color && color.color ? color.color : attribute.color
-			} and size ${
-				attribute.size
-			}. Please remove it from the cart or try another size or color.`;
+			const attribute = product.productAttributes.find(
+				(a) =>
+					(a.color || "").toLowerCase() ===
+						(item.chosenAttributes.color || "").toLowerCase() &&
+					(a.size || "").toLowerCase() ===
+						(item.chosenAttributes.size || "").toLowerCase()
+			);
+			if (!attribute) {
+				return `Attribute not found for product ${product.productName}`;
+			}
+			if (attribute.quantity < item.ordered_quantity) {
+				return `Insufficient stock for product ${product.productName} with color ${attribute.color} and size ${attribute.size}.`;
+			}
 		}
 	}
 
-	return null; // No stock issues
+	return null;
 };
 
 const updateStock = async (order) => {
 	try {
 		const bulkOps = [];
 
-		// Update stock for products without variables
+		// no-variable
 		for (const item of order.productsNoVariable) {
+			if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
+				// skip local stock
+				continue;
+			}
 			bulkOps.push({
 				updateOne: {
 					filter: { _id: item.productId },
@@ -255,56 +300,65 @@ const updateStock = async (order) => {
 			});
 		}
 
-		// Update stock for products with variables
+		// variable
 		for (const item of order.chosenProductQtyWithVariables) {
+			if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
+				// skip local attribute logic
+				continue;
+			}
+
 			const product = await Product.findById(item.productId);
-			if (product) {
-				const attribute = product.productAttributes.find(
-					(attr) =>
-						attr.color === item.chosenAttributes.color &&
-						attr.size === item.chosenAttributes.size
-				);
-
-				if (attribute) {
-					attribute.quantity -= item.ordered_quantity;
-
-					if (attribute.quantity < 0) {
-						throw new Error(
-							`Insufficient stock for product ${product.productName} with color ${attribute.color} and size ${attribute.size}`
-						);
-					}
-
-					bulkOps.push({
-						updateOne: {
-							filter: {
-								_id: product._id,
-								"productAttributes._id": attribute._id,
-							},
-							update: {
-								$set: { "productAttributes.$.quantity": attribute.quantity },
-							},
-							upsert: false,
-						},
-					});
-				} else {
-					throw new Error(
-						`Attribute not found for product ${product.productName}`
-					);
-				}
-			} else {
+			if (!product) {
 				throw new Error(`Product not found for ID ${item.productId}`);
 			}
+
+			const attr = product.productAttributes.find((a) => {
+				return (
+					(a.color || "").toLowerCase() ===
+						(item.chosenAttributes.color || "").toLowerCase() &&
+					(a.size || "").toLowerCase() ===
+						(item.chosenAttributes.size || "").toLowerCase()
+				);
+			});
+
+			if (!attr) {
+				throw new Error(
+					`Attribute not found for product ${product.productName}`
+				);
+			}
+
+			attr.quantity -= item.ordered_quantity;
+			if (attr.quantity < 0) {
+				throw new Error(
+					`Insufficient stock for ${product.productName} color ${attr.color} size ${attr.size}`
+				);
+			}
+
+			bulkOps.push({
+				updateOne: {
+					filter: {
+						_id: product._id,
+						"productAttributes._id": attr._id,
+					},
+					update: {
+						$set: { "productAttributes.$.quantity": attr.quantity },
+					},
+					upsert: false,
+				},
+			});
 		}
 
 		if (bulkOps.length > 0) {
 			await Product.bulkWrite(bulkOps);
 		}
-	} catch (error) {
-		console.error("Error updating stock:", error);
-		throw error; // Rethrow the error to handle it in the order creation flow
+	} catch (err) {
+		console.error("Error updating stock:", err);
+		throw err;
 	}
 };
 
+// ========================================================
+// =============== HELPER: INVOICE NUMBERS ================
 const generateRandomInvoiceNumber = () => {
 	return Math.floor(1000000000 + Math.random() * 9000000000).toString();
 };
@@ -322,10 +376,11 @@ const generateUniqueInvoiceNumber = async () => {
 		invoiceNumber = generateRandomInvoiceNumber();
 		isUnique = await isInvoiceNumberUnique(invoiceNumber);
 	}
-
 	return invoiceNumber;
 };
 
+// ========================================================
+// =============== SQUARE PAYMENT LOGIC ===================
 const processSquarePayment = async (
 	amount,
 	nonce,
@@ -334,16 +389,18 @@ const processSquarePayment = async (
 ) => {
 	const idempotencyKey = crypto.randomBytes(12).toString("hex");
 
+	console.log("FINAL ZIP CODE:", zipCode);
+
 	const requestBody = {
 		sourceId: nonce,
-		idempotencyKey: idempotencyKey,
+		idempotencyKey,
 		amountMoney: {
-			amount: Math.round(amount * 100), // amount in cents
+			amount: Math.round(amount * 100),
 			currency: "USD",
 		},
 		autocomplete: true,
 		billingAddress: {
-			postal_code: zipCode, // include the zip code
+			postal_code: zipCode || "",
 		},
 		customerDetails: {
 			givenName: customerDetails.name.split(" ")[0],
@@ -353,7 +410,7 @@ const processSquarePayment = async (
 			address: {
 				addressLine1: customerDetails.address,
 				locality: customerDetails.state,
-				postal_code: zipCode,
+				postal_code: zipCode || "",
 			},
 		},
 	};
@@ -363,18 +420,16 @@ const processSquarePayment = async (
 	try {
 		const response = await squareClient.paymentsApi.createPayment(requestBody);
 		return response.result;
-	} catch (error) {
-		console.log(error.message, "Square error.message");
-		throw new Error(error.message);
+	} catch (err) {
+		console.log(err.message, "Square error.message");
+		throw new Error(err.message);
 	}
 };
 
-// Helper function to convert BigInt to string
+// ========================================================
+// =============== MISC HELPER ============================
 const convertBigIntToString = (obj) => {
-	if (typeof obj !== "object" || obj === null) {
-		return obj;
-	}
-
+	if (typeof obj !== "object" || obj === null) return obj;
 	for (const key in obj) {
 		if (typeof obj[key] === "bigint") {
 			obj[key] = obj[key].toString();
@@ -382,43 +437,287 @@ const convertBigIntToString = (obj) => {
 			obj[key] = convertBigIntToString(obj[key]);
 		}
 	}
-
 	return obj;
 };
 
+/**
+ * Upload an image file to Printify if needed.
+ *
+ * @param {String} imageUrl  - The publicly accessible URL (e.g., from Cloudinary).
+ * @param {String} token     - The Printify personal access token to use.
+ * @returns {String|null}    - The uploaded image's "id" from Printify, or null on failure.
+ */
+async function uploadIfNeeded(imageUrl, token) {
+	try {
+		// 1) Attempt to upload by "url"
+		const payload = {
+			file_name: "custom-design.png",
+			url: imageUrl, // direct link to your final screenshot
+		};
+		const resp = await axios.post(
+			"https://api.printify.com/v1/uploads/images.json",
+			payload,
+			{
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+			}
+		);
+		// If successful, we get e.g. { id, file_name, ... }
+		return resp.data.id;
+	} catch (error) {
+		console.error(
+			"Error uploading final screenshot to Printify:",
+			error?.response?.data || error
+		);
+		return null;
+	}
+}
+
+// ========================================================
+// === For ephemeral POD item => create custom product, order, then DISABLE
+async function createOnTheFlyPOD(item, order, token) {
+	try {
+		const shopId = item.printifyProductDetails?.shop_id;
+		if (!shopId) {
+			throw new Error("No Printify shop_id found for POD item");
+		}
+
+		// 1) Normalize chosen color & size
+		const cartColor = (item.chosenAttributes.color || "").toLowerCase();
+		const cartSize = (item.chosenAttributes.size || "").toLowerCase();
+
+		// Remove quotes and trim so "15\" x 16\"" => "15 x 16"
+		const cartColorNormalized = cartColor.replace(/["']/g, "").trim();
+		const cartSizeNormalized = cartSize.replace(/["']/g, "").trim();
+
+		console.log(
+			"DEBUG: Matching variant =>",
+			"cartColorNormalized:",
+			cartColorNormalized,
+			"cartSizeNormalized:",
+			cartSizeNormalized
+		);
+
+		// 2) Find the real variant ID from item.printifyProductDetails.variants
+		const matchedVariantObj = item.printifyProductDetails.variants.find((v) => {
+			// Lowercase & remove quotes in the variant title
+			const titleNormalized = v.title.toLowerCase().replace(/["']/g, "").trim();
+			console.log("Variant title (normalized):", titleNormalized);
+
+			// We consider a match if the variant title includes both color & size
+			return (
+				titleNormalized.includes(cartColorNormalized) &&
+				titleNormalized.includes(cartSizeNormalized)
+			);
+		});
+
+		if (!matchedVariantObj) {
+			// THROW so the entire order is aborted
+			throw new Error("No real variant found for chosen color/size");
+		}
+
+		const realVariantId = matchedVariantObj.id;
+
+		// 3) Upload the BARE screenshot URL
+		let uploadedId = null;
+		if (item?.customDesign?.bareScreenshotUrl) {
+			uploadedId = await uploadIfNeeded(
+				item.customDesign.bareScreenshotUrl,
+				token
+			);
+			if (!uploadedId) {
+				throw new Error("Cannot proceed ephemeral. uploadIfNeeded is null");
+			}
+		} else {
+			throw new Error(
+				"No bareScreenshotUrl found. Skipping ephemeral creation."
+			);
+		}
+
+		// 4) Build placeholders
+		const placeholders = [
+			{
+				position: "front",
+				images: [
+					{
+						id: uploadedId,
+						type: "image/png", // or image/jpeg if needed
+						x: 0.5,
+						y: 0.5,
+						scale: 1,
+						angle: 0,
+					},
+				],
+			},
+		];
+
+		// 5) Create ephemeral product
+		const createProductPayload = {
+			title: "Custom One-Time Product",
+			description: "User-personalized product",
+			blueprint_id: item.printifyProductDetails.blueprint_id,
+			print_provider_id: item.printifyProductDetails.print_provider_id,
+			variants: [
+				{
+					id: realVariantId,
+					price: Math.round(item.price * 100),
+					is_enabled: true,
+					is_default: true,
+				},
+			],
+			print_areas: [
+				{
+					variant_ids: [realVariantId],
+					placeholders,
+				},
+			],
+		};
+
+		const createResp = await axios.post(
+			`https://api.printify.com/v1/shops/${shopId}/products.json`,
+			createProductPayload,
+			{
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+			}
+		);
+
+		if (!createResp.data?.id) {
+			throw new Error("Failed to create ephemeral POD product on Printify.");
+		}
+		const newProductId = createResp.data.id;
+		console.log("Ephemeral POD product created:", newProductId);
+
+		// 6) Place ephemeral order
+		const orderPayload = {
+			external_id: `custom-order-${Date.now()}`,
+			line_items: [
+				{
+					product_id: newProductId,
+					variant_id: realVariantId,
+					quantity: item.ordered_quantity,
+				},
+			],
+			shipping_method: 1, // standard shipping
+			send_shipping_notification: false,
+			address_to: {
+				first_name: order.customerDetails.name.split(" ")[0],
+				last_name: order.customerDetails.name.split(" ").slice(1).join(" "),
+				email: order.customerDetails.email,
+				phone: order.customerDetails.phone,
+				country: "US",
+				region: order.customerDetails.state,
+				address1: order.customerDetails.address,
+				city: order.customerDetails.city,
+				zip: order.customerDetails.zipcode,
+			},
+		};
+
+		const orderResp = await axios.post(
+			`https://api.printify.com/v1/shops/${shopId}/orders.json`,
+			orderPayload,
+			{
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+			}
+		);
+		console.log("Ephemeral POD order created:", orderResp.data);
+
+		// 7) DISABLE ephemeral product instead of deleting
+		try {
+			const disablePayload = { visible: false };
+			await axios.put(
+				`https://api.printify.com/v1/shops/${shopId}/products/${newProductId}.json`,
+				disablePayload,
+				{
+					headers: {
+						Authorization: `Bearer ${token}`,
+					},
+				}
+			);
+			console.log("Ephemeral POD product disabled:", newProductId);
+		} catch (disableErr) {
+			console.warn(
+				"Warning: ephemeral product was ordered but not disabled:",
+				disableErr
+			);
+		}
+
+		// 8) Save ephemeral order details in DB
+		await Order.findByIdAndUpdate(order._id, {
+			$push: {
+				printifyOrderDetails: {
+					ephemeralProductId: newProductId,
+					ephemeralOrder: orderResp.data,
+				},
+			},
+		});
+	} catch (err) {
+		console.error("Error in createOnTheFlyPOD:", err?.response?.data || err);
+		// rethrow to abort entire order
+		throw err;
+	}
+}
+
+// ========================================================
+// =============== POST ORDER TO PRINTIFY =================
 const postOrderToPrintify = async (order) => {
-	const headers = {
-		Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
-		"Content-Type": "application/json",
-	};
+	const normalToken = process.env.PRINTIFY_TOKEN; // normal Printify token
+	const designToken = process.env.DESIGN_PRINTIFY_TOKEN || normalToken; // for ephemeral POD
 
 	const products = [
 		...order.productsNoVariable,
 		...order.chosenProductQtyWithVariables,
 	];
 
-	for (const product of products) {
-		if (product.isPrintifyProduct) {
+	for (const item of products) {
+		// If not a Printify item, skip
+		if (!item.isPrintifyProduct) {
+			continue;
+		}
+
+		// If it's a "pure POD" with custom design => ephemeral approach
+		if (item.printifyProductDetails?.POD === true && item.customDesign) {
+			// If createOnTheFlyPOD fails, we throw => entire order is aborted
+			await createOnTheFlyPOD(item, order, designToken);
+		} else {
+			// normal approach => existing product
+			const headers = {
+				Authorization: `Bearer ${normalToken}`,
+				"Content-Type": "application/json",
+			};
+
 			let variantId;
-			if (product.chosenAttributes && product.chosenAttributes.SubSKU) {
-				const matchedVariant = product.printifyProductDetails.variants.find(
-					(variant) => variant.sku === product.chosenAttributes.SubSKU
+			if (item.chosenAttributes && item.chosenAttributes.SubSKU) {
+				const matchedVariant = item.printifyProductDetails.variants.find(
+					(v) => v.sku === item.chosenAttributes.SubSKU
 				);
-				variantId = matchedVariant
-					? matchedVariant.id
-					: product.printifyProductDetails.variants[0].id;
+				if (!matchedVariant) {
+					// Throw if we can't find the specified SKU
+					throw new Error(
+						`No matching variant in printifyProductDetails for SKU: ${item.chosenAttributes.SubSKU}`
+					);
+				}
+				variantId = matchedVariant.id;
 			} else {
-				variantId = product.printifyProductDetails.variants[0].id;
+				// fallback to the 1st variant
+				variantId = item.printifyProductDetails.variants[0].id;
 			}
 
 			const printifyOrder = {
 				line_items: [
 					{
-						product_id: product.printifyProductDetails.id,
+						product_id: item.printifyProductDetails.id,
 						variant_id: variantId,
-						quantity: product.ordered_quantity,
-						print_provider_id: product.printifyProductDetails.print_provider_id,
-						blueprint_id: product.printifyProductDetails.blueprint_id,
+						quantity: item.ordered_quantity,
+						print_provider_id: item.printifyProductDetails.print_provider_id,
+						blueprint_id: item.printifyProductDetails.blueprint_id,
 					},
 				],
 				address_to: {
@@ -426,7 +725,7 @@ const postOrderToPrintify = async (order) => {
 					last_name: order.customerDetails.name.split(" ").slice(1).join(" "),
 					email: order.customerDetails.email,
 					phone: order.customerDetails.phone,
-					country: "US", // Change as needed
+					country: "US",
 					region: order.customerDetails.state,
 					city: order.customerDetails.city,
 					address1: order.customerDetails.address,
@@ -437,90 +736,116 @@ const postOrderToPrintify = async (order) => {
 			};
 
 			console.log(
-				"Sending the following order to Printify:",
+				"Sending the following order to Printify (non-POD):",
 				JSON.stringify(printifyOrder, null, 2)
 			);
 
 			try {
 				const response = await axios.post(
-					`https://api.printify.com/v1/shops/${product.printifyProductDetails.shop_id}/orders.json`,
+					`https://api.printify.com/v1/shops/${item.printifyProductDetails.shop_id}/orders.json`,
 					printifyOrder,
 					{ headers }
 				);
-
 				console.log(`Order posted to Printify: ${response.data.id}`);
 
-				// Save the Printify order details to the MongoDB Order document
+				// Save normal printify order details
 				await Order.findByIdAndUpdate(order._id, {
 					$set: {
 						printifyOrderDetails: response.data,
 					},
 				});
-
 				console.log(`Printify order details saved for order: ${order._id}`);
 			} catch (error) {
 				console.error(`Error posting order to Printify: ${error.message}`);
 				if (error.response) {
 					console.error("Printify API response:", error.response.data);
 				}
+				// Rethrow => so we can abort the entire order
+				throw error;
 			}
 		}
 	}
 };
 
+// ========================================================
+// =============== CREATE ORDER CONTROLLER ================
+// Flow:
+//  1) Check stock
+//  2) Generate invoice number
+//  3) Create local order doc (without payment details yet)
+//  4) postOrderToPrintify => if fails => remove local order => throw error
+//  5) If printify success => processSquarePayment => if that fails => same approach
+//  6) Add paymentDetails => update stock => send notifications => respond
 exports.create = async (req, res) => {
 	try {
-		const { paymentToken, orderData, zipCode } = req.body;
+		const { paymentToken, orderData } = req.body;
+		const zipCode = orderData?.customerDetails?.zipcode;
 
 		if (!orderData || !orderData.totalAmount) {
 			throw new Error("Order data or totalAmount is missing");
 		}
 
-		// Check stock availability before processing payment
+		// 1) Check stock
 		const stockIssue = await checkStockAvailability(orderData);
-
-		// If there is a stock issue, send a response to the frontend
 		if (stockIssue) {
 			return res.status(400).json({ error: stockIssue });
 		}
 
-		// Process payment with Square
-		const paymentResult = await processSquarePayment(
-			orderData.totalAmountAfterDiscount,
-			paymentToken,
-			zipCode,
-			orderData.customerDetails
-		);
-
-		// Generate a unique invoice number
+		// 2) Generate Invoice Number
 		const invoiceNumber = await generateUniqueInvoiceNumber();
 
-		// Create the order object with the unique invoice number
+		// 3) Create local order in DB (without payment details yet)
 		const order = new Order({
 			...orderData,
 			invoiceNumber,
-			paymentDetails: paymentResult,
 		});
+		await order.save();
 
-		// Save the order
-		const data = await order.save();
+		// 4) Attempt to create the order on Printify BEFORE charging
+		try {
+			await postOrderToPrintify(order);
+		} catch (err) {
+			// If Printify fails (including "No real variant found"), remove the local doc
+			await Order.findByIdAndDelete(order._id);
+			throw new Error(
+				`Failed to create POD order. Card not charged. Please try again later`
+			);
+		}
 
+		// 5) Process Square Payment
+		let paymentResult;
+		try {
+			paymentResult = await processSquarePayment(
+				orderData.totalAmountAfterDiscount,
+				paymentToken,
+				zipCode,
+				orderData.customerDetails
+			);
+		} catch (err) {
+			// If Square fails, also remove the local order
+			await Order.findByIdAndDelete(order._id);
+			throw new Error(
+				`Card payment failed. Order aborted. Details: ${err.message}`
+			);
+		}
+
+		// 6) Save payment details in local order
+		order.paymentDetails = paymentResult;
+		await order.save();
+
+		// 7) Update local stock
 		await updateStock(order);
 
-		// Post order to Printify
-		await postOrderToPrintify(order);
+		// 8) Send Email & SMS
+		sendOrderConfirmationEmail(order).catch((err) =>
+			console.error("Error sending confirmation email:", err)
+		);
+		sendOrderConfirmationSMS(order).catch((err) =>
+			console.error("Error sending confirmation SMS:", err)
+		);
 
-		// Send email and SMS, but do not block the response in case of an error
-		sendOrderConfirmationEmail(order).catch((error) => {
-			console.error("Error sending confirmation email:", error);
-		});
-		sendOrderConfirmationSMS(order).catch((error) => {
-			console.error("Error sending confirmation SMS:", error);
-		});
-
-		// Convert BigInt values to strings before sending the response
-		const responseOrder = convertBigIntToString(data.toObject());
-
+		// 9) Convert BigInt => string & respond
+		const responseOrder = convertBigIntToString(order.toObject());
 		res.json(responseOrder);
 	} catch (error) {
 		console.error("Error creating order:", error);
@@ -619,6 +944,7 @@ const sendOrderConfirmationEmailPOS = async (order) => {
 
 		const recipientEmail = order.customerDetails.email || defaultEmail;
 		const bccEmails = [
+			{ email: "sally.abdelrazak@serenejannat.com" },
 			{ email: "ahmed.abdelrazak20@gmail.com" },
 			{ email: "ahmedandsally14@gmail.com" },
 		];
@@ -836,9 +1162,13 @@ exports.listOfAggregatedForPagination = async (req, res) => {
 
 	// Add status filter
 	if (status === "open") {
-		filters.status = { $nin: ["Shipped", "Delivered", "Cancelled"] };
+		filters.status = {
+			$nin: ["Shipped", "Delivered", "Cancelled", "fulfilled"],
+		};
 	} else if (status === "closed") {
-		filters.status = { $in: ["Shipped", "Delivered", "Cancelled"] };
+		filters.status = {
+			$in: ["Shipped", "Delivered", "Cancelled", "fulfilled"],
+		};
 	}
 
 	try {

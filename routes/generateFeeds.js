@@ -69,33 +69,40 @@ function extractFirstNumber(value) {
 // Function to generate image links for products
 function generateImageLinks(product) {
 	let images = [];
+	// If the product has variant attributes with images
 	if (product.productAttributes && product.productAttributes.length > 0) {
 		product.productAttributes.forEach((attr) => {
 			if (attr.productImages && attr.productImages.length > 0) {
 				images.push(...attr.productImages.map((img) => escapeXml(img.url)));
 			}
 		});
-	} else if (product.thumbnailImage && product.thumbnailImage.length > 0) {
+	}
+	// If no variant images, fallback to thumbnail
+	else if (product.thumbnailImage && product.thumbnailImage.length > 0) {
 		images.push(
 			...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
 		);
 	}
+
+	// Filter valid image formats
 	const validImages = images.filter((img) =>
 		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(img)
 	);
+	// Provide a default if no valid images
 	if (validImages.length === 0) {
 		validImages.push(
 			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
 		);
 	}
+
+	// Limit to max 5
 	return validImages.slice(0, 5);
 }
 
-// Conversion functions
+// Conversion functions (if needed)
 function convertLbsToKg(lbs) {
 	return lbs > 0 ? (lbs * 0.453592).toFixed(2) : "Not available";
 }
-
 function convertInchesToCm(inches) {
 	const numericValue = extractFirstNumber(inches);
 	return numericValue !== "Not available"
@@ -108,6 +115,21 @@ async function resolveColorName(hexCode) {
 	if (!hexCode) return "Unspecified";
 	const color = await Colors.findOne({ hexa: hexCode.toLowerCase() });
 	return color ? color.color : "Unspecified";
+}
+
+// NEW HELPER: Generate product link (conditional for POD)
+function getProductLink(product) {
+	// If the product is POD (Printify) => link to custom-gifts/<printifyProductId>
+	if (
+		product.printifyProductDetails?.POD === true &&
+		product.printifyProductDetails?.id
+	) {
+		return `https://serenejannat.com/custom-gifts/${product._id}`;
+	}
+	// Otherwise => old link
+	return `https://serenejannat.com/single-product/${escapeXml(
+		product.slug
+	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
 }
 
 // Generate Feeds Route
@@ -149,19 +171,22 @@ router.get("/generate-feeds", async (req, res) => {
 					"Home & Garden"
 			);
 
-			// **Addition Start**: Define custom labels
+			// **Addition**: custom labels
 			const categoryLabel = product.category.categoryName
 				? product.category.categoryName.toLowerCase().replace(/\s+/g, "_")
 				: "general";
 
 			const generalLabel = "general_campaign";
-			// **Addition End**
 
+			// If the product has variants...
 			if (hasVariants) {
+				// item_group_id for grouping all variants in a single "family"
+				const itemGroupId = escapeXml(product._id.toString()); // or use productSKU, etc.
+
 				for (let [index, variant] of product.productAttributes.entries()) {
 					const variantImage = variant.productImages?.[0]?.url || imageLink;
 					const variantSize = variant.size || "Unspecified";
-					const variantHexColor = variant.color || "Unspecified";
+					const variantHexColor = variant.color || "";
 					const variantColor = await resolveColorName(variantHexColor);
 					const variantPrice =
 						variant.priceAfterDiscount || variant.price || product.price;
@@ -185,137 +210,125 @@ router.get("/generate-feeds", async (req, res) => {
 						DEFAULT_HEIGHT
 					);
 
+					const finalLink = getProductLink(product);
+
 					const variantItem = `
-                <item>
-                  <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
-                  <g:title><![CDATA[${capitalizeWords(
-										product.productName
-									)} (${variantSize}, ${variantColor})]]></g:title>
-                  <g:description><![CDATA[${escapeXml(
-										product.description.replace(/<[^>]+>/g, "")
-									)}]]></g:description>
-                  <g:link>https://serenejannat.com/single-product/${escapeXml(
-										product.slug
-									)}/${escapeXml(product.category.categorySlug)}/${
-						product._id
-					}</g:link>
-                  <g:image_link>${escapeXml(variantImage)}</g:image_link>
-                  <g:availability>${variantAvailability}</g:availability>
-                  <g:price>${variantPrice.toFixed(2)} USD</g:price>
-                  <g:brand>${escapeXml(brand)}</g:brand>
-                  <g:condition>${escapeXml(condition)}</g:condition>
-                  <g:google_product_category>${googleProductCategory}</g:google_product_category>
-                  <g:product_type><![CDATA[${escapeXml(
-										product.category.categoryName
-									)}]]></g:product_type>
-                  <g:size>${escapeXml(variantSize)}</g:size>
-                  <g:color>${escapeXml(variantColor)}</g:color>
-                  <g:age_group>adult</g:age_group>
-                  <g:gender>${defaultGender}</g:gender>
-                  <g:identifier_exists>false</g:identifier_exists>
-                  <g:shipping_weight>${variantWeight} kg</g:shipping_weight>
-                  <g:shipping_length>${variantLength} cm</g:shipping_length>
-                  <g:shipping_width>${variantWidth} cm</g:shipping_width>
-                  <g:shipping_height>${variantHeight} cm</g:shipping_height>
-                  <!-- **Addition Start**: Add custom labels -->
-                  <g:custom_label_0>${escapeXml(
-										categoryLabel
-									)}</g:custom_label_0>
-                  <g:custom_label_1>${escapeXml(
-										generalLabel
-									)}</g:custom_label_1>
-                  <!-- **Addition End** -->
-                  <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
-                </item>
-              `;
-					googleItems.push(variantItem);
-					facebookItems.push(variantItem);
-				}
-			} else {
-				const weight = convertLbsToKg(product.geodata?.weight || 0);
-				const length = convertInchesToCm(product.geodata?.length || 0);
-				const width = convertInchesToCm(product.geodata?.width || 0);
-				const height = convertInchesToCm(product.geodata?.height || 0);
-				const size = product.size || "Unspecified";
-				const variantHexColor = product.color || "Unspecified";
-				const resolvedColor = await resolveColorName(variantHexColor); // **Fixed**: Ensure color name is resolved
-
-				// **Addition Start**: Define custom labels for non-variant products
-				const categoryLabel = product.category.categoryName
-					? product.category.categoryName.toLowerCase().replace(/\s+/g, "_")
-					: "general";
-
-				const generalLabel = "general_campaign";
-				// **Addition End**
-
-				const googleItem = `
               <item>
-                <g:id>${escapeXml(product._id.toString())}</g:id>
+                <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
                 <g:title><![CDATA[${capitalizeWords(
 									product.productName
-								)}]]></g:title>
+								)} (${variantSize}, ${variantColor})]]></g:title>
                 <g:description><![CDATA[${escapeXml(
 									product.description.replace(/<[^>]+>/g, "")
 								)}]]></g:description>
-                <g:link>https://serenejannat.com/single-product/${escapeXml(
-									product.slug
-								)}/${escapeXml(product.category.categorySlug)}/${
-					product._id
-				}</g:link>
-                <g:image_link>${imageLink}</g:image_link>
-                <g:availability>${
-									product.quantity > 0 ? "in stock" : "out of stock"
-								}</g:availability>
-                <g:price>${product.priceAfterDiscount.toFixed(2)} USD</g:price>
+                <g:link>${finalLink}</g:link>
+                <g:image_link>${escapeXml(variantImage)}</g:image_link>
+                <g:availability>${variantAvailability}</g:availability>
+                <g:price>${variantPrice.toFixed(2)} USD</g:price>
                 <g:brand>${escapeXml(brand)}</g:brand>
                 <g:condition>${escapeXml(condition)}</g:condition>
                 <g:google_product_category>${googleProductCategory}</g:google_product_category>
                 <g:product_type><![CDATA[${escapeXml(
 									product.category.categoryName
 								)}]]></g:product_type>
-                <g:size>${escapeXml(size)}</g:size>
-                <g:color>${escapeXml(resolvedColor)}</g:color>
+                <g:item_group_id>${itemGroupId}</g:item_group_id>
+                <g:size>${escapeXml(variantSize)}</g:size>
+                <g:color>${escapeXml(variantColor)}</g:color>
                 <g:age_group>adult</g:age_group>
                 <g:gender>${defaultGender}</g:gender>
                 <g:identifier_exists>false</g:identifier_exists>
-                <g:shipping_weight>${weight} kg</g:shipping_weight>
-                <g:shipping_length>${length} cm</g:shipping_length>
-                <g:shipping_width>${width} cm</g:shipping_width>
-                <g:shipping_height>${height} cm</g:shipping_height>
-                <!-- **Addition Start**: Add custom labels -->
+                <g:shipping_weight>${variantWeight} kg</g:shipping_weight>
+                <g:shipping_length>${variantLength} cm</g:shipping_length>
+                <g:shipping_width>${variantWidth} cm</g:shipping_width>
+                <g:shipping_height>${variantHeight} cm</g:shipping_height>
+                <!-- Custom labels -->
                 <g:custom_label_0>${escapeXml(categoryLabel)}</g:custom_label_0>
                 <g:custom_label_1>${escapeXml(generalLabel)}</g:custom_label_1>
-                <!-- **Addition End** -->
                 <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
               </item>
             `;
+					googleItems.push(variantItem);
+					facebookItems.push(variantItem);
+				}
+			} else {
+				// No variants => single product
+				const weight = convertLbsToKg(product.geodata?.weight || 0);
+				const length = convertInchesToCm(product.geodata?.length || 0);
+				const width = convertInchesToCm(product.geodata?.width || 0);
+				const height = convertInchesToCm(product.geodata?.height || 0);
+				const size = product.size || "Unspecified";
+				const variantHexColor = product.color || "";
+				const resolvedColor = await resolveColorName(variantHexColor);
+
+				const finalLink = getProductLink(product);
+
+				const googleItem = `
+            <item>
+              <g:id>${escapeXml(product._id.toString())}</g:id>
+              <g:title><![CDATA[${capitalizeWords(
+								product.productName
+							)}]]></g:title>
+              <g:description><![CDATA[${escapeXml(
+								product.description.replace(/<[^>]+>/g, "")
+							)}]]></g:description>
+              <g:link>${finalLink}</g:link>
+              <g:image_link>${imageLink}</g:image_link>
+              <g:availability>${
+								product.quantity > 0 ? "in stock" : "out of stock"
+							}</g:availability>
+              <g:price>${product.priceAfterDiscount.toFixed(2)} USD</g:price>
+              <g:brand>${escapeXml(brand)}</g:brand>
+              <g:condition>${escapeXml(condition)}</g:condition>
+              <g:google_product_category>${googleProductCategory}</g:google_product_category>
+              <g:product_type><![CDATA[${escapeXml(
+								product.category.categoryName
+							)}]]></g:product_type>
+              <g:size>${escapeXml(size)}</g:size>
+              <g:color>${escapeXml(resolvedColor)}</g:color>
+              <g:age_group>adult</g:age_group>
+              <g:gender>${defaultGender}</g:gender>
+              <g:identifier_exists>false</g:identifier_exists>
+              <g:shipping_weight>${weight} kg</g:shipping_weight>
+              <g:shipping_length>${length} cm</g:shipping_length>
+              <g:shipping_width>${width} cm</g:shipping_width>
+              <g:shipping_height>${height} cm</g:shipping_height>
+              <!-- Custom labels -->
+              <g:custom_label_0>${escapeXml(categoryLabel)}</g:custom_label_0>
+              <g:custom_label_1>${escapeXml(generalLabel)}</g:custom_label_1>
+              <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
+            </item>
+          `;
 				googleItems.push(googleItem);
 				facebookItems.push(googleItem);
 			}
 		}
 	}
 
+	// Build Google Feed
 	const googleFeedContent = `
-        <rss xmlns:g="http://base.google.com/ns/1.0" version="2.0">
-          <channel>
-            <title>Serene Jannat Products</title>
-            <link>https://serenejannat.com</link>
-            <description>Google Merchant Center Feed</description>
-            ${googleItems.join("\n")}
-          </channel>
-        </rss>
-      `;
-	const facebookFeedContent = `
-        <rss version="2.0">
-          <channel>
-            <title>Serene Jannat Products</title>
-            <link>https://serenejannat.com</link>
-            <description>Facebook Product Feed</description>
-            ${facebookItems.join("\n")}
-          </channel>
-        </rss>
-      `;
+    <rss xmlns:g="http://base.google.com/ns/1.0" version="2.0">
+      <channel>
+        <title>Serene Jannat Products</title>
+        <link>https://serenejannat.com</link>
+        <description>Google Merchant Center Feed</description>
+        ${googleItems.join("\n")}
+      </channel>
+    </rss>
+  `;
 
+	// Build Facebook Feed
+	const facebookFeedContent = `
+    <rss version="2.0">
+      <channel>
+        <title>Serene Jannat Products</title>
+        <link>https://serenejannat.com</link>
+        <description>Facebook Product Feed</description>
+        ${facebookItems.join("\n")}
+      </channel>
+    </rss>
+  `;
+
+	// Write the files to your public folder
 	const googleWriteStream = createWriteStream(
 		resolve(__dirname, "../../serene_frontend/public/merchant-center-feed.xml"),
 		{ flags: "w" }
@@ -330,6 +343,7 @@ router.get("/generate-feeds", async (req, res) => {
 	facebookWriteStream.write(facebookFeedContent, "utf-8");
 	facebookWriteStream.end();
 
+	// On finish, respond to client
 	googleWriteStream.on("finish", () => {
 		console.log("Google Merchant Center feed generated successfully");
 	});

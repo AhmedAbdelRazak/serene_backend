@@ -67,7 +67,46 @@ exports.listProductsNoFilter = async (req, res) => {
 	let limit = req.query.limit ? parseInt(req.query.limit) : 200;
 
 	try {
-		const products = await Product.find()
+		const products = await Product.find({
+			"printifyProductDetails.POD": { $ne: true },
+		})
+			.populate(
+				"category",
+				"_id categoryName categorySlug thumbnail categoryName_Arabic"
+			)
+			.populate(
+				"subcategory",
+				"_id SubcategoryName SubcategorySlug thumbnail SubcategoryName_Arabic"
+			)
+			.populate("gender", "_id genderName thumbnail")
+			.populate("addedByEmployee", "_id name role")
+			.populate("updatedByEmployee", "_id name role")
+			.populate({
+				path: "relatedProducts",
+				populate: {
+					path: "category",
+					select: "_id categoryName categorySlug thumbnail categoryName_Arabic",
+				},
+			})
+			.sort([[sortBy, order]])
+			.limit(limit);
+
+		res.json(products);
+	} catch (error) {
+		console.log(error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
+exports.listPODProducts = async (req, res) => {
+	let order = req.query.order ? req.query.order : "desc";
+	let sortBy = req.query.sortBy ? req.query.sortBy : "viewsCount";
+	let limit = req.query.limit ? parseInt(req.query.limit) : 200;
+
+	try {
+		const products = await Product.find({
+			"printifyProductDetails.POD": true,
+		})
 			.populate(
 				"category",
 				"_id categoryName categorySlug thumbnail categoryName_Arabic"
