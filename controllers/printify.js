@@ -322,119 +322,122 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 
 exports.printifyOrders = async (req, res) => {
 	try {
-		// Fetch orders from MongoDB excluding "delivered" and "cancelled"
+		// 1. Fetch orders from MongoDB that we need to sync (exclude delivered/cancelled)
 		const ordersToCheck = await Order.find({
 			status: { $nin: ["delivered", "cancelled"] },
 			"printifyOrderDetails.id": { $exists: true },
 		});
 
-		// Create a map of order IDs from MongoDB for quick lookup
+		// 2. Create a map of Printify Order IDs => local Order docs
+		//    for quick lookup & updates later.
 		const orderMap = new Map();
 		ordersToCheck.forEach((order) => {
 			orderMap.set(order.printifyOrderDetails.id, order);
 		});
 
-		// Fetch the Shop ID from Printify API
-		const shopResponse = await axios.get(
-			"https://api.printify.com/v1/shops.json",
-			{
-				headers: {
-					Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
-				},
-			}
-		);
+		// 3. Helper to fetch shops & orders for a given token, then update local DB
+		const fetchAndSyncShopsForToken = async (token) => {
+			const tokenLabel =
+				token === process.env.PRINTIFY_TOKEN ? "STANDARD" : "DESIGN";
 
-		// Check if there are shops in the response
-		if (shopResponse.data && shopResponse.data.length > 0) {
-			const shopId = shopResponse.data[0].id; // Assuming you want the first shop ID
-
-			// Fetch the orders for the Shop ID
-			const ordersResponse = await axios.get(
-				`https://api.printify.com/v1/shops/${shopId}/orders.json`,
+			// Attempt to fetch shops
+			const shopResponse = await axios.get(
+				"https://api.printify.com/v1/shops.json",
 				{
-					headers: {
-						Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
-					},
+					headers: { Authorization: `Bearer ${token}` },
 				}
 			);
 
-			// Log the response from Printify API
-			console.log("Orders Response Data:", ordersResponse.data);
-
-			// Check if there are orders in the response
 			if (
-				ordersResponse.data &&
-				ordersResponse.data.data &&
-				ordersResponse.data.data.length > 0
+				!shopResponse.data ||
+				!Array.isArray(shopResponse.data) ||
+				!shopResponse.data.length
 			) {
-				const orders = ordersResponse.data.data;
+				console.log(`⚠️ [${tokenLabel}] No shops found.`);
+				return { tokenLabel, shopsCount: 0, ordersSyncedCount: 0 };
+			}
 
-				for (const printifyOrder of orders) {
+			let totalOrdersSynced = 0;
+
+			// Iterate over each shop found under this token
+			for (const shop of shopResponse.data) {
+				const shopId = shop.id;
+
+				// Fetch orders for this shop
+				const ordersResponse = await axios.get(
+					`https://api.printify.com/v1/shops/${shopId}/orders.json`,
+					{
+						headers: { Authorization: `Bearer ${token}` },
+					}
+				);
+
+				const fetchedOrders = ordersResponse.data?.data || [];
+				console.log(
+					`[${tokenLabel}] ShopID=${shopId} => ${fetchedOrders.length} orders fetched.`
+				);
+
+				// Loop through each Printify order from that shop
+				for (const printifyOrder of fetchedOrders) {
+					// Check if we have a matching local order
 					const existingOrder = orderMap.get(printifyOrder.id);
+					if (!existingOrder) continue; // Not a local order we care about
 
-					if (existingOrder) {
-						const updatedFields = {};
+					const updatedFields = {};
 
-						// Check and update the status if it's different
-						if (existingOrder.status !== printifyOrder.status) {
-							updatedFields.status = printifyOrder.status;
-						}
+					// If local status differs from the Printify order status, update it
+					if (existingOrder.status !== printifyOrder.status) {
+						updatedFields.status = printifyOrder.status;
+					}
 
-						// Check and update the tracking number if it's different
-						const trackingNumber = printifyOrder.printify_connect
-							? printifyOrder.printify_connect.url
-							: null;
-						if (existingOrder.trackingNumber !== trackingNumber) {
-							updatedFields.trackingNumber = trackingNumber;
-						}
+					// Check & update the tracking number if different
+					const printifyTracking = printifyOrder?.printify_connect?.url || null;
+					if (existingOrder.trackingNumber !== printifyTracking) {
+						updatedFields.trackingNumber = printifyTracking;
+					}
 
-						// Update the order if there are changes
-						if (Object.keys(updatedFields).length > 0) {
-							await Order.updateOne(
-								{ _id: existingOrder._id },
-								{ $set: updatedFields }
-							);
-						}
+					// If we have changes, update the local DB
+					if (Object.keys(updatedFields).length > 0) {
+						await Order.updateOne(
+							{ _id: existingOrder._id },
+							{ $set: updatedFields }
+						);
+						totalOrdersSynced += 1;
 					}
 				}
-
-				return res.json({
-					shopId,
-					message: "Orders have been successfully synced with Printify.",
-				});
-			} else {
-				return res.status(404).json({ error: "No orders found for the shop" });
 			}
-		} else {
-			return res.status(404).json({ error: "No shops found" });
-		}
+
+			return {
+				tokenLabel,
+				shopsCount: shopResponse.data.length,
+				ordersSyncedCount: totalOrdersSynced,
+			};
+		};
+
+		// 4. Call our helper for both tokens
+		const resultsStandard = await fetchAndSyncShopsForToken(
+			process.env.PRINTIFY_TOKEN
+		);
+		const resultsDesign = await fetchAndSyncShopsForToken(
+			process.env.DESIGN_PRINTIFY_TOKEN
+		);
+
+		// 5. Return a combined response
+		return res.json({
+			success: true,
+			message:
+				"Orders have been successfully synced from both Printify tokens.",
+			details: [resultsStandard, resultsDesign],
+		});
 	} catch (error) {
 		console.error("Error fetching orders:", error.message);
 		if (error.response) {
 			console.error("Printify API response:", error.response.data);
 		}
-		return res.status(500).json({ error: "Error fetching orders" });
+		return res
+			.status(500)
+			.json({ error: "Error fetching orders from Printify" });
 	}
 };
-
-const uploadImageToCloudinary = async (imageUrl) => {
-	try {
-		const result = await cloudinary.uploader.upload(imageUrl, {
-			folder: "serene_janat/products", // Optional: specify a folder in Cloudinary
-			resource_type: "image",
-		});
-		return {
-			public_id: result.public_id,
-			url: result.secure_url,
-		};
-	} catch (error) {
-		console.error(`Error uploading image to Cloudinary: ${error.message}`);
-		// Handle the error as needed, e.g., return null or throw
-		return null;
-	}
-};
-
-const sizeOrder = ["S", "M", "L", "XL", "XXL"]; // Ensure this is defined
 
 exports.syncPrintifyProducts = async (req, res) => {
 	try {
