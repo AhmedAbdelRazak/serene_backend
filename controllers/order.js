@@ -138,21 +138,21 @@ const sendOrderConfirmationEmail = async (order) => {
 		const htmlContent = await formatOrderEmail(order);
 
 		const recipientEmail = order.customerDetails.email || defaultEmail;
+
+		// These might originally be objects like { email: "..."}
+		// Convert them to an array of email strings:
 		const bccEmails = [
 			{ email: "sally.abdelrazak@serenejannat.com" },
 			{ email: "ahmed.abdelrazak20@gmail.com" },
 			{ email: "ahmedandsally14@gmail.com" },
 		];
-
-		// Remove duplicates
-		const uniqueBccEmails = bccEmails.filter(
-			(bcc) => bcc.email !== recipientEmail
-		);
+		const uniqueBccEmails = bccEmails
+			.filter((bcc) => bcc.email !== recipientEmail)
+			.map((item) => item.email);
 
 		const FormSubmittionEmail = {
 			to: recipientEmail,
 			from: fromEmail,
-			bcc: uniqueBccEmails,
 			subject: `${BusinessName} - Order Confirmation`,
 			html: htmlContent,
 			attachments: [
@@ -165,8 +165,29 @@ const sendOrderConfirmationEmail = async (order) => {
 			],
 		};
 
+		// separate email for the internal team
+		const FormSubmittionEmail2 = {
+			to: uniqueBccEmails, // array of strings
+			from: fromEmail,
+			subject: `${BusinessName} - Order Confirmation`,
+			html: htmlContent,
+			attachments: [
+				{
+					content: pdfBuffer.toString("base64"),
+					filename: "Order_Confirmation.pdf",
+					type: "application/pdf",
+					disposition: "attachment",
+				},
+			],
+		};
+
+		// Send first to customer
 		await sgMail.send(FormSubmittionEmail);
-		console.log("Order confirmation email sent successfully.");
+
+		// Send second to internal staff
+		await sgMail.send(FormSubmittionEmail2);
+
+		console.log("Order confirmation emails sent successfully.");
 	} catch (error) {
 		console.error("Error sending order confirmation email:", error);
 		if (error.response) {
@@ -1172,14 +1193,111 @@ exports.listOfAggregatedForPagination = async (req, res) => {
 	}
 
 	try {
+		// 1) Match stage
 		const matchStage = { $match: filters };
+
+		// 2) Count total records
 		const countStage = { $count: "count" };
+
+		// 3) Build the "ordersStage"
 		const ordersStage = [
 			{ $sort: { createdAt: -1 } },
 			{ $skip: (pageNum - 1) * recordsNum },
 			{ $limit: recordsNum },
+
+			// --- STEP A: Convert productId (string) => ObjectId for each item in productsNoVariable ---
+			{
+				$addFields: {
+					productsNoVariable: {
+						$map: {
+							input: "$productsNoVariable",
+							as: "item",
+							in: {
+								$mergeObjects: [
+									// Original fields from each item
+									"$$item",
+									// Add a new field "productIdObj" by converting the string to ObjectId
+									{
+										productIdObj: { $toObjectId: "$$item.productId" },
+									},
+								],
+							},
+						},
+					},
+				},
+			},
+
+			// --- STEP B: Lookup the actual Product docs using productIdObj ---
+			{
+				$lookup: {
+					from: "products", // collection name
+					localField: "productsNoVariable.productIdObj",
+					foreignField: "_id",
+					as: "noVarProducts",
+				},
+			},
+
+			// --- STEP C: Merge the found productSKU into productsNoVariable ---
+			{
+				$addFields: {
+					productsNoVariable: {
+						$map: {
+							input: "$productsNoVariable",
+							as: "item",
+							in: {
+								$mergeObjects: [
+									"$$item", // original item fields
+									{
+										productSKU: {
+											$let: {
+												vars: {
+													matchedProduct: {
+														$first: {
+															$filter: {
+																input: "$noVarProducts",
+																as: "p",
+																cond: {
+																	$eq: ["$$item.productIdObj", "$$p._id"],
+																},
+															},
+														},
+													},
+												},
+												in: "$$matchedProduct.productSKU",
+											},
+										},
+
+										color: {
+											$let: {
+												vars: {
+													matchedProduct: {
+														$first: {
+															$filter: {
+																input: "$noVarProducts",
+																as: "p",
+																cond: {
+																	$eq: ["$$item.productIdObj", "$$p._id"],
+																},
+															},
+														},
+													},
+												},
+												in: "$$matchedProduct.color",
+											},
+										},
+									},
+								],
+							},
+						},
+					},
+				},
+			},
+
+			// --- STEP D: Remove temp array so it doesn’t clutter final output ---
+			{ $unset: "noVarProducts" },
 		];
 
+		// 4) Combine into a facet so we get totalRecords & orders together
 		const aggregateQuery = [
 			matchStage,
 			{
@@ -1196,11 +1314,13 @@ exports.listOfAggregatedForPagination = async (req, res) => {
 			},
 		];
 
+		// 5) Execute the pipeline
 		const result = await Order.aggregate(aggregateQuery);
 
 		const totalRecords = result[0]?.totalRecords || 0;
 		const orders = result[0]?.orders || [];
 
+		// 6) Return the final response
 		res.json({
 			page: pageNum,
 			records: recordsNum,
@@ -1668,6 +1788,111 @@ exports.updateSingleOrder = async (req, res) => {
 		updatedOrder.updateStatus = updateStatusMessage;
 
 		await updatedOrder.save();
+
+		// === Email Notification Logic ===
+		try {
+			const fromEmail = "noreply@serenejannat.com";
+			const adminEmails = [
+				"sally.abdelrazak@serenejannat.com",
+				"ahmed.abdelrazak20@gmail.com",
+				"ahmedandsally14@gmail.com",
+			];
+			const customerEmail = updatedOrder?.customerDetails?.email || "";
+
+			// Subject line still includes the general update message:
+			const subjectLine = `Order #${updatedOrder.invoiceNumber} - ${updateStatusMessage}`;
+
+			// Build a small helper string describing what's changed:
+			let detailLine = "";
+			switch (updateType) {
+				case "trackingNumber":
+					detailLine = `Your order tracking number is now <strong>${updatedOrder.trackingNumber}</strong>.`;
+					break;
+				case "status":
+					detailLine = `Your order status is now <strong>${updatedOrder.status}</strong>.`;
+					break;
+				case "cancel":
+					detailLine = `Your order has been <strong>cancelled</strong>.`;
+					break;
+				case "remove":
+					detailLine = `One or more items have been <strong>removed</strong> from your order.`;
+					break;
+				case "addUnits":
+				case "addProduct":
+					detailLine = `New item(s) have been <strong>added</strong> or quantity has changed.`;
+					break;
+				case "exchange":
+					detailLine = `An item in your order was <strong>exchanged</strong>.`;
+					break;
+				case "customerDetails":
+					detailLine = `Your shipping/contact information has been <strong>updated</strong>.`;
+					break;
+				default:
+					detailLine = `Your order information has been <strong>updated</strong>.`;
+					break;
+			}
+
+			// You can replace this URL with your own publicly hosted logo if desired:
+			const logoUrl =
+				"https://via.placeholder.com/200x100?text=Serene+Jannat+Logo";
+
+			// HTML layout similar to "create new order" but simpler
+			const htmlContent = `
+				<html>
+					<head>
+						<meta charset="UTF-8" />
+						<title>Serene Jannat - Order Update</title>
+					</head>
+					<body style="margin:0; padding:0; font-family: Arial, sans-serif; background-color: #f6f6f6; color: #333;">
+						<div style="background-color: #ffffff; max-width:600px; margin: 20px auto; padding: 20px; border: 1px solid #ddd;">
+							
+							<!-- Header / Logo -->
+							<div style="text-align: center; margin-bottom: 20px;">
+								<img src="${logoUrl}" alt="Serene Jannat Logo" style="max-width: 200px;" />
+							</div>
+
+							<!-- Title / Greeting -->
+							<h2 style="color: #333; text-align: center;">Order #${updatedOrder.invoiceNumber} Update</h2>
+
+							<!-- Body -->
+							<p>Hello ${updatedOrder.customerDetails.name},</p>
+							<p>We wanted to let you know that some changes have been made to your order. ${detailLine}</p>
+							
+							<p>If you have any questions, please send an email at <strong>sally.abdelrazak@serenejannat.com</strong> 
+							   or call <strong>951 565 7568</strong>.
+							</p>
+
+							<p>Thank you,<br/>Serene Jannat</p>
+						</div>
+					</body>
+				</html>
+			`;
+
+			// 1) Send to the Customer (if email exists)
+			if (customerEmail) {
+				await sgMail.send({
+					to: customerEmail,
+					from: fromEmail,
+					subject: subjectLine,
+					html: htmlContent,
+				});
+				console.log("Order update email sent to customer:", customerEmail);
+			} else {
+				console.log("No customer email found, skipping customer update email.");
+			}
+
+			// 2) Send a separate email to Admins (as 'to')
+			await sgMail.send({
+				to: adminEmails, // array of emails
+				from: fromEmail,
+				subject: subjectLine,
+				html: htmlContent,
+			});
+			console.log("Order update email sent to admins:", adminEmails);
+		} catch (emailError) {
+			console.error("Error sending order update emails:", emailError);
+		}
+		// === End of Email Notification Logic ===
 
 		res.json(updatedOrder);
 	} catch (error) {
