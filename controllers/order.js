@@ -1834,7 +1834,7 @@ exports.updateSingleOrder = async (req, res) => {
 
 			// You can replace this URL with your own publicly hosted logo if desired:
 			const logoUrl =
-				"https://via.placeholder.com/200x100?text=Serene+Jannat+Logo";
+				"https://res.cloudinary.com/infiniteapps/image/upload/v1719198504/serene_janat/1719198503886.png";
 
 			// HTML layout similar to "create new order" but simpler
 			const htmlContent = `
