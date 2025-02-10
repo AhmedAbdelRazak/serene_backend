@@ -122,7 +122,7 @@ async function resolveColorName(hexCode) {
 
 // Generate product link (conditional for POD)
 function getProductLink(product) {
-	// If the product is POD (Printify) => link to custom-gifts/<product._id>
+	// If the product is POD (Printify) => link to /custom-gifts/<_id>
 	if (
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
@@ -135,7 +135,7 @@ function getProductLink(product) {
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
 }
 
-// NEW OR CHANGED: Safely parse the variant title to separate size and color
+// Safely parse the variant title to separate size and color
 function parseSizeColorFromVariantTitle(title) {
 	if (!title || typeof title !== "string") {
 		return { variantSize: "Unspecified", variantColor: "Unspecified" };
@@ -147,24 +147,29 @@ function parseSizeColorFromVariantTitle(title) {
 	return { variantSize: size, variantColor: color };
 }
 
-// NEW OR CHANGED: Safely get final price from discount first, or fallback
+// Get final price from discount first, or fallback
 function getFinalVariantPrice(variant) {
-	// If you store variant.price in cents (e.g. 2596 => $25.96):
 	let rawPrice = variant.priceAfterDiscount ?? variant.price;
 	if (!rawPrice) return "0.00";
 
 	let floatVal = parseFloat(rawPrice);
 
-	// If the DB is storing in cents and the value is definitely bigger than 100,
-	// assume it's cents. Adjust as needed if you have other price ranges:
-	if (floatVal >= 100) {
+	// If you store price in cents, and floatVal >= 100 might mean e.g. 2596 => 25.96
+	if (floatVal >= 1000) {
 		floatVal = floatVal / 100;
 	}
 
 	return floatVal.toFixed(2);
 }
 
-// Generate Feeds Route
+// Validate gender
+function validateGender(gender) {
+	const validGenders = ["male", "female", "unisex"];
+	if (!gender || typeof gender !== "string") return "unisex";
+	const g = gender.toLowerCase();
+	return validGenders.includes(g) ? g : "unisex";
+}
+
 router.get("/generate-feeds", async (req, res) => {
 	let googleItems = [];
 	let facebookItems = [];
@@ -178,14 +183,6 @@ router.get("/generate-feeds", async (req, res) => {
 		if (product.category && product.category.categoryStatus) {
 			const condition = "new";
 			const brand = "Serene Jannat";
-
-			function validateGender(gender) {
-				const validGenders = ["male", "female", "unisex"];
-				return typeof gender === "string" &&
-					validGenders.includes(gender.toLowerCase())
-					? gender.toLowerCase()
-					: "unisex";
-			}
 
 			const defaultGender = validateGender(product.gender || "unisex");
 
@@ -206,46 +203,34 @@ router.get("/generate-feeds", async (req, res) => {
 				: "general";
 			const generalLabel = "general_campaign";
 
-			// ************************************
-			// 1) If product is POD => use Printify variants
-			// ************************************
+			// ============================
+			// === 1) POD PRODUCT LOGIC ===
+			// ============================
 			if (product.printifyProductDetails?.POD) {
 				const itemGroupId = escapeXml(product._id.toString());
+				// Grab variants if any
+				const variants = product.printifyProductDetails.variants || [];
 
-				// Make sure we have variants
-				if (
-					Array.isArray(product.printifyProductDetails.variants) &&
-					product.printifyProductDetails.variants.length > 0
-				) {
-					for (let [
-						index,
-						variant,
-					] of product.printifyProductDetails.variants.entries()) {
-						// NEW OR CHANGED: Safely parse out size and color from variant.title
+				if (Array.isArray(variants) && variants.length > 0) {
+					for (let [index, variant] of variants.entries()) {
 						const { variantSize, variantColor } =
 							parseSizeColorFromVariantTitle(variant.title);
-
-						// Price from DB's discount or fallback
 						const variantPrice = getFinalVariantPrice(variant);
-
-						// Mark availability
-						const variantAvailability =
-							variant.quantity && variant.quantity > 0
-								? "in stock"
-								: "in stock";
-						// or if you do want "out of stock" if 0 => variant.quantity > 0 ? 'in stock' : 'out of stock'
-
+						// Optionally: if variant.quantity > 0 => "in stock" else => "out of stock"
+						const variantAvailability = "in stock"; // Adjust if you track stock
 						const finalLink = getProductLink(product);
+						const variantImage = imageLink; // Or if you store separate images per variant
 
-						// Use main product image or fallback
-						const variantImage = imageLink; // or if each variant had its own image, you can adapt here
+						// NEW: Add "Custom Design" to the title for POD
+						// e.g. "T-shirt (Custom Design, M, Navy)"
+						const podTitle = `${capitalizeWords(
+							product.productName
+						)} (Custom Design, ${variantSize}, ${variantColor})`;
 
 						const variantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
-                <g:title><![CDATA[${capitalizeWords(
-									product.productName
-								)} (${variantSize}, ${variantColor})]]></g:title>
+                <g:title><![CDATA[${podTitle}]]></g:title>
                 <g:description><![CDATA[${escapeXml(
 									product.description.replace(/<[^>]+>/g, "")
 								)}]]></g:description>
@@ -277,18 +262,21 @@ router.get("/generate-feeds", async (req, res) => {
 						facebookItems.push(variantItem);
 					}
 				} else {
-					// POD but no variants found => fallback to a single item
+					// POD but no variants => fallback to single item
 					const fallbackPrice = parseFloat(
 						product.priceAfterDiscount || product.price || 0
 					).toFixed(2);
 					const finalLink = getProductLink(product);
 
+					// Title with "Custom Design"
+					const podFallbackTitle = `${capitalizeWords(
+						product.productName
+					)} (Custom Design)`;
+
 					const podItem = `
             <item>
               <g:id>${escapeXml(product._id.toString())}</g:id>
-              <g:title><![CDATA[${capitalizeWords(
-								product.productName
-							)}]]></g:title>
+              <g:title><![CDATA[${podFallbackTitle}]]></g:title>
               <g:description><![CDATA[${escapeXml(
 								product.description.replace(/<[^>]+>/g, "")
 							)}]]></g:description>
@@ -321,16 +309,15 @@ router.get("/generate-feeds", async (req, res) => {
 					facebookItems.push(podItem);
 				}
 
-				// ************************************
-				// 2) Non-POD logic
-				// ************************************
+				// ============================
+				// === 2) NON-POD PRODUCT  ===
+				// ============================
 			} else {
 				// If it's NOT POD, we follow your existing approach
 				const hasVariants =
 					product.productAttributes && product.productAttributes.length > 0;
 
 				if (hasVariants) {
-					// item_group_id for grouping all variants in a single "family"
 					const itemGroupId = escapeXml(product._id.toString());
 
 					for (let [index, variant] of product.productAttributes.entries()) {
@@ -363,12 +350,15 @@ router.get("/generate-feeds", async (req, res) => {
 
 						const finalLink = getProductLink(product);
 
+						// Original title pattern + size/color
+						const variantTitle = `${capitalizeWords(
+							product.productName
+						)} (${variantSize}, ${variantColor})`;
+
 						const variantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
-                <g:title><![CDATA[${capitalizeWords(
-									product.productName
-								)} (${variantSize}, ${variantColor})]]></g:title>
+                <g:title><![CDATA[${variantTitle}]]></g:title>
                 <g:description><![CDATA[${escapeXml(
 									product.description.replace(/<[^>]+>/g, "")
 								)}]]></g:description>
