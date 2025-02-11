@@ -66,7 +66,7 @@ function extractFirstNumber(value) {
 	return match ? parseFloat(match[0]) : "Not available";
 }
 
-// Generate image links for products
+// Generate *fallback* image links for non-POD or single-product usage
 function generateImageLinks(product) {
 	let images = [];
 
@@ -154,7 +154,7 @@ function getFinalVariantPrice(variant) {
 
 	let floatVal = parseFloat(rawPrice);
 
-	// If you store price in cents, and floatVal >= 100 might mean e.g. 2596 => 25.96
+	// If you store price in cents, and e.g. 2596 means $25.96
 	if (floatVal >= 1000) {
 		floatVal = floatVal / 100;
 	}
@@ -186,10 +186,11 @@ router.get("/generate-feeds", async (req, res) => {
 
 			const defaultGender = validateGender(product.gender || "unisex");
 
-			const images = generateImageLinks(product);
-			const imageLink =
-				images.length > 0
-					? images[0]
+			// Fallback images if no matched variant images
+			const fallbackImages = generateImageLinks(product);
+			const fallbackImageLink =
+				fallbackImages.length > 0
+					? fallbackImages[0]
 					: "https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg";
 
 			const googleProductCategory = escapeXml(
@@ -216,13 +217,35 @@ router.get("/generate-feeds", async (req, res) => {
 						const { variantSize, variantColor } =
 							parseSizeColorFromVariantTitle(variant.title);
 						const variantPrice = getFinalVariantPrice(variant);
-						// Optionally: if variant.quantity > 0 => "in stock" else => "out of stock"
-						const variantAvailability = "in stock"; // Adjust if you track stock
-						const finalLink = getProductLink(product);
-						const variantImage = imageLink; // Or if you store separate images per variant
 
-						// NEW: Add "Custom Design" to the title for POD
-						// e.g. "T-shirt (Custom Design, M, Navy)"
+						// Real stock logic if needed, else "in stock"
+						const variantAvailability = "in stock";
+
+						// ============================================
+						// HERE: MATCH CLOUDINARY IMAGES BY variant.sku
+						// ============================================
+						let variantImage = fallbackImageLink;
+						if (
+							product.productAttributes &&
+							product.productAttributes.length > 0
+						) {
+							// Find the attribute that has a SubSKU matching the variant's sku
+							const matchedAttr = product.productAttributes.find(
+								(attr) => attr.SubSKU === variant.sku
+							);
+							if (
+								matchedAttr &&
+								matchedAttr.productImages &&
+								matchedAttr.productImages.length > 0
+							) {
+								// Use the first Cloudinary image from that attribute
+								variantImage = matchedAttr.productImages[0].url;
+							}
+						}
+
+						const finalLink = getProductLink(product);
+
+						// Add "Custom Design" to the title for POD
 						const podTitle = `${capitalizeWords(
 							product.productName
 						)} (Custom Design, ${variantSize}, ${variantColor})`;
@@ -281,7 +304,7 @@ router.get("/generate-feeds", async (req, res) => {
 								product.description.replace(/<[^>]+>/g, "")
 							)}]]></g:description>
               <g:link>${finalLink}</g:link>
-              <g:image_link>${imageLink}</g:image_link>
+              <g:image_link>${fallbackImageLink}</g:image_link>
               <g:availability>${
 								product.quantity > 0 ? "in stock" : "out of stock"
 							}</g:availability>
@@ -313,7 +336,6 @@ router.get("/generate-feeds", async (req, res) => {
 				// === 2) NON-POD PRODUCT  ===
 				// ============================
 			} else {
-				// If it's NOT POD, we follow your existing approach
 				const hasVariants =
 					product.productAttributes && product.productAttributes.length > 0;
 
@@ -321,7 +343,8 @@ router.get("/generate-feeds", async (req, res) => {
 					const itemGroupId = escapeXml(product._id.toString());
 
 					for (let [index, variant] of product.productAttributes.entries()) {
-						const variantImage = variant.productImages?.[0]?.url || imageLink;
+						const variantImage =
+							variant.productImages?.[0]?.url || fallbackImageLink;
 						const variantSize = variant.size || "Unspecified";
 						const variantHexColor = variant.color || "";
 						const variantColor = await resolveColorName(variantHexColor);
@@ -365,7 +388,7 @@ router.get("/generate-feeds", async (req, res) => {
                 <g:link>${finalLink}</g:link>
                 <g:image_link>${escapeXml(variantImage)}</g:image_link>
                 <g:availability>${variantAvailability}</g:availability>
-                <g:price>${variantPrice.toFixed(2)} USD</g:price>
+                <g:price>${parseFloat(variantPrice).toFixed(2)} USD</g:price>
                 <g:brand>${escapeXml(brand)}</g:brand>
                 <g:condition>${escapeXml(condition)}</g:condition>
                 <g:google_product_category>${googleProductCategory}</g:google_product_category>
@@ -413,11 +436,13 @@ router.get("/generate-feeds", async (req, res) => {
 								product.description.replace(/<[^>]+>/g, "")
 							)}]]></g:description>
               <g:link>${finalLink}</g:link>
-              <g:image_link>${imageLink}</g:image_link>
+              <g:image_link>${fallbackImageLink}</g:image_link>
               <g:availability>${
 								product.quantity > 0 ? "in stock" : "out of stock"
 							}</g:availability>
-              <g:price>${product.priceAfterDiscount.toFixed(2)} USD</g:price>
+              <g:price>${parseFloat(
+								product.priceAfterDiscount || product.price || 0
+							).toFixed(2)} USD</g:price>
               <g:brand>${escapeXml(brand)}</g:brand>
               <g:condition>${escapeXml(condition)}</g:condition>
               <g:google_product_category>${googleProductCategory}</g:google_product_category>

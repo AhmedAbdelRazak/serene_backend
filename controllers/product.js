@@ -599,103 +599,144 @@ exports.getDistinctCategoriesActiveProducts = (req, res, next) => {
 		});
 };
 
-exports.gettingSpecificSetOfProducts = (req, res, next) => {
-	const { featured, newArrivals, sortByRate, offers, records } = req.params;
+exports.gettingSpecificSetOfProducts = async (req, res, next) => {
+	try {
+		const {
+			featured,
+			newArrivals,
+			customDesigns,
+			sortByRate,
+			offers,
+			records,
+		} = req.params;
 
-	let query = { activeProduct: true };
-	let pipeline = [];
+		// Base query always requires activeProduct = true
+		let baseMatch = { activeProduct: true };
+		let pipeline = [];
 
-	// For featured products
-	if (featured === "1") {
-		query.featuredProduct = true;
-	}
+		// 1) Handle customDesigns => only printify POD products
+		//    e.g. customDesigns=1 => "printifyProductDetails.POD === true"
+		if (customDesigns === "1") {
+			baseMatch["printifyProductDetails.POD"] = true;
+		}
 
-	// For new arrivals, no need to modify the query, we'll handle sorting later
-	if (newArrivals === "1") {
-		// If newArrivals is requested, it will be handled in the sorting stage
-		pipeline.push({ $sort: { createdAt: -1 } });
-	}
+		// 2) Featured => exclude POD
+		if (featured === "1") {
+			baseMatch.featuredProduct = true;
+			// Exclude POD from featured
+			baseMatch["printifyProductDetails.POD"] = { $ne: true };
+		}
 
-	// Handle sorting by rating
-	if (sortByRate === "1") {
-		pipeline.push(
-			{ $match: { ...query, ratings: { $exists: true, $not: { $size: 0 } } } },
-			{ $addFields: { ratingsCount: { $size: "$ratings" } } },
-			{ $sort: { ratingsCount: -1 } }
-		);
-	}
+		// 3) New arrivals => sort by createdAt desc, also exclude POD
+		if (newArrivals === "1") {
+			pipeline.push({ $sort: { createdAt: -1 } });
+			// Exclude POD from newArrivals
+			baseMatch["printifyProductDetails.POD"] = { $ne: true };
+		}
 
-	// For offers
-	if (offers === "1") {
-		query.$or = [
-			{ $expr: { $gt: ["$MSRPPriceBasic", "$priceAfterDiscount"] } },
-			{ $expr: { $gt: ["$price", "$priceAfterDiscount"] } },
-		];
-	}
+		// 4) Sort by rating => after we gather everything else
+		//    We only want to sort by rating if explicitly requested
+		//    We'll handle that further down as a separate pipeline step
+		let doSortByRating = false;
+		if (sortByRate === "1") {
+			doSortByRating = true;
+		}
 
-	// Add the match stage
-	pipeline.push({ $match: query });
+		// 5) Offers => same logic as your code (priceAfterDiscount < price OR < MSRPBasic)
+		if (offers === "1") {
+			baseMatch.$or = [
+				{ $expr: { $gt: ["$MSRPPriceBasic", "$priceAfterDiscount"] } },
+				{ $expr: { $gt: ["$price", "$priceAfterDiscount"] } },
+			];
+		}
 
-	// Add the lookup stage to populate the category
-	pipeline.push({
-		$lookup: {
-			from: "categories",
-			localField: "category",
-			foreignField: "_id",
-			as: "category",
-		},
-	});
+		// Now push the match stage
+		pipeline.push({ $match: baseMatch });
 
-	// Unwind the category array
-	pipeline.push({ $unwind: "$category" });
+		// If we need to sort by rating, do it here
+		if (doSortByRating) {
+			// We only want to match items that have a non-empty ratings array
+			pipeline.push({
+				$match: {
+					ratings: { $exists: true, $not: { $size: 0 } },
+				},
+			});
+			pipeline.push(
+				{ $addFields: { ratingsCount: { $size: "$ratings" } } },
+				{ $sort: { ratingsCount: -1 } }
+			);
+		}
 
-	// Limit the number of records if specified
-	if (records) {
-		pipeline.push({ $limit: parseInt(records) });
-	}
+		// If featured=1 or newArrivals=1, remove the entire printifyProductDetails field
+		// so it appears "blank" in the final output.
+		if (featured === "1" || newArrivals === "1") {
+			pipeline.push({ $unset: "printifyProductDetails" });
+		}
 
-	// Execute the aggregation pipeline
-	Product.aggregate(pipeline)
-		.then((products) => {
-			// Check if any product was returned when sorting by rate; if none, fallback to featured
-			if (sortByRate === "1" && products.length === 0 && featured !== "1") {
-				return Product.find({ activeProduct: true, featuredProduct: true })
-					.limit(parseInt(records))
-					.populate("category") // Populate category here as well
-					.lean();
-			}
-			return products;
-		})
-		.then((products) => {
-			const processedProducts = products
-				.map((product) => {
-					if (
-						product.productAttributes &&
-						product.productAttributes.length > 0
-					) {
-						// Group by color
-						const byColor = product.productAttributes.reduce((acc, attr) => {
-							acc[attr.color] = acc[attr.color] || {
+		// Lookup the category
+		pipeline.push({
+			$lookup: {
+				from: "categories",
+				localField: "category",
+				foreignField: "_id",
+				as: "category",
+			},
+		});
+
+		// Unwind category array
+		pipeline.push({ $unwind: "$category" });
+
+		// Limit the number of returned docs if "records" is present
+		if (records) {
+			pipeline.push({ $limit: parseInt(records, 10) });
+		}
+
+		// Execute the pipeline
+		let products = await Product.aggregate(pipeline);
+
+		// If we tried to sort by rating but got no products, and it's *not* featured=1,
+		// your original code does a fallback to featured products.
+		if (doSortByRating && products.length === 0 && featured !== "1") {
+			products = await Product.find({
+				activeProduct: true,
+				featuredProduct: true,
+			})
+				.limit(parseInt(records, 10))
+				.populate("category")
+				.lean();
+		}
+
+		// === GROUP EACH PRODUCT BY COLOR (like your original code) ===
+		const processedProducts = products
+			.map((product) => {
+				if (product.productAttributes && product.productAttributes.length > 0) {
+					// Group by color
+					const byColor = product.productAttributes.reduce((acc, attr) => {
+						const colorKey = attr.color || "unknown";
+						if (!acc[colorKey]) {
+							acc[colorKey] = {
 								...product,
 								productAttributes: [],
 								thumbnailImage: product.thumbnailImage,
 							};
-							acc[attr.color].productAttributes.push(attr);
-							return acc;
-						}, {});
+						}
+						acc[colorKey].productAttributes.push(attr);
+						return acc;
+					}, {});
 
-						// Return an array of products split by color
-						return Object.values(byColor);
-					}
-					// Return simple products as is
-					return [product];
-				})
-				.flat();
-			res.json(processedProducts);
-		})
-		.catch((err) => {
-			res.status(500).json({ error: err.message });
-		});
+					// Return an array of sub-products split by color
+					return Object.values(byColor);
+				}
+				// Otherwise, it's a simple product
+				return [product];
+			})
+			.flat();
+
+		return res.json(processedProducts);
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({ error: err.message });
+	}
 };
 
 exports.readSingleProduct = async (req, res, next) => {
@@ -834,7 +875,6 @@ exports.filteredProducts = async (req, res, next) => {
 
 	if (offers === "jannatoffers") {
 		console.log("Jannat Offers Was Triggered");
-		// query.category.categoryStatus = true;
 		query.$or = [
 			{
 				$expr: { $lt: ["$priceAfterDiscount", "$price"] },
@@ -894,7 +934,7 @@ exports.filteredProducts = async (req, res, next) => {
 			}
 		}
 
-		// Search term filter
+		// Search term
 		if (searchTerm) {
 			console.log(`Filtering by search term: ${searchTerm}`);
 			query.$text = { $search: searchTerm };
@@ -906,19 +946,20 @@ exports.filteredProducts = async (req, res, next) => {
 	const recordsPerPage = parseInt(records, 10) || 10;
 	const skip = (pageNumber - 1) * recordsPerPage;
 
-	// Add match stage to pipeline
+	// Build the initial aggregation pipeline
 	const pipeline = [{ $match: query }];
 
+	// Sort by createdAt descending initially
 	pipeline.push({ $sort: { createdAt: -1 } });
 
-	// Clone the pipeline to count the total number of records
+	// Clone pipeline for counting
 	const countPipeline = [...pipeline, { $count: "totalRecords" }];
 
-	// Add skip and limit for pagination
+	// Pagination
 	pipeline.push({ $skip: skip });
 	pipeline.push({ $limit: recordsPerPage });
 
-	// Add the lookup stages to populate the references
+	// Lookups
 	pipeline.push(
 		{
 			$lookup: {
@@ -946,7 +987,7 @@ exports.filteredProducts = async (req, res, next) => {
 		}
 	);
 
-	// Unwind the arrays
+	// Unwind
 	pipeline.push(
 		{ $unwind: "$category" },
 		{ $unwind: "$subcategory" },
@@ -954,6 +995,7 @@ exports.filteredProducts = async (req, res, next) => {
 	);
 
 	try {
+		// Parallel fetch
 		const [totalResult, products] = await Promise.all([
 			Product.aggregate(countPipeline),
 			Product.aggregate(pipeline),
@@ -961,7 +1003,7 @@ exports.filteredProducts = async (req, res, next) => {
 
 		const totalRecords = totalResult.length ? totalResult[0].totalRecords : 0;
 
-		// Extract unique colors, sizes, and categories
+		// Additional pipelines for color, size, category, gender
 		const colorPipeline = [
 			{ $match: { activeProduct: true } },
 			{ $unwind: "$productAttributes" },
@@ -1027,7 +1069,7 @@ exports.filteredProducts = async (req, res, next) => {
 			Product.aggregate(genderPipeline),
 		]);
 
-		// Calculate the min and max prices
+		// Price range
 		const pricePipeline = [
 			{ $match: { activeProduct: true } },
 			{
@@ -1052,10 +1094,13 @@ exports.filteredProducts = async (req, res, next) => {
 
 		const [priceRange] = await Product.aggregate(pricePipeline);
 
-		// Ensure to clear the uniqueProductsMap for every new request
+		// ======================
+		// Process final results
+		// ======================
 		let uniqueProductsMap = {};
 		let finalProducts = [];
 
+		// 1) Filter attributes by color/size if provided
 		const processedProducts = products
 			.map((product) => {
 				if (
@@ -1066,7 +1111,7 @@ exports.filteredProducts = async (req, res, next) => {
 					// Store all attributes
 					const overallProductAttributes = [...product.productAttributes];
 
-					// Filter product attributes by color and size if provided
+					// Filter by color & size
 					const filteredAttributes = product.productAttributes.filter(
 						(attr) => {
 							let matchesColor = true;
@@ -1075,49 +1120,45 @@ exports.filteredProducts = async (req, res, next) => {
 							if (color) {
 								matchesColor = attr.color === color;
 							}
-
 							if (size) {
 								matchesSize = attr.size === size;
 							}
-
 							return matchesColor && matchesSize;
 						}
 					);
 
 					if (filteredAttributes.length > 0) {
-						// Only add product with matching attributes
 						const newProduct = {
 							...product,
 							productAttributes: filteredAttributes,
-							overallProductAttributes, // Add overall attributes to the product object
+							overallProductAttributes,
 						};
 						finalProducts.push(newProduct);
 					}
 				} else if (product) {
-					// Return simple products as is
+					// No attributes => push as is
 					finalProducts.push(product);
 				}
 			})
 			.flat();
 
+		// 2) Deduplicate logic
 		processedProducts.forEach((product) => {
 			if (product) {
 				if (product.addVariables) {
-					// For products with variables, consider the attribute logic
-					const overallProductAttributes = [...product.productAttributes]; // Store all attributes
+					const overallProductAttributes = [...product.productAttributes];
 					product.productAttributes.forEach((attr) => {
 						const key = `${product._id}-${attr.color}-${attr.size}`;
 						if (!uniqueProductsMap[key]) {
 							uniqueProductsMap[key] = {
 								...product,
 								productAttributes: [attr],
-								overallProductAttributes, // Add overall attributes to the product object
+								overallProductAttributes,
 							};
 							finalProducts.push(uniqueProductsMap[key]);
 						}
 					});
 				} else {
-					// For products without variables, ensure unique IDs
 					if (!uniqueProductsMap[product._id]) {
 						uniqueProductsMap[product._id] = product;
 						finalProducts.push(product);
@@ -1126,8 +1167,81 @@ exports.filteredProducts = async (req, res, next) => {
 			}
 		});
 
-		console.log(finalProducts.length, "finalProducts.length");
+		// ===============================
+		// Custom Sorting w/ In-Stock First
+		// ===============================
+		//
+		// 1) Pinned IDs => rank 0 or 1
+		// 2) Other with printifyProductDetails => rank=3 (bottom)
+		// 3) Everything else => rank=2 (middle)
+		//    but for rank=2:
+		//      subRank=0 if totalQuantity>0 else subRank=1 (in-stock first)
+		//    then sort by updatedAt desc
+		//
+		// const pinnedIds = ["679dfc3ea7d26767d37667a6", "679dfc34a7d26767d376678b"];
+		const pinnedIds = [];
 
+		// Helper to compute total quantity for each product
+		function getTotalQuantity(prod) {
+			// If product has overallProductAttributes or productAttributes
+			// sum them, else use product.quantity
+			let attrSum = 0;
+			if (prod.productAttributes && Array.isArray(prod.productAttributes)) {
+				attrSum = prod.productAttributes.reduce((acc, a) => {
+					return acc + (Number(a.quantity) || 0);
+				}, 0);
+			}
+			// If there's a top-level product.quantity, add it
+			const topLevelQty = Number(prod.quantity) || 0;
+			return topLevelQty + attrSum;
+		}
+
+		finalProducts.forEach((prod) => {
+			const strId = String(prod._id);
+			const totalQty = getTotalQuantity(prod);
+
+			if (pinnedIds.includes(strId)) {
+				// pinned => top
+				// rank is indexOf => 0 or 1
+				prod.sortRank = pinnedIds.indexOf(strId);
+				prod.sortMark = "pinnedProduct";
+				// pinned gets subRank=0 by default
+				prod.subRank = 0;
+			} else if (prod.printifyProductDetails) {
+				// bottom
+				prod.sortRank = 3;
+				prod.sortMark = "otherPrintify";
+				prod.subRank = 0; // doesn't matter for rank=3
+			} else {
+				// normal => rank=2
+				prod.sortRank = 2;
+				prod.sortMark = "normalProduct";
+
+				// subRank=0 if in-stock, else=1
+				prod.subRank = totalQty > 0 ? 0 : 1;
+			}
+		});
+
+		// Now final sort
+		finalProducts.sort((a, b) => {
+			// 1. sort by rank ascending
+			if (a.sortRank !== b.sortRank) {
+				return a.sortRank - b.sortRank;
+			}
+			// 2. within same rank, sort by subRank ascending
+			if (a.subRank !== b.subRank) {
+				return a.subRank - b.subRank;
+			}
+			// 3. tie-break => updatedAt descending
+			return new Date(b.updatedAt) - new Date(a.updatedAt);
+		});
+
+		console.log(
+			finalProducts.length,
+			"finalProducts.length after custom sorting"
+		);
+
+		// Return final response
 		res.json({
 			products: finalProducts,
 			totalRecords,
@@ -1138,7 +1252,7 @@ exports.filteredProducts = async (req, res, next) => {
 			priceRange: priceRange || { minPrice: 0, maxPrice: 0 },
 		});
 	} catch (err) {
-		console.error(err); // Log the error to see what it is
+		console.error(err);
 		res.status(500).json({ error: err.message });
 	}
 };

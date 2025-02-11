@@ -47,7 +47,7 @@ router.get(
 
 //Get Specific Set of products
 router.get(
-	"/specific/products/:featured/:newArrivals/:sortByRate/:offers/:records",
+	"/specific/products/:featured/:newArrivals/:customDesigns/:sortByRate/:offers/:records",
 	gettingSpecificSetOfProducts
 );
 
