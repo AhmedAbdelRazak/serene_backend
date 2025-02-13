@@ -38,14 +38,14 @@ function escapeXml(unsafe) {
 	});
 }
 
-// Function to capitalize product titles
+// Capitalize product titles
 function capitalizeWords(string) {
 	return string
 		.toLowerCase()
 		.replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
 }
 
-// Function to ensure valid dimensions and weight
+// Ensure valid numeric dimension
 function validateDimension(value, defaultValue) {
 	const numericValue = parseFloat(value);
 	return !isNaN(numericValue) && numericValue > 0
@@ -53,20 +53,20 @@ function validateDimension(value, defaultValue) {
 		: defaultValue;
 }
 
-// Default values for dimensions and weight
-const DEFAULT_WEIGHT = "1.00"; // Default to 1 kg if not provided
-const DEFAULT_LENGTH = "10.00"; // Default to 10 cm if not provided
-const DEFAULT_WIDTH = "10.00"; // Default to 10 cm if not provided
-const DEFAULT_HEIGHT = "10.00"; // Default to 10 cm if not provided
+// Default dimension/weight placeholders
+const DEFAULT_WEIGHT = "1.00"; // in kg
+const DEFAULT_LENGTH = "10.00"; // in cm
+const DEFAULT_WIDTH = "10.00"; // in cm
+const DEFAULT_HEIGHT = "10.00"; // in cm
 
-// Function to extract the first valid numeric value from strings
+// Extract first numeric value from a string
 function extractFirstNumber(value) {
 	if (!value) return "Not available";
 	const match = value.match(/(\d+(\.\d+)?)/);
 	return match ? parseFloat(match[0]) : "Not available";
 }
 
-// Generate *fallback* image links for non-POD or single-product usage
+// Generate fallback images
 function generateImageLinks(product) {
 	let images = [];
 
@@ -89,6 +89,7 @@ function generateImageLinks(product) {
 	const validImages = images.filter((img) =>
 		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(img)
 	);
+
 	// Provide a default if no valid images
 	if (validImages.length === 0) {
 		validImages.push(
@@ -113,23 +114,23 @@ function convertInchesToCm(inches) {
 		: "Not available";
 }
 
-// For non-POD color resolution (optional usage)
+// Resolve color name from DB
 async function resolveColorName(hexCode) {
 	if (!hexCode) return "Unspecified";
 	const color = await Colors.findOne({ hexa: hexCode.toLowerCase() });
 	return color ? color.color : "Unspecified";
 }
 
-// Generate product link (conditional for POD)
+// Generate product link
 function getProductLink(product) {
-	// If the product is POD (Printify) => link to /custom-gifts/<_id>
+	// If the product is POD (Printify)
 	if (
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
 	) {
 		return `https://serenejannat.com/custom-gifts/${product._id}`;
 	}
-	// Otherwise => old link
+	// Otherwise => normal link
 	return `https://serenejannat.com/single-product/${escapeXml(
 		product.slug
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
@@ -140,23 +141,25 @@ function parseSizeColorFromVariantTitle(title) {
 	if (!title || typeof title !== "string") {
 		return { variantSize: "Unspecified", variantColor: "Unspecified" };
 	}
-	// Usually it looks like "M / White", "L / Island Reef", etc.
+	// Usually looks like "M / White", "L / Black", etc.
 	const parts = title.split(" / ");
 	const size = parts[0] ? parts[0].trim() : "Unspecified";
 	const color = parts[1] ? parts[1].trim() : "Unspecified";
 	return { variantSize: size, variantColor: color };
 }
 
-// Get final price from discount first, or fallback
+// This is the core fix for your Printify prices:
+//   - If the price is an integer >= 100, treat it like cents and divide by 100
+//   - Otherwise leave it as-is
 function getFinalVariantPrice(variant) {
 	let rawPrice = variant.priceAfterDiscount ?? variant.price;
 	if (!rawPrice) return "0.00";
 
 	let floatVal = parseFloat(rawPrice);
 
-	// If you store price in cents, and e.g. 2596 means $25.96
-	if (floatVal >= 1000) {
-		floatVal = floatVal / 100;
+	// If it's an integer >= 100, interpret it as cents (e.g. 805 => 8.05)
+	if (Number.isInteger(floatVal) && floatVal >= 100) {
+		floatVal /= 100;
 	}
 
 	return floatVal.toFixed(2);
@@ -174,16 +177,16 @@ router.get("/generate-feeds", async (req, res) => {
 	let googleItems = [];
 	let facebookItems = [];
 
-	// Fetch active products from MongoDB
+	// Fetch active products
 	const products = await Product.find({ activeProduct: true }).populate(
 		"category"
 	);
 
 	for (let product of products) {
+		// Make sure product category is active
 		if (product.category && product.category.categoryStatus) {
 			const condition = "new";
 			const brand = "Serene Jannat";
-
 			const defaultGender = validateGender(product.gender || "unisex");
 
 			// Fallback images if no matched variant images
@@ -193,43 +196,39 @@ router.get("/generate-feeds", async (req, res) => {
 					? fallbackImages[0]
 					: "https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg";
 
+			// Map to google product category if possible
 			const googleProductCategory = escapeXml(
 				categoryMapping[product.category.categoryName.toLowerCase()] ||
 					"Home & Garden"
 			);
 
-			// Custom labels: categoryLabel & a "general" label
+			// Some custom labels
 			const categoryLabel = product.category.categoryName
 				? product.category.categoryName.toLowerCase().replace(/\s+/g, "_")
 				: "general";
 			const generalLabel = "general_campaign";
 
-			// ============================
-			// === 1) POD PRODUCT LOGIC ===
-			// ============================
+			// ===========================
+			// CASE 1: POD PRINTIFY LOGIC
+			// ===========================
 			if (product.printifyProductDetails?.POD) {
 				const itemGroupId = escapeXml(product._id.toString());
-				// Grab variants if any
 				const variants = product.printifyProductDetails.variants || [];
 
 				if (Array.isArray(variants) && variants.length > 0) {
+					// Build an <item> per variant
 					for (let [index, variant] of variants.entries()) {
 						const { variantSize, variantColor } =
 							parseSizeColorFromVariantTitle(variant.title);
 						const variantPrice = getFinalVariantPrice(variant);
+						const variantAvailability = "in stock"; // or real stock if you have it
 
-						// Real stock logic if needed, else "in stock"
-						const variantAvailability = "in stock";
-
-						// ============================================
-						// HERE: MATCH CLOUDINARY IMAGES BY variant.sku
-						// ============================================
+						// Attempt to match a Cloudinary image by variant.sku
 						let variantImage = fallbackImageLink;
 						if (
 							product.productAttributes &&
 							product.productAttributes.length > 0
 						) {
-							// Find the attribute that has a SubSKU matching the variant's sku
 							const matchedAttr = product.productAttributes.find(
 								(attr) => attr.SubSKU === variant.sku
 							);
@@ -238,14 +237,11 @@ router.get("/generate-feeds", async (req, res) => {
 								matchedAttr.productImages &&
 								matchedAttr.productImages.length > 0
 							) {
-								// Use the first Cloudinary image from that attribute
 								variantImage = matchedAttr.productImages[0].url;
 							}
 						}
 
 						const finalLink = getProductLink(product);
-
-						// Add "Custom Design" to the title for POD
 						const podTitle = `${capitalizeWords(
 							product.productName
 						)} (Custom Design, ${variantSize}, ${variantColor})`;
@@ -286,12 +282,19 @@ router.get("/generate-feeds", async (req, res) => {
 					}
 				} else {
 					// POD but no variants => fallback to single item
-					const fallbackPrice = parseFloat(
-						product.priceAfterDiscount || product.price || 0
-					).toFixed(2);
 					const finalLink = getProductLink(product);
 
-					// Title with "Custom Design"
+					// Same "cents" fix for single/parent price
+					const rawFallbackPrice = parseFloat(
+						product.priceAfterDiscount || product.price || 0
+					);
+					let fallbackPrice = rawFallbackPrice;
+
+					// If it's an integer >= 100, treat as cents
+					if (Number.isInteger(fallbackPrice) && fallbackPrice >= 100) {
+						fallbackPrice = fallbackPrice / 100;
+					}
+
 					const podFallbackTitle = `${capitalizeWords(
 						product.productName
 					)} (Custom Design)`;
@@ -308,7 +311,7 @@ router.get("/generate-feeds", async (req, res) => {
               <g:availability>${
 								product.quantity > 0 ? "in stock" : "out of stock"
 							}</g:availability>
-              <g:price>${fallbackPrice} USD</g:price>
+              <g:price>${fallbackPrice.toFixed(2)} USD</g:price>
               <g:brand>${escapeXml(brand)}</g:brand>
               <g:condition>${escapeXml(condition)}</g:condition>
               <g:google_product_category>${googleProductCategory}</g:google_product_category>
@@ -333,7 +336,7 @@ router.get("/generate-feeds", async (req, res) => {
 				}
 
 				// ============================
-				// === 2) NON-POD PRODUCT  ===
+				// CASE 2: NON-POD PRODUCT
 				// ============================
 			} else {
 				const hasVariants =
@@ -349,11 +352,13 @@ router.get("/generate-feeds", async (req, res) => {
 						const variantHexColor = variant.color || "";
 						const variantColor = await resolveColorName(variantHexColor);
 
+						// If you have discount, use it, else normal price
 						const variantPrice =
 							variant.priceAfterDiscount || variant.price || product.price;
 						const variantAvailability =
 							variant.quantity > 0 ? "in stock" : "out of stock";
 
+						// Dimensions
 						const variantWeight = validateDimension(
 							variant.weight || product.geodata?.weight,
 							DEFAULT_WEIGHT
@@ -372,8 +377,6 @@ router.get("/generate-feeds", async (req, res) => {
 						);
 
 						const finalLink = getProductLink(product);
-
-						// Original title pattern + size/color
 						const variantTitle = `${capitalizeWords(
 							product.productName
 						)} (${variantSize}, ${variantColor})`;
@@ -416,7 +419,7 @@ router.get("/generate-feeds", async (req, res) => {
 						facebookItems.push(variantItem);
 					}
 				} else {
-					// No variants => single product
+					// Single product
 					const weight = convertLbsToKg(product.geodata?.weight || 0);
 					const length = convertInchesToCm(product.geodata?.length || 0);
 					const width = convertInchesToCm(product.geodata?.width || 0);
