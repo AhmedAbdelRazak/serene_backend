@@ -121,47 +121,61 @@ async function resolveColorName(hexCode) {
 	return color ? color.color : "Unspecified";
 }
 
-// Generate product link
-function getProductLink(product) {
+// ======================================================================
+// 1) getProductLink => Accept (product, color, size) so we do ?color=&size=
+// ======================================================================
+function getProductLink(product, color, size) {
 	// If the product is POD (Printify)
 	if (
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
 	) {
-		return `https://serenejannat.com/custom-gifts/${product._id}`;
+		let url = `https://serenejannat.com/custom-gifts/${product._id}`;
+
+		// Only append ?color= & ?size= if they exist
+		const queryParams = [];
+		if (color && color !== "Unspecified") {
+			queryParams.push(`color=${encodeURIComponent(color)}`);
+		}
+		if (size && size !== "Unspecified") {
+			queryParams.push(`size=${encodeURIComponent(size)}`);
+		}
+		if (queryParams.length > 0) {
+			url += `?${queryParams.join("&")}`;
+		}
+
+		return url;
 	}
+
 	// Otherwise => normal link
 	return `https://serenejannat.com/single-product/${escapeXml(
 		product.slug
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
 }
 
-// Safely parse the variant title to separate size and color
+// Safely parse the variant title to separate COLOR and SIZE
 function parseSizeColorFromVariantTitle(title) {
 	if (!title || typeof title !== "string") {
-		return { variantSize: "Unspecified", variantColor: "Unspecified" };
+		return { variantColor: "Unspecified", variantSize: "Unspecified" };
 	}
-	// Usually looks like "M / White", "L / Black", etc.
+	// e.g. "Light Blue / 2XL" => color="Light Blue", size="2XL"
 	const parts = title.split(" / ");
-	const size = parts[0] ? parts[0].trim() : "Unspecified";
-	const color = parts[1] ? parts[1].trim() : "Unspecified";
-	return { variantSize: size, variantColor: color };
+	const variantColor = parts[0] ? parts[0].trim() : "Unspecified";
+	const variantSize = parts[1] ? parts[1].trim() : "Unspecified";
+
+	return { variantColor, variantSize };
 }
 
-// This is the core fix for your Printify prices:
-//   - If the price is an integer >= 100, treat it like cents and divide by 100
-//   - Otherwise leave it as-is
+// If the price is an integer >= 100, treat it as cents and divide by 100
 function getFinalVariantPrice(variant) {
 	let rawPrice = variant.priceAfterDiscount ?? variant.price;
 	if (!rawPrice) return "0.00";
 
 	let floatVal = parseFloat(rawPrice);
-
 	// If it's an integer >= 100, interpret it as cents (e.g. 805 => 8.05)
 	if (Number.isInteger(floatVal) && floatVal >= 100) {
 		floatVal /= 100;
 	}
-
 	return floatVal.toFixed(2);
 }
 
@@ -218,10 +232,10 @@ router.get("/generate-feeds", async (req, res) => {
 				if (Array.isArray(variants) && variants.length > 0) {
 					// Build an <item> per variant
 					for (let [index, variant] of variants.entries()) {
-						const { variantSize, variantColor } =
+						const { variantColor, variantSize } =
 							parseSizeColorFromVariantTitle(variant.title);
 						const variantPrice = getFinalVariantPrice(variant);
-						const variantAvailability = "in stock"; // or real stock if you have it
+						const variantAvailability = "in stock"; // or real stock if needed
 
 						// Attempt to match a Cloudinary image by variant.sku
 						let variantImage = fallbackImageLink;
@@ -241,11 +255,18 @@ router.get("/generate-feeds", async (req, res) => {
 							}
 						}
 
-						const finalLink = getProductLink(product);
+						// 2) Build link with color first, size second
+						const finalLink = getProductLink(
+							product,
+							variantColor,
+							variantSize
+						);
+
 						const podTitle = `${capitalizeWords(
 							product.productName
 						)} (Custom Design, ${variantSize}, ${variantColor})`;
 
+						// NOTE: Escaping finalLink with escapeXml(...)
 						const variantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
@@ -253,7 +274,7 @@ router.get("/generate-feeds", async (req, res) => {
                 <g:description><![CDATA[${escapeXml(
 									product.description.replace(/<[^>]+>/g, "")
 								)}]]></g:description>
-                <g:link>${finalLink}</g:link>
+                <g:link>${escapeXml(finalLink)}</g:link>
                 <g:image_link>${escapeXml(variantImage)}</g:image_link>
                 <g:availability>${variantAvailability}</g:availability>
                 <g:price>${variantPrice} USD</g:price>
@@ -284,12 +305,11 @@ router.get("/generate-feeds", async (req, res) => {
 					// POD but no variants => fallback to single item
 					const finalLink = getProductLink(product);
 
-					// Same "cents" fix for single/parent price
+					// handle single/parent price
 					const rawFallbackPrice = parseFloat(
 						product.priceAfterDiscount || product.price || 0
 					);
 					let fallbackPrice = rawFallbackPrice;
-
 					// If it's an integer >= 100, treat as cents
 					if (Number.isInteger(fallbackPrice) && fallbackPrice >= 100) {
 						fallbackPrice = fallbackPrice / 100;
@@ -306,7 +326,7 @@ router.get("/generate-feeds", async (req, res) => {
               <g:description><![CDATA[${escapeXml(
 								product.description.replace(/<[^>]+>/g, "")
 							)}]]></g:description>
-              <g:link>${finalLink}</g:link>
+              <g:link>${escapeXml(finalLink)}</g:link>
               <g:image_link>${fallbackImageLink}</g:image_link>
               <g:availability>${
 								product.quantity > 0 ? "in stock" : "out of stock"
@@ -352,7 +372,7 @@ router.get("/generate-feeds", async (req, res) => {
 						const variantHexColor = variant.color || "";
 						const variantColor = await resolveColorName(variantHexColor);
 
-						// If you have discount, use it, else normal price
+						// If you have discount, use it; else normal price
 						const variantPrice =
 							variant.priceAfterDiscount || variant.price || product.price;
 						const variantAvailability =
@@ -376,6 +396,7 @@ router.get("/generate-feeds", async (req, res) => {
 							DEFAULT_HEIGHT
 						);
 
+						// No ?color= or ?size= for non-POD
 						const finalLink = getProductLink(product);
 						const variantTitle = `${capitalizeWords(
 							product.productName
@@ -388,7 +409,7 @@ router.get("/generate-feeds", async (req, res) => {
                 <g:description><![CDATA[${escapeXml(
 									product.description.replace(/<[^>]+>/g, "")
 								)}]]></g:description>
-                <g:link>${finalLink}</g:link>
+                <g:link>${escapeXml(finalLink)}</g:link>
                 <g:image_link>${escapeXml(variantImage)}</g:image_link>
                 <g:availability>${variantAvailability}</g:availability>
                 <g:price>${parseFloat(variantPrice).toFixed(2)} USD</g:price>
@@ -438,7 +459,7 @@ router.get("/generate-feeds", async (req, res) => {
               <g:description><![CDATA[${escapeXml(
 								product.description.replace(/<[^>]+>/g, "")
 							)}]]></g:description>
-              <g:link>${finalLink}</g:link>
+              <g:link>${escapeXml(finalLink)}</g:link>
               <g:image_link>${fallbackImageLink}</g:image_link>
               <g:availability>${
 								product.quantity > 0 ? "in stock" : "out of stock"
