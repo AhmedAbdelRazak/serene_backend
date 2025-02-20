@@ -553,7 +553,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 		};
 
 		//-------------------------------------------------------------------
-		// 5. MASTER SYNC HANDLER FOR A SINGLE VARIANT OR PRODUCT
+		// 5. MASTER SYNC HANDLER (CREATE or PARTIAL UPDATE)
 		//-------------------------------------------------------------------
 		async function handleProductSync(
 			productData,
@@ -568,12 +568,49 @@ exports.syncPrintifyProducts = async (req, res) => {
 				return;
 			}
 
-			// 5A. Create / Update in DB
+			// *** ADDED OR CHANGED ***
+			// Instead of overwriting the entire document, do a partial update.
 			const existingProduct = await Product.findOne({ productSKU: variantSKU });
 			if (existingProduct) {
-				await Product.updateOne({ _id: existingProduct._id }, productData);
+				//------------------------------------------------------
+				// PARTIAL UPDATE: Only update fields that changed
+				//------------------------------------------------------
+				existingProduct.productName = productData.productName;
+				existingProduct.description = productData.description;
+				existingProduct.price = productData.price;
+				existingProduct.priceAfterDiscount = productData.priceAfterDiscount;
+				existingProduct.MSRPPriceBasic = productData.MSRPPriceBasic;
+				existingProduct.quantity = productData.quantity;
+
+				// Slugs, if you want them to reflect the new name
+				existingProduct.slug = productData.slug;
+				existingProduct.slug_Arabic = productData.slug_Arabic;
+
+				existingProduct.category = productData.category;
+				existingProduct.subcategory = productData.subcategory;
+				existingProduct.gender = productData.gender;
+				existingProduct.chosenSeason = productData.chosenSeason;
+				existingProduct.isPrintifyProduct = productData.isPrintifyProduct;
+				existingProduct.addVariables = productData.addVariables;
+
+				// If you want to keep your existing images, DO NOT overwrite:
+				// existingProduct.thumbnailImage = productData.thumbnailImage; // skipping
+				// existingProduct.productAttributes = productData.productAttributes; // skipping
+
+				// Overwrite Printify details if you want them up to date
+				// or you can do partial merges. For simplicity, we just overwrite them:
+				existingProduct.printifyProductDetails =
+					productData.printifyProductDetails;
+
+				// If you need to update "scent" or others:
+				existingProduct.scent = productData.scent || existingProduct.scent;
+
+				await existingProduct.save();
 				console.log(`↺ Updated product: ${productData.productName}`);
 			} else {
+				//------------------------------------------------------
+				// NEW DOCUMENT
+				//------------------------------------------------------
 				const newProduct = new Product({
 					productSKU: variantSKU,
 					...productData,
@@ -582,7 +619,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				console.log(`➕ Added product: ${productData.productName}`);
 			}
 
-			// 5B. Attempt to publish
+			// 5B. Attempt to publish (same as your original)
 			try {
 				await axios.post(
 					`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products/${printifyProduct.id}/publish.json`,
@@ -685,6 +722,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 							failedProducts.push(printifyProduct.title);
 							continue;
 						}
+
 						// Extract scent
 						const scentOpt = printifyProduct.options.find(
 							(o) => o.type === "scent"
@@ -697,14 +735,27 @@ exports.syncPrintifyProducts = async (req, res) => {
 							);
 							scent = foundScentValue?.title || "";
 						}
-						// Upload images for this variant
-						const variantImages = (printifyProduct.images || []).filter((img) =>
-							img.variant_ids.includes(variant.id)
-						);
-						const validUploadedImages = await uploadImageToCloudinaryLimited(
-							variantImages,
-							5
-						);
+
+						// *** ADDED OR CHANGED ***
+						// Check if this variant already exists => skip re-upload
+						const existingVariantDoc = await Product.findOne({
+							productSKU: variant.sku,
+						});
+						let validUploadedImages = [];
+						if (!existingVariantDoc) {
+							// Not found => brand-new SKU => upload images
+							const variantImages = (printifyProduct.images || []).filter(
+								(img) => img.variant_ids.includes(variant.id)
+							);
+							validUploadedImages = await uploadImageToCloudinaryLimited(
+								variantImages,
+								5
+							);
+						} else {
+							// Found => keep the existing images
+							validUploadedImages =
+								existingVariantDoc.thumbnailImage?.[0]?.images || [];
+						}
 
 						const uniqueSlug = `${productSlug}-${variant.sku}`;
 						const uniqueSlugArabic = `${productSlugArabic}-${variant.sku}`;
@@ -722,11 +773,14 @@ exports.syncPrintifyProducts = async (req, res) => {
 							subcategory: matchingSubcategories.map((s) => s._id),
 							gender: "6635ab22898104005c96250a",
 							chosenSeason: "all",
+
+							// We'll store images only if new
 							thumbnailImage: [
 								{
 									images: validUploadedImages,
 								},
 							],
+
 							isPrintifyProduct: true,
 							addVariables: false,
 
@@ -777,10 +831,23 @@ exports.syncPrintifyProducts = async (req, res) => {
 						failedProducts.push(printifyProduct.title);
 						continue;
 					}
-					const validUploadedImages = await uploadImageToCloudinaryLimited(
-						printifyProduct.images || [],
-						5
-					);
+
+					// *** ADDED OR CHANGED ***
+					// Check if the single-variant candle already exists
+					let validUploadedImages = [];
+					const existingDoc = await Product.findOne({
+						productSKU: firstVar.sku,
+					});
+					if (!existingDoc) {
+						// Not found => brand-new => upload
+						validUploadedImages = await uploadImageToCloudinaryLimited(
+							printifyProduct.images || [],
+							5
+						);
+					} else {
+						// Found => reuse images
+						validUploadedImages = existingDoc.thumbnailImage?.[0]?.images || [];
+					}
 
 					const productData = {
 						productName: printifyProduct.title,
@@ -880,27 +947,39 @@ exports.syncPrintifyProducts = async (req, res) => {
 				});
 			}
 
-			// Upload up to 5 images for thumbnail
-			const relevantImagesForProduct = (printifyProduct.images || []).filter(
-				(img) => {
-					return img.variant_ids.some((vId) =>
-						enabledVariants.some((ev) => ev.id === vId)
-					);
-				}
-			);
-			const validUploadedImages = await uploadImageToCloudinaryLimited(
-				relevantImagesForProduct,
-				5
-			);
-
-			// Simple vs Multi-variant
 			const hasSingleVariant =
 				enabledVariants.length === 1 &&
 				!colorOption &&
 				!sizeOption &&
 				!scentOption;
 
+			// *** ADDED OR CHANGED ***
+			// For the top-level "thumbnailImage", we only want to upload if the product does not exist
 			const firstVariantSKU = enabledVariants[0].sku || "NOSKU";
+			const existingTopLevel = await Product.findOne({
+				productSKU: firstVariantSKU,
+			});
+			let validUploadedImages = [];
+
+			if (!existingTopLevel) {
+				// brand new => upload up to 5 images as "thumbnail"
+				const relevantImagesForProduct = (printifyProduct.images || []).filter(
+					(img) => {
+						return img.variant_ids.some((vId) =>
+							enabledVariants.some((ev) => ev.id === vId)
+						);
+					}
+				);
+				validUploadedImages = await uploadImageToCloudinaryLimited(
+					relevantImagesForProduct,
+					5
+				);
+			} else {
+				// existing => keep what's in DB
+				validUploadedImages =
+					existingTopLevel.thumbnailImage?.[0]?.images || [];
+			}
+
 			const productData = {
 				productName: printifyProduct.title,
 				description: printifyProduct.description || "",
@@ -987,18 +1066,36 @@ exports.syncPrintifyProducts = async (req, res) => {
 					if (sizeVal) pkParts.push(sizeVal);
 					if (colorVal) pkParts.push(colorVal);
 					if (scentVal) pkParts.push(scentVal);
-
-					// If nothing in pkParts => use variant.sku
 					const PK = pkParts.filter(Boolean).join("#") || variant.sku;
 
-					// Upload up to 5 images for this variant
-					const vImages = (printifyProduct.images || []).filter((img) =>
-						img.variant_ids.includes(variant.id)
-					);
-					const variantUploadedImages = await uploadImageToCloudinaryLimited(
-						vImages,
-						5
-					);
+					// *** ADDED OR CHANGED ***
+					// Check if this subSKU already exists
+					let variantUploadedImages = [];
+					const existingVariantDoc = await Product.findOne({
+						productSKU: variant.sku,
+					});
+					if (!existingVariantDoc) {
+						// Not found => new variant => upload images
+						const vImages = (printifyProduct.images || []).filter((img) =>
+							img.variant_ids.includes(variant.id)
+						);
+						variantUploadedImages = await uploadImageToCloudinaryLimited(
+							vImages,
+							5
+						);
+					} else {
+						// Found => keep existing images
+						// For multi-variant products, images typically live in productAttributes
+						// but the simplest approach is just to keep the first one found
+						const matchingAttr =
+							existingVariantDoc.productAttributes?.find(
+								(a) => a.SubSKU === variant.sku
+							) || {};
+						variantUploadedImages =
+							matchingAttr.productImages ||
+							existingVariantDoc.thumbnailImage?.[0]?.images ||
+							[];
+					}
 
 					return {
 						PK,
