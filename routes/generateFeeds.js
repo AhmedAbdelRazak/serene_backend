@@ -10,6 +10,7 @@ const Colors = require("../models/colors");
 
 // --------------------------
 // 1) Google Category Mapping
+//    (If you do want to keep these for certain categories, fine.)
 // --------------------------
 const categoryMapping = {
 	vases: "Home & Garden > Decor > Vases",
@@ -21,10 +22,48 @@ const categoryMapping = {
 	seasonal: "Home & Garden > Decor > Seasonal & Holiday Decorations",
 	votives: "Home & Garden > Decor > Home Fragrances > Candles",
 
-	// If you have a category named "custom_design" in your DB,
-	// map it to whichever Google category you prefer:
-	custom_design: "Apparel & Accessories > Clothing > Customizable",
+	// If you have a category named "custom design" in your DB,
+	// previously we mapped it here, but let's keep it as fallback logic.
+	// "custom design": "Apparel & Accessories",
 };
+
+// --------------------------
+// 2) Keyword-based fallback
+//    if categoryMapping doesn't supply a match
+// --------------------------
+function computeGoogleCategory(product) {
+	// 1) First see if product.category is in our categoryMapping:
+	const catName = product.category?.categoryName?.toLowerCase() || "";
+	if (categoryMapping[catName]) {
+		return categoryMapping[catName];
+	}
+
+	// 2) If not, let's see if productName has keywords.
+	const name = (product.productName || "").toLowerCase();
+
+	if (name.includes("mug")) {
+		return "Home & Garden > Kitchen & Dining > Tableware > Drinkware > Mugs";
+	}
+	if (
+		name.includes("unisex") ||
+		name.includes("t-shirt") ||
+		name.includes("t shirt") ||
+		name.includes("shirt") ||
+		name.includes("short") ||
+		name.includes("hoodie")
+	) {
+		return "Apparel & Accessories > Clothing";
+	}
+	if (name.includes("bag") || name.includes("tote")) {
+		return "Apparel & Accessories > Handbags, Wallets & Cases";
+	}
+	if (name.includes("phone")) {
+		return "Electronics > Communications > Telephony > Mobile Phones";
+	}
+
+	// 3) Otherwise, default:
+	return "Apparel & Accessories";
+}
 
 // Function to escape XML special characters
 function escapeXml(unsafe) {
@@ -72,10 +111,7 @@ function extractFirstNumber(value) {
 	return match ? parseFloat(match[0]) : "Not available";
 }
 
-// ----------------------------
-// 2) Generate *all* variant or fallback images (limit to 5 total in old code).
-//    We'll keep it but we'll also handle "top 3" in the actual feed output.
-// ----------------------------
+// Generate up to 5 images. We'll only display 3 in the feed.
 function generateImageLinks(product) {
 	let images = [];
 
@@ -94,28 +130,21 @@ function generateImageLinks(product) {
 		);
 	}
 
-	// Filter for valid formats
 	const validImages = images.filter((img) =>
 		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(img)
 	);
-
-	// Provide a default if none
 	if (validImages.length === 0) {
 		validImages.push(
 			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
 		);
 	}
-
-	// Limit to max of 5 in the old logic
 	return validImages.slice(0, 5);
 }
 
-// Convert LBS → KG
 function convertLbsToKg(lbs) {
 	return lbs > 0 ? (lbs * 0.453592).toFixed(2) : "Not available";
 }
 
-// Convert inches → cm
 function convertInchesToCm(inches) {
 	const numericValue = extractFirstNumber(inches);
 	return numericValue !== "Not available"
@@ -123,16 +152,14 @@ function convertInchesToCm(inches) {
 		: "Not available";
 }
 
-// Attempt to get color name from DB
 async function resolveColorName(hexCode) {
 	if (!hexCode) return "Unspecified";
 	const color = await Colors.findOne({ hexa: hexCode.toLowerCase() });
 	return color ? color.color : "Unspecified";
 }
 
-// Build the product link
 function getProductLink(product, color, size) {
-	// If the product is POD => custom link
+	// If product is POD => /custom-gifts/:id?color=xx&size=yy
 	if (
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
@@ -150,8 +177,7 @@ function getProductLink(product, color, size) {
 		}
 		return url;
 	}
-
-	// Otherwise => normal link
+	// else normal link
 	return `https://serenejannat.com/single-product/${escapeXml(
 		product.slug
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
@@ -167,7 +193,7 @@ function parseSizeColorFromVariantTitle(title) {
 	return { variantColor, variantSize };
 }
 
-// If price is an int >=100 => treat as cents
+// If price is >=100 and integer => treat as cents
 function getFinalVariantPrice(variant) {
 	let rawPrice = variant.priceAfterDiscount ?? variant.price;
 	if (!rawPrice) return "0.00";
@@ -185,15 +211,14 @@ function validateGender(gender) {
 	return validGenders.includes(g) ? g : "unisex";
 }
 
-// ------------------------------
-// HELPER to transform an array of up to 3 images into
-// <g:image_link> (first) + <g:additional_image_link> (the rest).
-// ------------------------------
+/**
+ * Convert an array of images to
+ * - <g:image_link> the first
+ * - <g:additional_image_link> for up to 2 more
+ */
 function buildImageTags(imageArray) {
-	// limit to 3 total
 	const upTo3 = imageArray.slice(0, 3);
 	if (!upTo3.length) {
-		// fallback if empty
 		upTo3.push(
 			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
 		);
@@ -222,37 +247,34 @@ router.get("/generate-feeds", async (req, res) => {
 	);
 
 	for (let product of products) {
-		// Ensure product's category is active
+		// Only if product has an active category
 		if (product.category && product.category.categoryStatus) {
 			const condition = "new";
 			const brand = "Serene Jannat";
 			const defaultGender = validateGender(product.gender || "unisex");
 
-			// Google Category
-			const googleProductCategory = escapeXml(
-				categoryMapping[product.category.categoryName?.toLowerCase()] ||
-					"Home & Garden"
-			);
+			// The new function decides final category:
+			const googleProductCategory = escapeXml(computeGoogleCategory(product));
 
-			// Some custom labels
+			// Custom labels
 			const categoryLabel = product.category.categoryName
 				? product.category.categoryName.toLowerCase().replace(/\s+/g, "_")
 				: "general";
 			const generalLabel = "general_campaign";
 
-			// Because it's repeated, let's store a shorted description
+			// Short description
 			const cleanedDesc = escapeXml(
 				product.description.replace(/<[^>]+>/g, "")
 			);
 
-			// -----------------------------
-			// POD PRINTIFY Products (POD= true)
-			// -----------------------------
+			// -----------------------------------
+			// 1) Printify POD => multi or single variant
+			// -----------------------------------
 			if (product.printifyProductDetails?.POD) {
 				const itemGroupId = escapeXml(product._id.toString());
 				const variants = product.printifyProductDetails.variants || [];
 
-				if (Array.isArray(variants) && variants.length > 0) {
+				if (variants.length > 0) {
 					// multi-variant
 					for (let [index, variant] of variants.entries()) {
 						const { variantColor, variantSize } =
@@ -260,7 +282,7 @@ router.get("/generate-feeds", async (req, res) => {
 						const variantPrice = getFinalVariantPrice(variant);
 						const variantAvailability = "in stock";
 
-						// Gather up to 3 images for THIS variant, fallback to the product-level ones if none
+						// Images for this variant
 						let variantImages = [];
 						if (
 							product.productAttributes &&
@@ -273,15 +295,12 @@ router.get("/generate-feeds", async (req, res) => {
 								variantImages = matchedAttr.productImages.map((x) => x.url);
 							}
 						}
-						// fallback if variantImages empty => fallback product-level
 						if (!variantImages.length) {
 							variantImages = generateImageLinks(product);
 						}
-
-						// Build the <g:image_link> + <g:additional_image_link> lines
 						const imageLinksXML = buildImageTags(variantImages);
 
-						// Build link with color/size in the query
+						// link with color/size
 						const finalLink = getProductLink(
 							product,
 							variantColor,
@@ -324,7 +343,7 @@ router.get("/generate-feeds", async (req, res) => {
 						facebookItems.push(variantItem);
 					}
 				} else {
-					// Single-variant POD
+					// single variant or no "variants" array
 					const finalLink = getProductLink(product);
 					let rawFallbackPrice = parseFloat(
 						product.priceAfterDiscount || product.price || 0
@@ -373,9 +392,9 @@ router.get("/generate-feeds", async (req, res) => {
 					facebookItems.push(podItem);
 				}
 			}
-			// ------------------------------------
-			// NON-POD / Regular products
-			// ------------------------------------
+			// ------------------------------
+			// 2) Non-POD products
+			// ------------------------------
 			else {
 				const hasVariants =
 					product.productAttributes && product.productAttributes.length > 0;
@@ -388,7 +407,6 @@ router.get("/generate-feeds", async (req, res) => {
 							variant.priceAfterDiscount || variant.price || product.price
 						).toFixed(2);
 
-						// Up to 3 images for this variant
 						let variantImages = variant.productImages?.map((x) => x.url) || [];
 						if (!variantImages.length) {
 							variantImages = generateImageLinks(product);
