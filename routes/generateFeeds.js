@@ -8,7 +8,9 @@ require("dotenv").config();
 const Product = require("../models/product");
 const Colors = require("../models/colors");
 
-// Mapping of your categories to Google Product Categories
+// --------------------------
+// 1) Google Category Mapping
+// --------------------------
 const categoryMapping = {
 	vases: "Home & Garden > Decor > Vases",
 	planters: "Home & Garden > Lawn & Garden > Gardening > Pot & Planter Liners",
@@ -18,6 +20,10 @@ const categoryMapping = {
 	"t shirts": "Apparel & Accessories > Clothing > Shirts & Tops",
 	seasonal: "Home & Garden > Decor > Seasonal & Holiday Decorations",
 	votives: "Home & Garden > Decor > Home Fragrances > Candles",
+
+	// If you have a category named "custom_design" in your DB,
+	// map it to whichever Google category you prefer:
+	custom_design: "Apparel & Accessories > Clothing > Customizable",
 };
 
 // Function to escape XML special characters
@@ -34,6 +40,8 @@ function escapeXml(unsafe) {
 				return "&apos;";
 			case '"':
 				return "&quot;";
+			default:
+				return c;
 		}
 	});
 }
@@ -53,24 +61,25 @@ function validateDimension(value, defaultValue) {
 		: defaultValue;
 }
 
-// Default dimension/weight placeholders
-const DEFAULT_WEIGHT = "1.00"; // in kg
-const DEFAULT_LENGTH = "10.00"; // in cm
-const DEFAULT_WIDTH = "10.00"; // in cm
-const DEFAULT_HEIGHT = "10.00"; // in cm
+const DEFAULT_WEIGHT = "1.00"; // kg
+const DEFAULT_LENGTH = "10.00"; // cm
+const DEFAULT_WIDTH = "10.00"; // cm
+const DEFAULT_HEIGHT = "10.00"; // cm
 
-// Extract first numeric value from a string
 function extractFirstNumber(value) {
 	if (!value) return "Not available";
 	const match = value.match(/(\d+(\.\d+)?)/);
 	return match ? parseFloat(match[0]) : "Not available";
 }
 
-// Generate fallback images
+// ----------------------------
+// 2) Generate *all* variant or fallback images (limit to 5 total in old code).
+//    We'll keep it but we'll also handle "top 3" in the actual feed output.
+// ----------------------------
 function generateImageLinks(product) {
 	let images = [];
 
-	// If the product has variant attributes with images
+	// If product has variant attributes w/images
 	if (product.productAttributes && product.productAttributes.length > 0) {
 		product.productAttributes.forEach((attr) => {
 			if (attr.productImages && attr.productImages.length > 0) {
@@ -78,35 +87,35 @@ function generateImageLinks(product) {
 			}
 		});
 	}
-	// If no variant images, fallback to thumbnail
+	// Otherwise fallback to thumbnail images
 	else if (product.thumbnailImage && product.thumbnailImage.length > 0) {
 		images.push(
 			...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
 		);
 	}
 
-	// Filter valid image formats
+	// Filter for valid formats
 	const validImages = images.filter((img) =>
 		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(img)
 	);
 
-	// Provide a default if no valid images
+	// Provide a default if none
 	if (validImages.length === 0) {
 		validImages.push(
 			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
 		);
 	}
 
-	// Limit to max 5
+	// Limit to max of 5 in the old logic
 	return validImages.slice(0, 5);
 }
 
-// Convert LBS to KG
+// Convert LBS → KG
 function convertLbsToKg(lbs) {
 	return lbs > 0 ? (lbs * 0.453592).toFixed(2) : "Not available";
 }
 
-// Convert inches to CM
+// Convert inches → cm
 function convertInchesToCm(inches) {
 	const numericValue = extractFirstNumber(inches);
 	return numericValue !== "Not available"
@@ -114,25 +123,21 @@ function convertInchesToCm(inches) {
 		: "Not available";
 }
 
-// Resolve color name from DB
+// Attempt to get color name from DB
 async function resolveColorName(hexCode) {
 	if (!hexCode) return "Unspecified";
 	const color = await Colors.findOne({ hexa: hexCode.toLowerCase() });
 	return color ? color.color : "Unspecified";
 }
 
-// ======================================================================
-// 1) getProductLink => Accept (product, color, size) so we do ?color=&size=
-// ======================================================================
+// Build the product link
 function getProductLink(product, color, size) {
-	// If the product is POD (Printify)
+	// If the product is POD => custom link
 	if (
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
 	) {
 		let url = `https://serenejannat.com/custom-gifts/${product._id}`;
-
-		// Only append ?color= & ?size= if they exist
 		const queryParams = [];
 		if (color && color !== "Unspecified") {
 			queryParams.push(`color=${encodeURIComponent(color)}`);
@@ -143,7 +148,6 @@ function getProductLink(product, color, size) {
 		if (queryParams.length > 0) {
 			url += `?${queryParams.join("&")}`;
 		}
-
 		return url;
 	}
 
@@ -153,38 +157,59 @@ function getProductLink(product, color, size) {
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
 }
 
-// Safely parse the variant title to separate COLOR and SIZE
 function parseSizeColorFromVariantTitle(title) {
 	if (!title || typeof title !== "string") {
 		return { variantColor: "Unspecified", variantSize: "Unspecified" };
 	}
-	// e.g. "Light Blue / 2XL" => color="Light Blue", size="2XL"
 	const parts = title.split(" / ");
 	const variantColor = parts[0] ? parts[0].trim() : "Unspecified";
 	const variantSize = parts[1] ? parts[1].trim() : "Unspecified";
-
 	return { variantColor, variantSize };
 }
 
-// If the price is an integer >= 100, treat it as cents and divide by 100
+// If price is an int >=100 => treat as cents
 function getFinalVariantPrice(variant) {
 	let rawPrice = variant.priceAfterDiscount ?? variant.price;
 	if (!rawPrice) return "0.00";
-
 	let floatVal = parseFloat(rawPrice);
-	// If it's an integer >= 100, interpret it as cents (e.g. 805 => 8.05)
 	if (Number.isInteger(floatVal) && floatVal >= 100) {
 		floatVal /= 100;
 	}
 	return floatVal.toFixed(2);
 }
 
-// Validate gender
 function validateGender(gender) {
 	const validGenders = ["male", "female", "unisex"];
 	if (!gender || typeof gender !== "string") return "unisex";
 	const g = gender.toLowerCase();
 	return validGenders.includes(g) ? g : "unisex";
+}
+
+// ------------------------------
+// HELPER to transform an array of up to 3 images into
+// <g:image_link> (first) + <g:additional_image_link> (the rest).
+// ------------------------------
+function buildImageTags(imageArray) {
+	// limit to 3 total
+	const upTo3 = imageArray.slice(0, 3);
+	if (!upTo3.length) {
+		// fallback if empty
+		upTo3.push(
+			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
+		);
+	}
+	const main = upTo3[0];
+	const additionals = upTo3.slice(1);
+
+	let xml = `<g:image_link>${escapeXml(main)}</g:image_link>`;
+	if (additionals.length > 0) {
+		additionals.forEach((img) => {
+			xml += `\n<g:additional_image_link>${escapeXml(
+				img
+			)}</g:additional_image_link>`;
+		});
+	}
+	return xml;
 }
 
 router.get("/generate-feeds", async (req, res) => {
@@ -197,22 +222,15 @@ router.get("/generate-feeds", async (req, res) => {
 	);
 
 	for (let product of products) {
-		// Make sure product category is active
+		// Ensure product's category is active
 		if (product.category && product.category.categoryStatus) {
 			const condition = "new";
 			const brand = "Serene Jannat";
 			const defaultGender = validateGender(product.gender || "unisex");
 
-			// Fallback images if no matched variant images
-			const fallbackImages = generateImageLinks(product);
-			const fallbackImageLink =
-				fallbackImages.length > 0
-					? fallbackImages[0]
-					: "https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg";
-
-			// Map to google product category if possible
+			// Google Category
 			const googleProductCategory = escapeXml(
-				categoryMapping[product.category.categoryName.toLowerCase()] ||
+				categoryMapping[product.category.categoryName?.toLowerCase()] ||
 					"Home & Garden"
 			);
 
@@ -222,60 +240,64 @@ router.get("/generate-feeds", async (req, res) => {
 				: "general";
 			const generalLabel = "general_campaign";
 
-			// ===========================
-			// CASE 1: POD PRINTIFY LOGIC
-			// ===========================
+			// Because it's repeated, let's store a shorted description
+			const cleanedDesc = escapeXml(
+				product.description.replace(/<[^>]+>/g, "")
+			);
+
+			// -----------------------------
+			// POD PRINTIFY Products (POD= true)
+			// -----------------------------
 			if (product.printifyProductDetails?.POD) {
 				const itemGroupId = escapeXml(product._id.toString());
 				const variants = product.printifyProductDetails.variants || [];
 
 				if (Array.isArray(variants) && variants.length > 0) {
-					// Build an <item> per variant
+					// multi-variant
 					for (let [index, variant] of variants.entries()) {
 						const { variantColor, variantSize } =
 							parseSizeColorFromVariantTitle(variant.title);
 						const variantPrice = getFinalVariantPrice(variant);
-						const variantAvailability = "in stock"; // or real stock if needed
+						const variantAvailability = "in stock";
 
-						// Attempt to match a Cloudinary image by variant.sku
-						let variantImage = fallbackImageLink;
+						// Gather up to 3 images for THIS variant, fallback to the product-level ones if none
+						let variantImages = [];
 						if (
 							product.productAttributes &&
 							product.productAttributes.length > 0
 						) {
 							const matchedAttr = product.productAttributes.find(
-								(attr) => attr.SubSKU === variant.sku
+								(a) => a.SubSKU === variant.sku
 							);
-							if (
-								matchedAttr &&
-								matchedAttr.productImages &&
-								matchedAttr.productImages.length > 0
-							) {
-								variantImage = matchedAttr.productImages[0].url;
+							if (matchedAttr && matchedAttr.productImages?.length) {
+								variantImages = matchedAttr.productImages.map((x) => x.url);
 							}
 						}
+						// fallback if variantImages empty => fallback product-level
+						if (!variantImages.length) {
+							variantImages = generateImageLinks(product);
+						}
 
-						// 2) Build link with color first, size second
+						// Build the <g:image_link> + <g:additional_image_link> lines
+						const imageLinksXML = buildImageTags(variantImages);
+
+						// Build link with color/size in the query
 						const finalLink = getProductLink(
 							product,
 							variantColor,
 							variantSize
 						);
-
 						const podTitle = `${capitalizeWords(
 							product.productName
 						)} (Custom Design, ${variantSize}, ${variantColor})`;
 
-						// NOTE: Escaping finalLink with escapeXml(...)
 						const variantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
                 <g:title><![CDATA[${podTitle}]]></g:title>
-                <g:description><![CDATA[${escapeXml(
-									product.description.replace(/<[^>]+>/g, "")
-								)}]]></g:description>
+                <g:description><![CDATA[${cleanedDesc}]]></g:description>
                 <g:link>${escapeXml(finalLink)}</g:link>
-                <g:image_link>${escapeXml(variantImage)}</g:image_link>
+                ${imageLinksXML}
                 <g:availability>${variantAvailability}</g:availability>
                 <g:price>${variantPrice} USD</g:price>
                 <g:brand>${escapeXml(brand)}</g:brand>
@@ -302,18 +324,16 @@ router.get("/generate-feeds", async (req, res) => {
 						facebookItems.push(variantItem);
 					}
 				} else {
-					// POD but no variants => fallback to single item
+					// Single-variant POD
 					const finalLink = getProductLink(product);
-
-					// handle single/parent price
-					const rawFallbackPrice = parseFloat(
+					let rawFallbackPrice = parseFloat(
 						product.priceAfterDiscount || product.price || 0
 					);
-					let fallbackPrice = rawFallbackPrice;
-					// If it's an integer >= 100, treat as cents
-					if (Number.isInteger(fallbackPrice) && fallbackPrice >= 100) {
-						fallbackPrice = fallbackPrice / 100;
+					if (Number.isInteger(rawFallbackPrice) && rawFallbackPrice >= 100) {
+						rawFallbackPrice /= 100;
 					}
+					const fallbackImages = generateImageLinks(product);
+					const imageLinksXML = buildImageTags(fallbackImages);
 
 					const podFallbackTitle = `${capitalizeWords(
 						product.productName
@@ -323,15 +343,13 @@ router.get("/generate-feeds", async (req, res) => {
             <item>
               <g:id>${escapeXml(product._id.toString())}</g:id>
               <g:title><![CDATA[${podFallbackTitle}]]></g:title>
-              <g:description><![CDATA[${escapeXml(
-								product.description.replace(/<[^>]+>/g, "")
-							)}]]></g:description>
+              <g:description><![CDATA[${cleanedDesc}]]></g:description>
               <g:link>${escapeXml(finalLink)}</g:link>
-              <g:image_link>${fallbackImageLink}</g:image_link>
+              ${imageLinksXML}
               <g:availability>${
 								product.quantity > 0 ? "in stock" : "out of stock"
 							}</g:availability>
-              <g:price>${fallbackPrice.toFixed(2)} USD</g:price>
+              <g:price>${rawFallbackPrice.toFixed(2)} USD</g:price>
               <g:brand>${escapeXml(brand)}</g:brand>
               <g:condition>${escapeXml(condition)}</g:condition>
               <g:google_product_category>${googleProductCategory}</g:google_product_category>
@@ -354,11 +372,11 @@ router.get("/generate-feeds", async (req, res) => {
 					googleItems.push(podItem);
 					facebookItems.push(podItem);
 				}
-
-				// ============================
-				// CASE 2: NON-POD PRODUCT
-				// ============================
-			} else {
+			}
+			// ------------------------------------
+			// NON-POD / Regular products
+			// ------------------------------------
+			else {
 				const hasVariants =
 					product.productAttributes && product.productAttributes.length > 0;
 
@@ -366,19 +384,23 @@ router.get("/generate-feeds", async (req, res) => {
 					const itemGroupId = escapeXml(product._id.toString());
 
 					for (let [index, variant] of product.productAttributes.entries()) {
-						const variantImage =
-							variant.productImages?.[0]?.url || fallbackImageLink;
+						const variantPrice = parseFloat(
+							variant.priceAfterDiscount || variant.price || product.price
+						).toFixed(2);
+
+						// Up to 3 images for this variant
+						let variantImages = variant.productImages?.map((x) => x.url) || [];
+						if (!variantImages.length) {
+							variantImages = generateImageLinks(product);
+						}
+						const imageLinksXML = buildImageTags(variantImages);
+
 						const variantSize = variant.size || "Unspecified";
 						const variantHexColor = variant.color || "";
 						const variantColor = await resolveColorName(variantHexColor);
-
-						// If you have discount, use it; else normal price
-						const variantPrice =
-							variant.priceAfterDiscount || variant.price || product.price;
 						const variantAvailability =
 							variant.quantity > 0 ? "in stock" : "out of stock";
 
-						// Dimensions
 						const variantWeight = validateDimension(
 							variant.weight || product.geodata?.weight,
 							DEFAULT_WEIGHT
@@ -396,7 +418,6 @@ router.get("/generate-feeds", async (req, res) => {
 							DEFAULT_HEIGHT
 						);
 
-						// No ?color= or ?size= for non-POD
 						const finalLink = getProductLink(product);
 						const variantTitle = `${capitalizeWords(
 							product.productName
@@ -406,13 +427,11 @@ router.get("/generate-feeds", async (req, res) => {
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
                 <g:title><![CDATA[${variantTitle}]]></g:title>
-                <g:description><![CDATA[${escapeXml(
-									product.description.replace(/<[^>]+>/g, "")
-								)}]]></g:description>
+                <g:description><![CDATA[${cleanedDesc}]]></g:description>
                 <g:link>${escapeXml(finalLink)}</g:link>
-                <g:image_link>${escapeXml(variantImage)}</g:image_link>
+                ${imageLinksXML}
                 <g:availability>${variantAvailability}</g:availability>
-                <g:price>${parseFloat(variantPrice).toFixed(2)} USD</g:price>
+                <g:price>${variantPrice} USD</g:price>
                 <g:brand>${escapeXml(brand)}</g:brand>
                 <g:condition>${escapeXml(condition)}</g:condition>
                 <g:google_product_category>${googleProductCategory}</g:google_product_category>
@@ -440,7 +459,7 @@ router.get("/generate-feeds", async (req, res) => {
 						facebookItems.push(variantItem);
 					}
 				} else {
-					// Single product
+					// single product
 					const weight = convertLbsToKg(product.geodata?.weight || 0);
 					const length = convertInchesToCm(product.geodata?.length || 0);
 					const width = convertInchesToCm(product.geodata?.width || 0);
@@ -450,17 +469,18 @@ router.get("/generate-feeds", async (req, res) => {
 					const resolvedColor = await resolveColorName(variantHexColor);
 					const finalLink = getProductLink(product);
 
-					const googleItem = `
+					const fallbackImages = generateImageLinks(product);
+					const imageLinksXML = buildImageTags(fallbackImages);
+
+					const itemXML = `
             <item>
               <g:id>${escapeXml(product._id.toString())}</g:id>
               <g:title><![CDATA[${capitalizeWords(
 								product.productName
 							)}]]></g:title>
-              <g:description><![CDATA[${escapeXml(
-								product.description.replace(/<[^>]+>/g, "")
-							)}]]></g:description>
+              <g:description><![CDATA[${cleanedDesc}]]></g:description>
               <g:link>${escapeXml(finalLink)}</g:link>
-              <g:image_link>${fallbackImageLink}</g:image_link>
+              ${imageLinksXML}
               <g:availability>${
 								product.quantity > 0 ? "in stock" : "out of stock"
 							}</g:availability>
@@ -489,14 +509,16 @@ router.get("/generate-feeds", async (req, res) => {
               <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
             </item>
           `;
-					googleItems.push(googleItem);
-					facebookItems.push(googleItem);
+					googleItems.push(itemXML);
+					facebookItems.push(itemXML);
 				}
 			}
 		}
 	}
 
+	// ----------------------------
 	// Build Google Feed
+	// ----------------------------
 	const googleFeedContent = `
     <rss xmlns:g="http://base.google.com/ns/1.0" version="2.0">
       <channel>
@@ -508,7 +530,9 @@ router.get("/generate-feeds", async (req, res) => {
     </rss>
   `;
 
+	// ----------------------------
 	// Build Facebook Feed
+	// ----------------------------
 	const facebookFeedContent = `
     <rss version="2.0">
       <channel>
@@ -520,7 +544,7 @@ router.get("/generate-feeds", async (req, res) => {
     </rss>
   `;
 
-	// Write the files to your public folder
+	// Write the files
 	const googleWriteStream = createWriteStream(
 		resolve(__dirname, "../../serene_frontend/public/merchant-center-feed.xml"),
 		{ flags: "w" }
@@ -535,7 +559,6 @@ router.get("/generate-feeds", async (req, res) => {
 	facebookWriteStream.write(facebookFeedContent, "utf-8");
 	facebookWriteStream.end();
 
-	// On finish, respond to client
 	googleWriteStream.on("finish", () => {
 		console.log("Google Merchant Center feed generated successfully");
 	});
