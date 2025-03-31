@@ -72,9 +72,18 @@ const userSchema = new mongoose.Schema(
 			type: String,
 			default: "customer",
 		},
+
 		userBranch: {
 			type: String,
 			default: "",
+		},
+
+		profilePhoto: {
+			type: Object,
+			default: {
+				public_id: "",
+				url: "",
+			},
 		},
 	},
 	{ timestamps: true }

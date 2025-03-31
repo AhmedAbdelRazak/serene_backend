@@ -152,6 +152,15 @@ exports.isAdmin = (req, res, next) => {
 	next();
 };
 
+exports.isSeller = (req, res, next) => {
+	if (req.profile.role !== 1 && req.profile.role !== 2000) {
+		return res.status(403).json({
+			error: "Seller resource! access denied",
+		});
+	}
+	next();
+};
+
 exports.isOrderTaker = (req, res, next) => {
 	if (req.profile.role !== 3) {
 		return res.status(403).json({

@@ -76,6 +76,11 @@ const OrderSchema = new mongoose.Schema(
 			type: Boolean,
 			default: false,
 		},
+
+		orderExpenses: {
+			type: Object,
+			default: {},
+		},
 	},
 	{ timestamps: true }
 );

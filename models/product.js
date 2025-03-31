@@ -62,41 +62,6 @@ const productSchema = new mongoose.Schema(
 			default: "",
 			text: true,
 		},
-		policy_Arabic: {
-			type: String,
-			default: "",
-			text: true,
-		},
-		DNA: {
-			type: String,
-			default: "",
-			text: true,
-		},
-		DNA_Arabic: {
-			type: String,
-			default: "",
-			text: true,
-		},
-		Specs: {
-			type: String,
-			default: "",
-			text: true,
-		},
-		Specs_Arabic: {
-			type: String,
-			default: "",
-			text: true,
-		},
-		fitCare: {
-			type: String,
-			default: "",
-			text: true,
-		},
-		fitCare_Arabic: {
-			type: String,
-			default: "",
-			text: true,
-		},
 
 		price: {
 			type: Number,
@@ -227,6 +192,11 @@ const productSchema = new mongoose.Schema(
 			default: "",
 		},
 
+		brandName: {
+			type: String,
+			default: "Serene Jannat",
+		},
+
 		size: {
 			type: String,
 			default: "",
@@ -309,6 +279,7 @@ const productSchema = new mongoose.Schema(
 		},
 
 		likes: [{ type: ObjectId, ref: "User" }],
+		belongsTo: { type: ObjectId, ref: "User" },
 		views: [],
 		viewsCount: {
 			type: Number,
