@@ -1531,6 +1531,7 @@ const calculateOrderTotals = (order) => {
 exports.updateSingleOrder = async (req, res) => {
 	try {
 		const { orderId } = req.params;
+		// Pull out all possible fields from the request body
 		const {
 			order,
 			updateType,
@@ -1538,6 +1539,8 @@ exports.updateSingleOrder = async (req, res) => {
 			trackingNumber,
 			status,
 			customerDetails,
+			orderExpenses, // newly added for internal expenses
+			sendEmail, // newly added to decide whether to send email
 		} = req.body;
 
 		console.log(req.body, "req.body");
@@ -1568,7 +1571,7 @@ exports.updateSingleOrder = async (req, res) => {
 				updateStatusMessage = "Removed product";
 				break;
 
-			case "addUnits":
+			case "addUnits": {
 				const currentProduct =
 					currentOrder.productsNoVariable.find(
 						(p) => p.productId === product.productId
@@ -1582,6 +1585,7 @@ exports.updateSingleOrder = async (req, res) => {
 						currentProduct.ordered_quantity + product.added_quantity;
 				}
 				await updateStockForOrder(currentOrder, "addUnits", product);
+
 				updatedOrder = await Order.findByIdAndUpdate(
 					orderId,
 					{
@@ -1600,6 +1604,7 @@ exports.updateSingleOrder = async (req, res) => {
 				);
 				updateStatusMessage = "Added units to product";
 				break;
+			}
 
 			case "addProduct":
 				await updateStockForOrder(currentOrder, "addProduct", product);
@@ -1652,16 +1657,16 @@ exports.updateSingleOrder = async (req, res) => {
 							},
 							$set: { updateStatus: "Exchanged product" },
 						},
-						{
-							new: true,
-						}
+						{ new: true }
 					);
 				} else {
 					updatedOrder = await Order.findByIdAndUpdate(
 						orderId,
 						{
 							$pull: {
-								productsNoVariable: { productId: product.oldProduct.productId },
+								productsNoVariable: {
+									productId: product.oldProduct.productId,
+								},
 							},
 							$push: {
 								exhchangedProductsNoVariable: {
@@ -1679,9 +1684,7 @@ exports.updateSingleOrder = async (req, res) => {
 							},
 							$set: { updateStatus: "Exchanged product" },
 						},
-						{
-							new: true,
-						}
+						{ new: true }
 					);
 				}
 
@@ -1730,7 +1733,9 @@ exports.updateSingleOrder = async (req, res) => {
 				console.log("Updating tracking number:", trackingNumber);
 				updatedOrder = await Order.findByIdAndUpdate(
 					orderId,
-					{ $set: { trackingNumber, updateStatus: "Updated tracking number" } },
+					{
+						$set: { trackingNumber, updateStatus: "Updated tracking number" },
+					},
 					{ new: true }
 				);
 				if (!updatedOrder) {
@@ -1765,6 +1770,21 @@ exports.updateSingleOrder = async (req, res) => {
 				updateStatusMessage = "Updated customer details";
 				break;
 
+			case "orderExpenses":
+				// For your internal expenses update
+				updatedOrder = await Order.findByIdAndUpdate(
+					orderId,
+					{
+						$set: {
+							orderExpenses,
+							updateStatus: "Updated order expenses",
+						},
+					},
+					{ new: true }
+				);
+				updateStatusMessage = "Updated order expenses";
+				break;
+
 			default:
 				updatedOrder = await Order.findByIdAndUpdate(orderId, order, {
 					new: true,
@@ -1790,107 +1810,118 @@ exports.updateSingleOrder = async (req, res) => {
 		await updatedOrder.save();
 
 		// === Email Notification Logic ===
-		try {
-			const fromEmail = "noreply@serenejannat.com";
-			const adminEmails = [
-				"sally.abdelrazak@serenejannat.com",
-				"ahmed.abdelrazak20@gmail.com",
-				"ahmedandsally14@gmail.com",
-			];
-			const customerEmail = updatedOrder?.customerDetails?.email || "";
+		// Only send the email if:
+		// 1) sendEmail === "yes"
+		// 2) updateType !== "orderExpenses" (since it's internal)
+		if (sendEmail === "yes" && updateType !== "orderExpenses") {
+			try {
+				const fromEmail = "noreply@serenejannat.com";
+				const adminEmails = [
+					"sally.abdelrazak@serenejannat.com",
+					"ahmed.abdelrazak20@gmail.com",
+					"ahmedandsally14@gmail.com",
+				];
+				const customerEmail = updatedOrder?.customerDetails?.email || "";
 
-			// Subject line still includes the general update message:
-			const subjectLine = `Order #${updatedOrder.invoiceNumber} - ${updateStatusMessage}`;
+				// Subject line still includes the general update message:
+				const subjectLine = `Order #${updatedOrder.invoiceNumber} - ${updateStatusMessage}`;
 
-			// Build a small helper string describing what's changed:
-			let detailLine = "";
-			switch (updateType) {
-				case "trackingNumber":
-					detailLine = `Your order tracking number is now <strong>${updatedOrder.trackingNumber}</strong>.`;
-					break;
-				case "status":
-					detailLine = `Your order status is now <strong>${updatedOrder.status}</strong>.`;
-					break;
-				case "cancel":
-					detailLine = `Your order has been <strong>cancelled</strong>.`;
-					break;
-				case "remove":
-					detailLine = `One or more items have been <strong>removed</strong> from your order.`;
-					break;
-				case "addUnits":
-				case "addProduct":
-					detailLine = `New item(s) have been <strong>added</strong> or quantity has changed.`;
-					break;
-				case "exchange":
-					detailLine = `An item in your order was <strong>exchanged</strong>.`;
-					break;
-				case "customerDetails":
-					detailLine = `Your shipping/contact information has been <strong>updated</strong>.`;
-					break;
-				default:
-					detailLine = `Your order information has been <strong>updated</strong>.`;
-					break;
-			}
+				// Build a small helper string describing what's changed:
+				let detailLine = "";
+				switch (updateType) {
+					case "trackingNumber":
+						detailLine = `Your order tracking number is now <strong>${updatedOrder.trackingNumber}</strong>.`;
+						break;
+					case "status":
+						detailLine = `Your order status is now <strong>${updatedOrder.status}</strong>.`;
+						break;
+					case "cancel":
+						detailLine = `Your order has been <strong>cancelled</strong>.`;
+						break;
+					case "remove":
+						detailLine = `One or more items have been <strong>removed</strong> from your order.`;
+						break;
+					case "addUnits":
+					case "addProduct":
+						detailLine = `New item(s) have been <strong>added</strong> or quantity has changed.`;
+						break;
+					case "exchange":
+						detailLine = `An item in your order was <strong>exchanged</strong>.`;
+						break;
+					case "customerDetails":
+						detailLine = `Your shipping/contact information has been <strong>updated</strong>.`;
+						break;
+					default:
+						detailLine = `Your order information has been <strong>updated</strong>.`;
+						break;
+				}
 
-			// You can replace this URL with your own publicly hosted logo if desired:
-			const logoUrl =
-				"https://res.cloudinary.com/infiniteapps/image/upload/v1719198504/serene_janat/1719198503886.png";
+				// You can replace this URL with your own publicly hosted logo if desired:
+				const logoUrl =
+					"https://res.cloudinary.com/infiniteapps/image/upload/v1719198504/serene_janat/1719198503886.png";
 
-			// HTML layout similar to "create new order" but simpler
-			const htmlContent = `
-				<html>
-					<head>
-						<meta charset="UTF-8" />
-						<title>Serene Jannat - Order Update</title>
-					</head>
-					<body style="margin:0; padding:0; font-family: Arial, sans-serif; background-color: #f6f6f6; color: #333;">
-						<div style="background-color: #ffffff; max-width:600px; margin: 20px auto; padding: 20px; border: 1px solid #ddd;">
-							
-							<!-- Header / Logo -->
-							<div style="text-align: center; margin-bottom: 20px;">
-								<img src="${logoUrl}" alt="Serene Jannat Logo" style="max-width: 200px;" />
+				// HTML layout
+				const htmlContent = `
+					<html>
+						<head>
+							<meta charset="UTF-8" />
+							<title>Serene Jannat - Order Update</title>
+						</head>
+						<body style="margin:0; padding:0; font-family: Arial, sans-serif; background-color: #f6f6f6; color: #333;">
+							<div style="background-color: #ffffff; max-width:600px; margin: 20px auto; padding: 20px; border: 1px solid #ddd;">
+								
+								<!-- Header / Logo -->
+								<div style="text-align: center; margin-bottom: 20px;">
+									<img src="${logoUrl}" alt="Serene Jannat Logo" style="max-width: 200px;" />
+								</div>
+
+								<!-- Title / Greeting -->
+								<h2 style="color: #333; text-align: center;">Order #${updatedOrder.invoiceNumber} Update</h2>
+
+								<!-- Body -->
+								<p>Hello ${updatedOrder.customerDetails.name},</p>
+								<p>We wanted to let you know that some changes have been made to your order. ${detailLine}</p>
+								
+								<p>If you have any questions, please send an email at <strong>sally.abdelrazak@serenejannat.com</strong> 
+								   or call <strong>951 565 7568</strong>.
+								</p>
+
+								<p>Thank you,<br/>Serene Jannat</p>
 							</div>
+						</body>
+					</html>
+				`;
 
-							<!-- Title / Greeting -->
-							<h2 style="color: #333; text-align: center;">Order #${updatedOrder.invoiceNumber} Update</h2>
+				// 1) Send to the Customer (if email exists)
+				if (customerEmail) {
+					await sgMail.send({
+						to: customerEmail,
+						from: fromEmail,
+						subject: subjectLine,
+						html: htmlContent,
+					});
+					console.log("Order update email sent to customer:", customerEmail);
+				} else {
+					console.log(
+						"No customer email found, skipping customer update email."
+					);
+				}
 
-							<!-- Body -->
-							<p>Hello ${updatedOrder.customerDetails.name},</p>
-							<p>We wanted to let you know that some changes have been made to your order. ${detailLine}</p>
-							
-							<p>If you have any questions, please send an email at <strong>sally.abdelrazak@serenejannat.com</strong> 
-							   or call <strong>951 565 7568</strong>.
-							</p>
-
-							<p>Thank you,<br/>Serene Jannat</p>
-						</div>
-					</body>
-				</html>
-			`;
-
-			// 1) Send to the Customer (if email exists)
-			if (customerEmail) {
+				// 2) Send a separate email to Admins (as 'to')
 				await sgMail.send({
-					to: customerEmail,
+					to: adminEmails, // array of emails
 					from: fromEmail,
 					subject: subjectLine,
 					html: htmlContent,
 				});
-				console.log("Order update email sent to customer:", customerEmail);
-			} else {
-				console.log("No customer email found, skipping customer update email.");
+				console.log("Order update email sent to admins:", adminEmails);
+			} catch (emailError) {
+				console.error("Error sending order update emails:", emailError);
 			}
-
-			// 2) Send a separate email to Admins (as 'to')
-			await sgMail.send({
-				to: adminEmails, // array of emails
-				from: fromEmail,
-				subject: subjectLine,
-				html: htmlContent,
-			});
-			console.log("Order update email sent to admins:", adminEmails);
-		} catch (emailError) {
-			console.error("Error sending order update emails:", emailError);
+		} else {
+			console.log(
+				"Skipping email notifications (sendEmail is 'no' or updateType is 'orderExpenses')."
+			);
 		}
 		// === End of Email Notification Logic ===
 
@@ -1942,5 +1973,226 @@ exports.orderSearch = async (req, res) => {
 	} catch (error) {
 		console.error("Error searching for orders:", error);
 		res.status(500).json({ message: "Server error. Please try again later." });
+	}
+};
+
+// Helper to sum up all keys in orderExpenses object, defaulting to {} if null
+const totalExpensesExpression = {
+	$reduce: {
+		input: { $objectToArray: { $ifNull: ["$orderExpenses", {}] } },
+		initialValue: 0,
+		in: { $add: ["$$value", "$$this.v"] },
+	},
+};
+
+// Helper for net = totalAmount - totalExpenses, defaulting totalAmount to 0
+const netTotalExpression = {
+	$subtract: [{ $ifNull: ["$totalAmount", 0] }, totalExpensesExpression],
+};
+
+/**
+ * GET /order-report/:orderquery/:userId
+ * A comprehensive report generator
+ */
+exports.adminOrderReport = async (req, res) => {
+	try {
+		const { orderquery, userId } = req.params; // 'orderquery' might be "report" or something else
+		const { startDate, endDate, measureType } = req.query;
+
+		// 1) Build date range - default to current month if none provided
+		const now = new Date();
+		const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+		const endOfMonth = new Date(
+			now.getFullYear(),
+			now.getMonth() + 1,
+			0,
+			23,
+			59,
+			59
+		);
+
+		const start = startDate ? new Date(startDate) : firstOfMonth;
+		const end = endDate ? new Date(endDate) : endOfMonth;
+
+		// 2) Decide how we measure (orderCount, totalQuantity, grossTotal, netTotal)
+		// for dayOverDay, stateSummary, statusSummary, etc.
+		let dayOverDayGroup = {};
+		let stateGroup = {};
+		let statusGroup = {};
+
+		switch (measureType) {
+			case "totalQuantity":
+				dayOverDayGroup = { $sum: "$totalOrderQty" };
+				stateGroup = { $sum: "$totalOrderQty" };
+				statusGroup = { $sum: "$totalOrderQty" };
+				break;
+			case "grossTotal":
+				dayOverDayGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
+				stateGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
+				statusGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
+				break;
+			case "netTotal":
+				// net = totalAmount - sum(orderExpenses)
+				dayOverDayGroup = { $sum: netTotalExpression };
+				stateGroup = { $sum: netTotalExpression };
+				statusGroup = { $sum: netTotalExpression };
+				break;
+			case "orderCount":
+			default:
+				dayOverDayGroup = { $sum: 1 };
+				stateGroup = { $sum: 1 };
+				statusGroup = { $sum: 1 };
+				break;
+		}
+
+		// 3) Build pipeline
+		const matchStage = {
+			$match: {
+				orderCreationDate: { $gte: start, $lte: end },
+			},
+		};
+
+		const pipeline = [
+			matchStage,
+			{
+				$facet: {
+					// A) Day Over Day
+					dayOverDay: [
+						{
+							$group: {
+								_id: {
+									$dateToString: {
+										format: "%Y-%m-%d",
+										date: "$orderCreationDate",
+									},
+								},
+								measure: dayOverDayGroup,
+							},
+						},
+						{ $sort: { _id: 1 } },
+					],
+					// B) Product Summary: noVariable
+					productSummaryNoVar: [
+						{ $unwind: "$productsNoVariable" },
+						{
+							$group: {
+								_id: "$productsNoVariable.name",
+								orderCount: { $sum: 1 },
+								totalQuantity: { $sum: "$productsNoVariable.ordered_quantity" },
+								grossTotal: {
+									$sum: {
+										$multiply: [
+											"$productsNoVariable.ordered_quantity",
+											"$productsNoVariable.price",
+										],
+									},
+								},
+								// netTotal is not trivially allocated per product, so we do same as gross
+								netTotal: {
+									$sum: {
+										$multiply: [
+											"$productsNoVariable.ordered_quantity",
+											"$productsNoVariable.price",
+										],
+									},
+								},
+							},
+						},
+					],
+					// C) Product Summary: withVariables
+					productSummaryVar: [
+						{ $unwind: "$chosenProductQtyWithVariables" },
+						{
+							$group: {
+								_id: "$chosenProductQtyWithVariables.name",
+								orderCount: { $sum: 1 },
+								totalQuantity: {
+									$sum: "$chosenProductQtyWithVariables.orderedQty",
+								},
+								grossTotal: {
+									$sum: {
+										$multiply: [
+											"$chosenProductQtyWithVariables.orderedQty",
+											"$chosenProductQtyWithVariables.price",
+										],
+									},
+								},
+								// Same approach for net, for simplicity
+								netTotal: {
+									$sum: {
+										$multiply: [
+											"$chosenProductQtyWithVariables.orderedQty",
+											"$chosenProductQtyWithVariables.price",
+										],
+									},
+								},
+							},
+						},
+					],
+					// D) State Summary
+					stateSummary: [
+						{
+							$group: {
+								_id: "$customerDetails.state",
+								measure: stateGroup,
+							},
+						},
+					],
+					// E) Status Summary
+					statusSummary: [
+						{
+							$group: {
+								_id: "$status",
+								measure: statusGroup,
+							},
+						},
+					],
+					// F) Scoreboard
+					scoreboard: [
+						{
+							$group: {
+								_id: null,
+								totalOrders: { $sum: 1 },
+								totalQuantity: { $sum: "$totalOrderQty" },
+								// Default totalAmount to 0 if missing
+								grossTotal: { $sum: { $ifNull: ["$totalAmount", 0] } },
+								// Sum of all orderExpenses
+								totalExpenses: { $sum: totalExpensesExpression },
+								// netTotal = totalAmount - totalExpenses
+								netTotal: {
+									$sum: netTotalExpression,
+								},
+							},
+						},
+					],
+				},
+			},
+			{
+				// Combine product arrays into single "productSummary"
+				$project: {
+					dayOverDay: 1,
+					productSummary: {
+						$concatArrays: ["$productSummaryNoVar", "$productSummaryVar"],
+					},
+					stateSummary: 1,
+					statusSummary: 1,
+					scoreboard: 1,
+				},
+			},
+		];
+
+		// 4) Execute
+		const results = await Order.aggregate(pipeline);
+		const finalData = results.length ? results[0] : {};
+
+		// 5) Return
+		return res.json({ success: true, data: finalData });
+	} catch (error) {
+		console.error("Error in adminOrderReport:", error);
+		return res.status(500).json({
+			success: false,
+			message: "Failed to generate order report",
+			error: error.message,
+		});
 	}
 };

@@ -15,6 +15,7 @@ const {
 	createPOS,
 	readSingleOrder,
 	processOrderPayment,
+	adminOrderReport,
 } = require("../controllers/order");
 
 router.post("/order/creation/:userId", requireSignin, isAuth, create);
@@ -45,6 +46,14 @@ router.get(
 	isAuth,
 	isAdmin,
 	orderSearch
+);
+
+router.get(
+	"/order-report/:orderquery/:userId",
+	requireSignin,
+	isAuth,
+	isAdmin,
+	adminOrderReport
 );
 
 router.param("userId", userById);
