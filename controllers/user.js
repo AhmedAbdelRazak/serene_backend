@@ -8,7 +8,7 @@ exports.userById = async (req, res, next, id) => {
 	try {
 		const user = await User.findById(id)
 			.select(
-				"_id name email role phone user points activePoints likesUser activeUser employeeImage userRole history userStore userBranch"
+				"_id name email role phone user points activePoints likesUser activeUser profilePhoto authProvider"
 			)
 			.populate({
 				path: "likesUser",
@@ -37,7 +37,7 @@ exports.userById = async (req, res, next, id) => {
 exports.updatedUserId = (req, res, next, id) => {
 	User.findById(id)
 		.select(
-			"_id name email role user points activePoints likesUser activeUser employeeImage userRole history userStore userBranch"
+			"_id name email role user points activePoints likesUser activeUser profilePhoto authProvider"
 		)
 
 		.exec((err, userNeedsUpdate) => {
@@ -62,28 +62,31 @@ exports.update = async (req, res) => {
 	const { name, email, phone, password } = req.body;
 
 	try {
+		// 1) Find user by ID
 		let user = await User.findOne({ _id: req.profile._id });
 		if (!user) {
-			return res.status(400).json({
-				error: "User not found",
-			});
+			return res.status(400).json({ error: "User not found" });
 		}
+
+		// 2) Name is required
 		if (!name) {
-			return res.status(400).json({
-				error: "Name is required",
-			});
+			return res.status(400).json({ error: "Name is required" });
 		} else {
 			user.name = name;
 		}
 
+		// 3) Update email if provided
 		if (email) {
 			user.email = email;
 		}
 
+		// 4) Update phone if provided
 		if (phone) {
 			user.phone = phone;
 		}
 
+		// 5) If a password is passed AND this user is "local," then update
+		//    (Or if you want to allow a Google user to add a password, remove the check).
 		if (password) {
 			if (password.length < 6) {
 				return res.status(400).json({
@@ -94,15 +97,16 @@ exports.update = async (req, res) => {
 			}
 		}
 
+		// 6) Save user
 		let updatedUser = await user.save();
 		updatedUser.hashed_password = undefined;
 		updatedUser.salt = undefined;
-		res.json(updatedUser);
+
+		// 7) Send response
+		return res.json(updatedUser);
 	} catch (err) {
 		console.log("USER UPDATE ERROR", err);
-		return res.status(400).json({
-			error: "User update failed",
-		});
+		return res.status(400).json({ error: "User update failed" });
 	}
 };
 
@@ -123,7 +127,7 @@ exports.remove = (req, res) => {
 exports.allUsersList = (req, res) => {
 	User.find()
 		.select(
-			"_id name email role user points activePoints likesUser activeUser employeeImage userRole history userStore userBranch"
+			"_id name email role user points activePoints likesUser activeUser profilePhoto authProvider"
 		)
 		.exec((err, users) => {
 			if (err) {
@@ -238,17 +242,8 @@ exports.unlike = (req, res) => {
 };
 
 exports.updateUserByAdmin = (req, res) => {
-	const {
-		name,
-		password,
-		role,
-		activeUser,
-		employeeImage,
-		email,
-		userRole,
-		userStore,
-		userBranch,
-	} = req.body.updatedUserByAdmin;
+	const { name, password, role, activeUser, email } =
+		req.body.updatedUserByAdmin;
 
 	User.findOne({ _id: req.body.updatedUserByAdmin.userId }, (err, user) => {
 		if (err || !user) {
@@ -296,38 +291,6 @@ exports.updateUserByAdmin = (req, res) => {
 			});
 		} else {
 			user.activeUser = activeUser;
-		}
-
-		if (!employeeImage) {
-			return res.status(400).json({
-				error: "employeeImage is required",
-			});
-		} else {
-			user.employeeImage = employeeImage;
-		}
-
-		if (!userRole) {
-			return res.status(400).json({
-				error: "User Role Is Required",
-			});
-		} else {
-			user.userRole = userRole;
-		}
-
-		if (!userStore) {
-			return res.status(400).json({
-				error: "User Store Is Required",
-			});
-		} else {
-			user.userStore = userStore;
-		}
-
-		if (!userBranch) {
-			return res.status(400).json({
-				error: "User Store Is Required",
-			});
-		} else {
-			user.userBranch = userBranch;
 		}
 
 		user.save((err, updatedUser) => {

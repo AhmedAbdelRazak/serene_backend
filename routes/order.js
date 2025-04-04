@@ -16,6 +16,8 @@ const {
 	readSingleOrder,
 	processOrderPayment,
 	adminOrderReport,
+	getDetailedOrders,
+	checkInvoiceNumber,
 } = require("../controllers/order");
 
 router.post("/order/creation/:userId", requireSignin, isAuth, create);
@@ -55,6 +57,16 @@ router.get(
 	isAdmin,
 	adminOrderReport
 );
+
+router.get(
+	"/order-report-modal/detailed-orders/:userId",
+	requireSignin,
+	isAuth,
+	isAdmin,
+	getDetailedOrders
+);
+
+router.get("/orders/check-invoice/for-chat", checkInvoiceNumber);
 
 router.param("userId", userById);
 router.param("orderId", orderById);

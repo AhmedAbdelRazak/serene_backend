@@ -249,8 +249,14 @@ const productSchema = new mongoose.Schema(
 
 		activeProduct: {
 			type: Boolean,
+			default: false,
+		},
+
+		activeProductBySeller: {
+			type: Boolean,
 			default: true,
 		},
+
 		activeBackorder: {
 			type: Boolean,
 			default: true,
@@ -279,7 +285,6 @@ const productSchema = new mongoose.Schema(
 		},
 
 		likes: [{ type: ObjectId, ref: "User" }],
-		belongsTo: { type: ObjectId, ref: "User" },
 		views: [],
 		viewsCount: {
 			type: Number,
@@ -303,6 +308,12 @@ const productSchema = new mongoose.Schema(
 				ratedBy: { type: ObjectId, ref: "User" },
 			},
 		],
+
+		store: {
+			type: ObjectId,
+			ref: "StoreManagement",
+			default: "67ef147140130b857c44ba75",
+		},
 	},
 	{ timestamps: true }
 );

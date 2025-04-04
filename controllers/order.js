@@ -1991,15 +1991,15 @@ const netTotalExpression = {
 };
 
 /**
- * GET /order-report/:orderquery/:userId
+ * GET /order-report/report/:userId
  * A comprehensive report generator
  */
 exports.adminOrderReport = async (req, res) => {
 	try {
-		const { orderquery, userId } = req.params; // 'orderquery' might be "report" or something else
+		const { userId } = req.params;
 		const { startDate, endDate, measureType } = req.query;
 
-		// 1) Build date range - default to current month if none provided
+		// 1) Build date range - fallback to current month if none provided
 		const now = new Date();
 		const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 		const endOfMonth = new Date(
@@ -2015,7 +2015,7 @@ exports.adminOrderReport = async (req, res) => {
 		const end = endDate ? new Date(endDate) : endOfMonth;
 
 		// 2) Decide how we measure (orderCount, totalQuantity, grossTotal, netTotal)
-		// for dayOverDay, stateSummary, statusSummary, etc.
+		// for dayOverDay, stateSummary, statusSummary, scoreboard (NOT productSummary)
 		let dayOverDayGroup = {};
 		let stateGroup = {};
 		let statusGroup = {};
@@ -2066,11 +2066,12 @@ exports.adminOrderReport = async (req, res) => {
 										date: "$orderCreationDate",
 									},
 								},
-								measure: dayOverDayGroup,
+								measure: dayOverDayGroup, // based on measureType
 							},
 						},
 						{ $sort: { _id: 1 } },
 					],
+
 					// B) Product Summary: noVariable
 					productSummaryNoVar: [
 						{ $unwind: "$productsNoVariable" },
@@ -2087,7 +2088,6 @@ exports.adminOrderReport = async (req, res) => {
 										],
 									},
 								},
-								// netTotal is not trivially allocated per product, so we do same as gross
 								netTotal: {
 									$sum: {
 										$multiply: [
@@ -2099,6 +2099,7 @@ exports.adminOrderReport = async (req, res) => {
 							},
 						},
 					],
+
 					// C) Product Summary: withVariables
 					productSummaryVar: [
 						{ $unwind: "$chosenProductQtyWithVariables" },
@@ -2117,7 +2118,6 @@ exports.adminOrderReport = async (req, res) => {
 										],
 									},
 								},
-								// Same approach for net, for simplicity
 								netTotal: {
 									$sum: {
 										$multiply: [
@@ -2129,7 +2129,68 @@ exports.adminOrderReport = async (req, res) => {
 							},
 						},
 					],
-					// D) State Summary
+
+					// D) Product Summary: exchangedNoVariable
+					productSummaryExchangeNoVar: [
+						{ $unwind: "$exchangedProductsNoVariable" },
+						{
+							$group: {
+								_id: "$exchangedProductsNoVariable.name",
+								orderCount: { $sum: 1 },
+								totalQuantity: {
+									$sum: "$exchangedProductsNoVariable.ordered_quantity",
+								},
+								grossTotal: {
+									$sum: {
+										$multiply: [
+											"$exchangedProductsNoVariable.ordered_quantity",
+											"$exchangedProductsNoVariable.price",
+										],
+									},
+								},
+								netTotal: {
+									$sum: {
+										$multiply: [
+											"$exchangedProductsNoVariable.ordered_quantity",
+											"$exchangedProductsNoVariable.price",
+										],
+									},
+								},
+							},
+						},
+					],
+
+					// E) Product Summary: exchangedWithVariables
+					productSummaryExchangeVar: [
+						{ $unwind: "$exchangedProductQtyWithVariables" },
+						{
+							$group: {
+								_id: "$exchangedProductQtyWithVariables.name",
+								orderCount: { $sum: 1 },
+								totalQuantity: {
+									$sum: "$exchangedProductQtyWithVariables.orderedQty",
+								},
+								grossTotal: {
+									$sum: {
+										$multiply: [
+											"$exchangedProductQtyWithVariables.orderedQty",
+											"$exchangedProductQtyWithVariables.price",
+										],
+									},
+								},
+								netTotal: {
+									$sum: {
+										$multiply: [
+											"$exchangedProductQtyWithVariables.orderedQty",
+											"$exchangedProductQtyWithVariables.price",
+										],
+									},
+								},
+							},
+						},
+					],
+
+					// F) State Summary
 					stateSummary: [
 						{
 							$group: {
@@ -2138,7 +2199,8 @@ exports.adminOrderReport = async (req, res) => {
 							},
 						},
 					],
-					// E) Status Summary
+
+					// G) Status Summary
 					statusSummary: [
 						{
 							$group: {
@@ -2147,21 +2209,17 @@ exports.adminOrderReport = async (req, res) => {
 							},
 						},
 					],
-					// F) Scoreboard
+
+					// H) Scoreboard
 					scoreboard: [
 						{
 							$group: {
 								_id: null,
 								totalOrders: { $sum: 1 },
 								totalQuantity: { $sum: "$totalOrderQty" },
-								// Default totalAmount to 0 if missing
 								grossTotal: { $sum: { $ifNull: ["$totalAmount", 0] } },
-								// Sum of all orderExpenses
 								totalExpenses: { $sum: totalExpensesExpression },
-								// netTotal = totalAmount - totalExpenses
-								netTotal: {
-									$sum: netTotalExpression,
-								},
+								netTotal: { $sum: netTotalExpression },
 							},
 						},
 					],
@@ -2172,7 +2230,12 @@ exports.adminOrderReport = async (req, res) => {
 				$project: {
 					dayOverDay: 1,
 					productSummary: {
-						$concatArrays: ["$productSummaryNoVar", "$productSummaryVar"],
+						$concatArrays: [
+							"$productSummaryNoVar",
+							"$productSummaryVar",
+							"$productSummaryExchangeNoVar",
+							"$productSummaryExchangeVar",
+						],
 					},
 					stateSummary: 1,
 					statusSummary: 1,
@@ -2181,11 +2244,16 @@ exports.adminOrderReport = async (req, res) => {
 			},
 		];
 
-		// 4) Execute
+		// 4) Execute the pipeline
 		const results = await Order.aggregate(pipeline);
 		const finalData = results.length ? results[0] : {};
 
-		// 5) Return
+		// 5) Manually sort the productSummary by grossTotal descending
+		if (finalData.productSummary && finalData.productSummary.length) {
+			finalData.productSummary.sort((a, b) => b.grossTotal - a.grossTotal);
+		}
+
+		// Return
 		return res.json({ success: true, data: finalData });
 	} catch (error) {
 		console.error("Error in adminOrderReport:", error);
@@ -2193,6 +2261,108 @@ exports.adminOrderReport = async (req, res) => {
 			success: false,
 			message: "Failed to generate order report",
 			error: error.message,
+		});
+	}
+};
+
+exports.getDetailedOrders = async (req, res) => {
+	try {
+		const { userId } = req.params;
+		const { filterType, filterValue, startDate, endDate } = req.query;
+		console.log(filterType, "filterType");
+
+		// Build date range - fallback to current month if not provided
+		const now = new Date();
+		const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+		const endOfMonth = new Date(
+			now.getFullYear(),
+			now.getMonth() + 1,
+			0,
+			23,
+			59,
+			59
+		);
+		const start = startDate ? new Date(startDate) : firstOfMonth;
+		const end = endDate ? new Date(endDate) : endOfMonth;
+
+		// Build match conditions for date range
+		const match = {
+			orderCreationDate: { $gte: start, $lte: end },
+		};
+
+		if (filterType === "state") {
+			/**
+			 * Case-insensitive match for state:
+			 * e.g. if filterValue = "wisconsin", it will match "Wisconsin" or "WISCONSIN", etc.
+			 */
+			match["customerDetails.state"] = {
+				$regex: new RegExp(`^${filterValue}$`, "i"),
+			};
+		} else if (filterType === "product") {
+			/**
+			 * Include all possible arrays:
+			 * productsNoVariable, chosenProductQtyWithVariables,
+			 * exhchangedProductsNoVariable, exchangedProductQtyWithVariables
+			 *
+			 * And make the name match case-insensitively.
+			 */
+			const caseInsensitive = { $regex: new RegExp(filterValue, "i") };
+
+			match.$or = [
+				{ "productsNoVariable.name": caseInsensitive },
+				{ "chosenProductQtyWithVariables.name": caseInsensitive },
+				// also handle "exhchanged" or "exchanged" (typo in your schema?)
+				{ "exhchangedProductsNoVariable.name": caseInsensitive },
+				{ "exchangedProductQtyWithVariables.name": caseInsensitive },
+			];
+		}
+
+		// Now query orders
+		const orders = await Order.find(match).sort({ orderCreationDate: -1 });
+		return res.json({
+			success: true,
+			orders,
+		});
+	} catch (error) {
+		console.error("Error in getDetailedOrders:", error);
+		return res.status(500).json({
+			success: false,
+			message: "Failed to get filtered orders",
+			error: error.message,
+		});
+	}
+};
+
+exports.checkInvoiceNumber = async (req, res) => {
+	try {
+		const { invoiceNumber } = req.query;
+
+		if (!invoiceNumber) {
+			return res
+				.status(400)
+				.json({ error: "Missing invoiceNumber query parameter" });
+		}
+
+		const foundOrder = await Order.findOne({ invoiceNumber }).select("store");
+
+		if (!foundOrder) {
+			return res.json({
+				found: false,
+				storeId: null,
+				message: "No order found with that invoiceNumber",
+			});
+		}
+
+		// If found => respond with storeId (could be null if not associated with a store)
+		return res.json({
+			found: true,
+			storeId: foundOrder.store || null,
+			message: "Order found",
+		});
+	} catch (error) {
+		console.error("Error in checkInvoiceNumber:", error);
+		res.status(500).json({
+			error: "Server error occurred while checking invoice number.",
 		});
 	}
 };

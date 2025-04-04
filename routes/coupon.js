@@ -4,7 +4,7 @@ const express = require("express");
 const router = express.Router();
 
 // middlewares
-const { isAuth, isAdmin, requireSignin } = require("../controllers/auth");
+const { isSeller, requireSignin } = require("../controllers/auth");
 const { userById } = require("../controllers/user");
 
 // controller
@@ -17,15 +17,9 @@ const {
 } = require("../controllers/coupon");
 
 // routes
-router.post("/coupon/create/:userId", requireSignin, isAuth, isAdmin, create);
+router.post("/coupon/create/:userId", requireSignin, isSeller, create);
 router.get("/coupons", list);
-router.delete(
-	"/coupon/:couponId/:userId",
-	requireSignin,
-	isAuth,
-	isAdmin,
-	remove
-);
+router.delete("/coupon/:couponId/:userId", requireSignin, isSeller, remove);
 
 router.get("/coupon/byname/:coupon", getSingleCoupon);
 

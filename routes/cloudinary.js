@@ -5,7 +5,7 @@ const router = express.Router();
 const {
 	requireSignin,
 	isAuth,
-	isAdmin,
+	// isAdmin,
 	isOperations,
 } = require("../controllers/auth");
 const {
@@ -17,20 +17,8 @@ const {
 	removeForPOD,
 } = require("../controllers/cloudinary");
 const { userById } = require("../controllers/user");
-router.post(
-	"/admin/uploadimages/:userId",
-	requireSignin,
-	isAuth,
-	isAdmin,
-	upload
-);
-router.post(
-	"/admin/removeimage/:userId",
-	requireSignin,
-	isAuth,
-	isAdmin,
-	remove
-);
+router.post("/admin/uploadimages/:userId", requireSignin, isAuth, upload);
+router.post("/admin/removeimage/:userId", requireSignin, isAuth, remove);
 
 router.post(
 	"/admin/uploadimagesimagecomment/:userId",

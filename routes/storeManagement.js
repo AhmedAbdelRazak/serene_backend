@@ -1,27 +1,68 @@
 /** @format */
-
 const express = require("express");
 const router = express.Router();
-const { requireSignin, isAuth, isAdmin } = require("../controllers/auth");
-const { userById } = require("../controllers/user");
 
 const {
-	create,
-	StoreManagementById,
-	list,
+	createSingleStore,
+	getSingleStore,
+	updateSingleStore,
+	deleteSingleStore,
+	getAllSellersWithStores,
+	toggleStoreActivationByAdmin,
 } = require("../controllers/storeManagement");
 
+const {
+	requireSignin,
+	isSeller,
+	isAuth,
+	isAdmin,
+} = require("../controllers/auth");
+const { userById } = require("../controllers/user");
+
+// CREATE the single store doc (only once per user)
 router.post(
-	"/store-management/create/:userId",
+	"/store-management/:userId",
+	requireSignin,
+	isSeller,
+	createSingleStore
+);
+
+// READ the single store doc
+router.get("/store-management/:userId", getSingleStore);
+
+// UPDATE the single store doc
+router.put(
+	"/store-management/:userId",
+	requireSignin,
+	isSeller,
+	updateSingleStore
+);
+
+// DELETE the single store doc
+router.delete(
+	"/store-management/:userId",
+	requireSignin,
+	isSeller,
+	deleteSingleStore
+);
+
+router.get(
+	"/all-user-store-management/foradmin/:userId",
 	requireSignin,
 	isAuth,
 	isAdmin,
-	create,
+	getAllSellersWithStores
 );
 
-router.get("/store-management", list);
+router.put(
+	"/all-user-store-management/foradmin/activate/:storeId/:userId",
+	requireSignin,
+	isAuth,
+	isAdmin,
+	toggleStoreActivationByAdmin
+);
 
+// Param middleware
 router.param("userId", userById);
-router.param("serviceId", StoreManagementById);
 
 module.exports = router;

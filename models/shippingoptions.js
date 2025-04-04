@@ -1,6 +1,7 @@
 /** @format */
 
 const mongoose = require("mongoose");
+const { ObjectId } = mongoose.Schema;
 
 const shippingoptionsSchema = new mongoose.Schema(
 	{
@@ -14,7 +15,6 @@ const shippingoptionsSchema = new mongoose.Schema(
 		carrierName_Arabic: {
 			type: String,
 			trim: true,
-			required: "Carrier is required",
 			minlength: [2, "Too short"],
 			maxlength: [32, "Too long"],
 		},
@@ -24,7 +24,7 @@ const shippingoptionsSchema = new mongoose.Schema(
 		},
 		shippingPrice_Unit: {
 			type: String,
-			required: "Shipping Price is required",
+			default: "USD",
 		},
 		carrierStatus: {
 			type: Boolean,
@@ -45,6 +45,12 @@ const shippingoptionsSchema = new mongoose.Schema(
 			type: Array,
 			trim: true,
 			default: ["13:00"],
+		},
+
+		store: {
+			type: ObjectId,
+			ref: "StoreManagement",
+			default: "67ef147140130b857c44ba75",
 		},
 	},
 	{ timestamps: true }

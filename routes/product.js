@@ -2,7 +2,12 @@
 
 const express = require("express");
 const router = express.Router();
-const { requireSignin, isAuth, isAdmin } = require("../controllers/auth");
+const {
+	requireSignin,
+	isAuth,
+	isAdmin,
+	isSeller,
+} = require("../controllers/auth");
 const { userById } = require("../controllers/user");
 
 const {
@@ -23,19 +28,16 @@ const {
 	filteredProducts,
 	likedProducts,
 	listPODProducts,
+	listProductsNoFilterForSeller,
+	autoCompleteProducts,
 } = require("../controllers/product");
 
-router.post("/product/create/:userId", requireSignin, isAuth, isAdmin, create);
-router.put(
-	"/product/:productId/:userId",
-	requireSignin,
-	isAuth,
-	isAdmin,
-	update
-);
+router.post("/product/create/:userId", requireSignin, isSeller, create);
+router.put("/product/:productId/:userId", requireSignin, isSeller, update);
 
 router.get("/products", listProductsNoFilter);
-router.get("/products/pod", listPODProducts);
+router.get("/products/:storeId", listProductsNoFilterForSeller);
+router.get("/products/pod/print-on-demand-products", listPODProducts);
 router.get("/product/:productId", read);
 router.get("/single-product/:slug/:categorySlug/:productId", readSingleProduct);
 
@@ -73,6 +75,15 @@ router.put("/product/star/:productId/:userId", requireSignin, productStar);
 router.get("/products/:filters/:page/:records", filteredProducts);
 
 router.get("/products/wishlist/:userId", requireSignin, isAuth, likedProducts);
+
+router.get(
+	"/products/autocomplete/for-client-chat-support",
+	(req, res, next) => {
+		console.log("IN AUTOCOMPLETE ROUTE, query =", req.query);
+		next();
+	},
+	autoCompleteProducts
+);
 
 router.param("userId", userById);
 router.param("productId", productById);

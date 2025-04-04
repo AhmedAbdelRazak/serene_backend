@@ -64,22 +64,84 @@ server.listen(port, () => {
 	console.log(`Server is running on port ${port}`);
 });
 
+// ===== SOCKET.IO EVENT HANDLING =====
 io.on("connection", (socket) => {
-	console.log("A user connected");
+	console.log("A user connected:", socket.id);
 
-	socket.on("sendMessage", (message) => {
-		console.log("Message received: ", message);
-		io.emit("receiveMessage", message);
+	/**
+	 * Join a specific room (caseId)
+	 */
+	socket.on("joinRoom", ({ caseId }) => {
+		if (caseId) {
+			socket.join(caseId);
+			console.log(`Socket ${socket.id} joined room: ${caseId}`);
+		}
 	});
 
-	socket.on("typing", (data) => {
-		io.emit("typing", data);
+	/**
+	 * Leave the room (caseId) on command
+	 */
+	socket.on("leaveRoom", ({ caseId }) => {
+		if (caseId) {
+			socket.leave(caseId);
+			console.log(`Socket ${socket.id} left room: ${caseId}`);
+		}
 	});
 
-	socket.on("stopTyping", (data) => {
-		io.emit("stopTyping", data);
+	/**
+	 * Handle user typing events
+	 */
+	socket.on("typing", ({ caseId, user }) => {
+		// Include caseId in the payload so that only the correct chat updates
+		io.to(caseId).emit("typing", { caseId, user });
 	});
 
+	socket.on("stopTyping", ({ caseId, user }) => {
+		io.to(caseId).emit("stopTyping", { caseId, user });
+	});
+
+	/**
+	 * Send message - broadcast to the specific room
+	 *
+	 * NOTE: In your controllers, once the DB is updated, you do:
+	 *   req.io.emit("receiveMessage", updatedCase);
+	 * or
+	 *   req.io.to(caseId).emit("receiveMessage", updatedCase);
+	 *
+	 * That’s fine, as long as the client code expects an entire updatedCase object.
+	 */
+	socket.on("sendMessage", (messageData) => {
+		// Typically you do NOT update the DB here if you're using your REST endpoint to do it.
+		// But if you prefer a pure-socket approach, you’d do it here.
+		// For now, just re-broadcast so others see it in real-time:
+		const { caseId } = messageData;
+		console.log(
+			"sendMessage received on server -> broadcast to room",
+			messageData
+		);
+		io.to(caseId).emit("receiveMessage", messageData);
+	});
+
+	/**
+	 * New Chat
+	 */
+	socket.on("newChat", (data) => {
+		console.log("New chat data:", data);
+		// If you want to broadcast to all connected admin/agents:
+		io.emit("newChat", data);
+	});
+
+	/**
+	 * Delete message
+	 */
+	socket.on("deleteMessage", ({ caseId, messageId }) => {
+		console.log(`Message deleted in case ${caseId}: ${messageId}`);
+		io.to(caseId).emit("messageDeleted", { caseId, messageId });
+	});
+
+	/**
+	 * Disconnection
+	 */
 	socket.on("disconnect", (reason) => {
 		console.log(`A user disconnected: ${reason}`);
 	});

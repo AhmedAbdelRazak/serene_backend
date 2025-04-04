@@ -1,6 +1,7 @@
 /** @format */
 
 const mongoose = require("mongoose");
+const { ObjectId } = mongoose.Schema;
 
 const couponSchema = new mongoose.Schema(
 	{
@@ -21,8 +22,9 @@ const couponSchema = new mongoose.Schema(
 			type: Number,
 			requred: true,
 		},
+		store: { type: ObjectId, ref: "StoreManagement", default: null },
 	},
-	{ timestamps: true },
+	{ timestamps: true }
 );
 
 module.exports = mongoose.model("Coupon", couponSchema);

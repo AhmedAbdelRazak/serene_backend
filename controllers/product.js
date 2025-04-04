@@ -98,6 +98,43 @@ exports.listProductsNoFilter = async (req, res) => {
 	}
 };
 
+exports.listProductsNoFilterForSeller = async (req, res) => {
+	const storeId = req.params.storeId;
+	if (!mongoose.Types.ObjectId.isValid(storeId)) {
+		return res.status(400).json({ error: "Invalid storeId param" });
+	}
+
+	try {
+		const products = await Product.find({
+			"printifyProductDetails.POD": { $ne: true },
+			store: storeId,
+		})
+			.populate(
+				"category",
+				"_id categoryName categorySlug thumbnail categoryName_Arabic"
+			)
+			.populate(
+				"subcategory",
+				"_id SubcategoryName SubcategorySlug thumbnail SubcategoryName_Arabic"
+			)
+			.populate("gender", "_id genderName thumbnail")
+			.populate("addedByEmployee", "_id name role")
+			.populate("updatedByEmployee", "_id name role")
+			.populate({
+				path: "relatedProducts",
+				populate: {
+					path: "category",
+					select: "_id categoryName categorySlug thumbnail categoryName_Arabic",
+				},
+			});
+
+		res.json(products);
+	} catch (error) {
+		console.log(error);
+		res.status(400).json({ error: error.message });
+	}
+};
+
 exports.listPODProducts = async (req, res) => {
 	let order = req.query.order ? req.query.order : "desc";
 	let sortBy = req.query.sortBy ? req.query.sortBy : "viewsCount";
@@ -1279,6 +1316,44 @@ exports.likedProducts = async (req, res) => {
 	} catch (err) {
 		return res.status(400).json({
 			error: "Error fetching wishlist products",
+		});
+	}
+};
+
+exports.autoCompleteProducts = async (req, res) => {
+	try {
+		const { query } = req.query;
+		console.log(req.query, "req.query");
+
+		// Enforce a minimum length (e.g., 4 chars)
+		if (!query || query.trim().length < 4) {
+			return res.json([]); // Returns a 200 status with an empty array
+		}
+
+		// Escape special regex chars in query. For example: "Glass (Test)" -> "Glass \(Test\)"
+		const escapedQuery = query
+			.trim()
+			.replace(/[-[\]{}()*+?.,\\/^$|#\s]/g, "\\$&");
+
+		// Wrap in .* to allow matching anywhere in the string
+		const regex = new RegExp(`.*${escapedQuery}.*`, "i");
+
+		// Adjust your search fields as desired
+		const products = await Product.find({
+			$or: [
+				{ productName: { $regex: regex } },
+				{ productSKU: { $regex: regex } },
+				// Add other fields if you want them included (e.g. slug, etc.)
+			],
+		})
+			.select("_id productName productSKU store slug thumbnailImage")
+			.limit(10);
+
+		return res.json(products); // 200 OK
+	} catch (error) {
+		console.error("Error in autoCompleteProducts:", error);
+		return res.status(500).json({
+			error: "Server error occurred while fetching product suggestions.",
 		});
 	}
 };

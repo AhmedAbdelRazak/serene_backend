@@ -24,17 +24,14 @@ const userSchema = new mongoose.Schema(
 		phone: {
 			type: String,
 			trim: true,
-			required: true,
+			default: "",
 		},
 
 		hashed_password: {
 			type: String,
 			required: true,
 		},
-		about: {
-			type: String,
-			trim: true,
-		},
+
 		salt: String,
 		employeeImage: String,
 		role: {
@@ -56,26 +53,26 @@ const userSchema = new mongoose.Schema(
 			type: Number,
 			default: 0,
 		},
+
 		activePoints: {
 			type: Number,
 			default: 0,
 		},
+
 		activeUser: {
 			type: Boolean,
 			default: true,
 		},
+
 		userRole: {
 			type: String,
 			default: "customer",
 		},
-		userStore: {
-			type: String,
-			default: "customer",
-		},
 
-		userBranch: {
+		authProvider: {
 			type: String,
-			default: "",
+			default: "local", // "local" if signed up via email/password
+			enum: ["local", "google", "facebook"],
 		},
 
 		profilePhoto: {
@@ -85,6 +82,8 @@ const userSchema = new mongoose.Schema(
 				url: "",
 			},
 		},
+
+		storeIds: [{ type: ObjectId, ref: "StoreManagement", default: null }],
 	},
 	{ timestamps: true }
 );
