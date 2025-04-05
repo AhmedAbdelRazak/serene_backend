@@ -26,7 +26,7 @@ const orderStatusSMS = require("twilio")(
 
 // ==================== SQUARE SETUP ======================
 const squareClient = new Client({
-	environment: Environment.Sandbox, // for sandbox 'cnon:...' token Production
+	environment: Environment.Production, // for Sandbox 'cnon:...' token Production
 	accessToken: process.env.SQUARE_ACCESS_TOKEN_TEST,
 });
 
