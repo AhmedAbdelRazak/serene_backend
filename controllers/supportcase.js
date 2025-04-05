@@ -14,35 +14,6 @@ const orderStatusSMS = twilio(
 	process.env.TWILIO_AUTH_TOKEN
 );
 
-// const adminPhoneNumber = "+19515657568";
-// 		const adminPhoneNumber2 = "+19512591528";
-// 		const fromPhoneNumber = "+19094884148";
-// 		const smsText =
-// 			"Hi Sally, Please login to your admin dashboard, there's a client needs help.";
-
-// 		try {
-// 			await orderStatusSMS.messages.create({
-// 				body: smsText,
-// 				from: fromPhoneNumber,
-// 				// to: adminPhoneNumber2,
-// 				to: adminPhoneNumber,
-// 			});
-// 			console.log(`SMS sent to ${adminPhoneNumber}`);
-// 		} catch (smsError) {
-// 			console.error(`Error sending SMS to ${adminPhoneNumber}:`, smsError);
-// 		}
-
-/**
- * Support Case Controller
- *
- * Provides CRUD operations and additional functionality
- * for the real estate SupportCase system, including:
- * - Creating new cases
- * - Updating case status, adding conversation messages
- * - Tracking unseen messages per role
- * - Fetching open/closed cases (for properties, sellers, clients)
- */
-
 exports.getSupportCases = async (req, res) => {
 	try {
 		const userId = req.user._id;
@@ -315,6 +286,24 @@ exports.createNewSupportCase = async (req, res) => {
 			subject: `New Support Case | ${storeName}`,
 			html: emailHtml,
 		});
+
+		const adminPhoneNumber = "+19515657568";
+		const adminPhoneNumber2 = "+19512591528";
+		const fromPhoneNumber = "+19094884148";
+		const smsText =
+			"Hi Sally, Please login to your admin dashboard, there's a client needs help.";
+
+		try {
+			await orderStatusSMS.messages.create({
+				body: smsText,
+				from: fromPhoneNumber,
+				// to: adminPhoneNumber2,
+				to: adminPhoneNumber,
+			});
+			console.log(`SMS sent to ${adminPhoneNumber}`);
+		} catch (smsError) {
+			console.error(`Error sending SMS to ${adminPhoneNumber}:`, smsError);
+		}
 
 		return res.status(201).json(newCase);
 	} catch (error) {

@@ -2,6 +2,7 @@
 
 const { Order } = require("../models/order");
 const Product = require("../models/product");
+const StoreManagement = require("../models/storeManagement");
 const Colors = require("../models/colors");
 const sgMail = require("@sendgrid/mail");
 const PDFDocument = require("pdfkit");
@@ -16,6 +17,7 @@ const {
 	formatOrderEmail,
 	formatOrderEmailPOS,
 	formatPaymentLinkEmail,
+	formatSellerEmail,
 } = require("./Helper");
 
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
@@ -33,6 +35,7 @@ const squareClient = new Client({
 const BusinessName = "Serene Jannat";
 const fromEmail = "noreply@serenejannat.com";
 const defaultEmail = "ahmed.abdelrazak@jannatbooking.com";
+const owners = ["ahmedandsally14@gmail.com", "ahmed.abdelrazak20@gmail.com"];
 const shopLogo = path.join(__dirname, "../shopLogo/logo.png");
 
 // ========================================================
@@ -134,13 +137,12 @@ const createPdfBuffer = (order) => {
 // ============= EMAIL & SMS NOTIFICATIONS ===============
 const sendOrderConfirmationEmail = async (order) => {
 	try {
+		// 1) Generate the PDF & main HTML
 		const pdfBuffer = await createPdfBuffer(order);
 		const htmlContent = await formatOrderEmail(order);
 
+		// 2) Determine recipient (customer’s email) & internal BCC
 		const recipientEmail = order.customerDetails.email || defaultEmail;
-
-		// These might originally be objects like { email: "..."}
-		// Convert them to an array of email strings:
 		const bccEmails = [
 			{ email: "sally.abdelrazak@serenejannat.com" },
 			{ email: "ahmed.abdelrazak20@gmail.com" },
@@ -150,6 +152,9 @@ const sendOrderConfirmationEmail = async (order) => {
 			.filter((bcc) => bcc.email !== recipientEmail)
 			.map((item) => item.email);
 
+		// 3) Prepare the two existing emails
+
+		// A) Email to the customer
 		const FormSubmittionEmail = {
 			to: recipientEmail,
 			from: fromEmail,
@@ -165,7 +170,7 @@ const sendOrderConfirmationEmail = async (order) => {
 			],
 		};
 
-		// separate email for the internal team
+		// B) Email to internal staff
 		const FormSubmittionEmail2 = {
 			to: uniqueBccEmails, // array of strings
 			from: fromEmail,
@@ -181,13 +186,81 @@ const sendOrderConfirmationEmail = async (order) => {
 			],
 		};
 
-		// Send first to customer
+		// 4) Send the customer & internal emails (sequentially or in parallel)
 		await sgMail.send(FormSubmittionEmail);
-
-		// Send second to internal staff
 		await sgMail.send(FormSubmittionEmail2);
 
-		console.log("Order confirmation emails sent successfully.");
+		console.log(
+			"Order confirmation emails (customer & internal) sent successfully."
+		);
+
+		// ──────────────────────────────────────────────────────────────────────────
+		// 5) Now gather all distinct storeIds => find each StoreManagement => get seller
+		// ──────────────────────────────────────────────────────────────────────────
+
+		// Pull storeIds from the relevant arrays. If you also have "exchangedProductsNoVariable"
+		// or "exchangedProductQtyWithVariables", include them as well.
+		const storeIdsNoVar = (order.productsNoVariable || []).map(
+			(p) => p.storeId
+		);
+		const storeIdsVar = (order.chosenProductQtyWithVariables || []).map(
+			(p) => p.storeId
+		);
+
+		// Combine & de-duplicate
+		const allStoreIds = [...storeIdsNoVar, ...storeIdsVar].filter(Boolean);
+		const distinctStoreIds = [...new Set(allStoreIds)];
+
+		// If no storeIds, we can skip
+		if (distinctStoreIds.length === 0) {
+			console.log("No storeIds found in this order; skipping seller emails.");
+			return;
+		}
+
+		// 6) Lookup each store, populating "belongsTo" to get the user’s name & email
+		//    For example, if your store schema has: belongsTo: { type: ObjectId, ref: 'User' }
+		//    and your User model has fields: { name, email }, do:
+		const storeDocs = await StoreManagement.find({
+			_id: { $in: distinctStoreIds },
+		})
+			.populate("belongsTo", "name email") // Adjust if your user model uses different fields
+			.exec();
+
+		// 7) Send a simple email to each seller
+		for (const storeDoc of storeDocs) {
+			// storeDoc belongsTo: { _id, name, email }, addStoreName, etc.
+			if (!storeDoc?.belongsTo?.email) {
+				// If we can’t find a valid email, skip
+				console.warn(
+					`Warning: storeId=${storeDoc._id} has no belongsTo.email; skipping seller email.`
+				);
+				continue;
+			}
+
+			const sellerEmail = storeDoc.belongsTo.email.trim().toLowerCase();
+			const fullName = storeDoc.belongsTo.name || "Seller";
+			const firstName = fullName.split(" ")[0]; // just the first name
+			const storeName = storeDoc.addStoreName || "Your Store";
+			const htmlContentSeller = await formatSellerEmail(firstName, storeName);
+
+			// A simple text (or minimal HTML) body
+			const sellerTextBody = htmlContentSeller;
+
+			// Construct the email object
+			const sellerEmailObj = {
+				to: sellerEmail,
+				from: fromEmail,
+				subject: `${storeName} - Order Confirmation`,
+				html: sellerTextBody,
+			};
+
+			try {
+				await sgMail.send(sellerEmailObj);
+				console.log(`Seller email sent to ${sellerEmail}`);
+			} catch (err) {
+				console.error(`Error sending seller email to ${sellerEmail}:`, err);
+			}
+		}
 	} catch (error) {
 		console.error("Error sending order confirmation email:", error);
 		if (error.response) {
@@ -1976,6 +2049,19 @@ exports.orderSearch = async (req, res) => {
 	}
 };
 
+const totalExpensesExpression = {
+	$reduce: {
+		input: { $objectToArray: { $ifNull: ["$orderExpenses", {}] } },
+		initialValue: 0,
+		in: { $add: ["$$value", "$$this.v"] },
+	},
+};
+
+// Helper for net = totalAmount - totalExpenses, defaulting totalAmount to 0
+const netTotalExpression = {
+	$subtract: [{ $ifNull: ["$totalAmount", 0] }, totalExpensesExpression],
+};
+
 /**
  * GET /order-report/report/:userId
  * A comprehensive report generator
@@ -2533,8 +2619,6 @@ exports.listOfAggregatedForPaginationSeller = async (req, res) => {
 		? { $match: { $and: matchConditions } }
 		: { $match: {} };
 
-	console.log("listOfAggregatedForPaginationSeller finalMatch =>", finalMatch);
-
 	try {
 		// disable cache => no 304
 		res.set("Cache-Control", "no-store");
@@ -2656,27 +2740,292 @@ exports.orderSearchSeller = async (req, res) => {
 	}
 };
 
-// Helper to sum up all keys in orderExpenses object, defaulting to {} if null
-const totalExpensesExpression = {
-	$reduce: {
-		input: { $objectToArray: { $ifNull: ["$orderExpenses", {}] } },
-		initialValue: 0,
-		in: { $add: ["$$value", "$$this.v"] },
-	},
-};
+/**
+ * Helper: Transforms a single order so that it only contains
+ * the sub-items for this particular seller (storeId),
+ * and recomputes partial shipping, discount, and expenses.
+ */
+function transformOrderForSellerOrderReport(order, storeIdString) {
+	const storeId = storeIdString;
 
-// Helper for net = totalAmount - totalExpenses, defaulting totalAmount to 0
-const netTotalExpression = {
-	$subtract: [{ $ifNull: ["$totalAmount", 0] }, totalExpensesExpression],
-};
+	// 1) Filter out sub-docs that don't belong to this seller
+	const filteredNoVar = (order.productsNoVariable || []).filter(
+		(p) => p.storeId === storeId
+	);
+	const filteredVar = (order.chosenProductQtyWithVariables || []).filter(
+		(p) => p.storeId === storeId
+	);
+	const filteredExNoVar = (order.exchangedProductsNoVariable || []).filter(
+		(p) => p.storeId === storeId
+	);
+	const filteredExVar = (order.exchangedProductQtyWithVariables || []).filter(
+		(p) => p.storeId === storeId
+	);
+
+	// 2) Compute the store’s own subtotal
+	const storeSubtotal = [
+		...filteredNoVar.map((p) => p.price * p.ordered_quantity),
+		...filteredVar.map((p) => p.price * p.orderedQty),
+		...filteredExNoVar.map((p) => p.price * p.ordered_quantity),
+		...filteredExVar.map((p) => p.price * p.orderedQty),
+	].reduce((acc, val) => acc + val, 0);
+
+	// 3) Compute the store’s own quantity
+	const storeQty = [
+		...filteredNoVar.map((p) => p.ordered_quantity),
+		...filteredVar.map((p) => p.orderedQty),
+		...filteredExNoVar.map((p) => p.ordered_quantity),
+		...filteredExVar.map((p) => p.orderedQty),
+	].reduce((acc, val) => acc + val, 0);
+
+	// 4) Entire order’s quantity
+	let entireQty = 0;
+	entireQty += (order.productsNoVariable || []).reduce(
+		(acc, x) => acc + (x.ordered_quantity || 0),
+		0
+	);
+	entireQty += (order.chosenProductQtyWithVariables || []).reduce(
+		(acc, x) => acc + (x.orderedQty || 0),
+		0
+	);
+	entireQty += (order.exchangedProductsNoVariable || []).reduce(
+		(acc, x) => acc + (x.ordered_quantity || 0),
+		0
+	);
+	entireQty += (order.exchangedProductQtyWithVariables || []).reduce(
+		(acc, x) => acc + (x.orderedQty || 0),
+		0
+	);
+
+	// 5) Compute entire discount
+	const shippingFees = order.shippingFees || 0;
+	const fullTotal = order.customerDetails?.totalAmount || 0; // original
+	const fullTotalAfterDiscount =
+		order.customerDetails?.totalAmountAfterDiscount || fullTotal;
+	const entireDiscount = fullTotal - fullTotalAfterDiscount;
+
+	// 6) Compute entire expenses
+	//    Summation of numeric keys in order.orderExpenses, if any
+	const orderExpenses = order.orderExpenses || {}; // object
+	const entireExpenses = Object.values(orderExpenses).reduce(
+		(acc, val) => acc + (val || 0),
+		0
+	);
+
+	// 7) Partial shipping, discount, expenses
+	let partialShipping = 0;
+	let partialDiscount = 0;
+	let partialOrderExpenses = 0;
+	if (entireQty > 0) {
+		partialShipping = shippingFees * (storeQty / entireQty);
+		partialDiscount = entireDiscount * (storeQty / entireQty);
+		partialOrderExpenses = entireExpenses * (storeQty / entireQty);
+	}
+
+	// 8) Store’s partial gross total
+	//    storeSubtotal - partialDiscount + partialShipping
+	const storeGrossTotal = storeSubtotal - partialDiscount + partialShipping;
+
+	// 9) Store’s partial net total = storeGrossTotal - partialOrderExpenses
+	const storeNetTotal = storeGrossTotal - partialOrderExpenses;
+
+	// 10) Build a plain object so we can overwrite fields
+	const newOrder = order.toObject ? order.toObject() : { ...order };
+
+	// Overwrite arrays with filtered arrays
+	newOrder.productsNoVariable = filteredNoVar;
+	newOrder.chosenProductQtyWithVariables = filteredVar;
+	newOrder.exchangedProductsNoVariable = filteredExNoVar;
+	newOrder.exchangedProductQtyWithVariables = filteredExVar;
+
+	// Overwrite shippingFees, totalOrderQty, totalAmount, totalAmountAfterDiscount
+	newOrder.shippingFees = +partialShipping.toFixed(2);
+
+	if (!newOrder.customerDetails) {
+		newOrder.customerDetails = {};
+	}
+	newOrder.customerDetails.totalOrderQty = storeQty;
+	newOrder.customerDetails.totalAmount = +storeGrossTotal.toFixed(2);
+	newOrder.customerDetails.totalAmountAfterDiscount =
+		+storeGrossTotal.toFixed(2);
+
+	newOrder.totalOrderQty = storeQty;
+	newOrder.totalAmount = +storeGrossTotal.toFixed(2);
+	newOrder.totalAmountAfterDiscount = +storeGrossTotal.toFixed(2);
+
+	// 11) Attach a "sellerView" object with important partial fields
+	newOrder.sellerView = {
+		storeQty,
+		storeSubtotal: +storeSubtotal.toFixed(2),
+		partialShipping: +partialShipping.toFixed(2),
+		partialDiscount: +partialDiscount.toFixed(2),
+		partialOrderExpenses: +partialOrderExpenses.toFixed(2),
+		storeGrossTotal: +storeGrossTotal.toFixed(2),
+		storeNetTotal: +storeNetTotal.toFixed(2),
+	};
+
+	return newOrder;
+}
+
+/**
+ * Helper to produce the final aggregated "report" data in memory.
+ * We feed it the array of *already transformed* partial orders.
+ * measureType => "orderCount", "totalQuantity", "grossTotal", or "netTotal"
+ */
+function buildSellerReport(transformedOrders, measureType) {
+	// We'll produce an object that looks like:
+	// {
+	//   dayOverDay: [{ _id: "YYYY-MM-DD", measure: number }, ... ],
+	//   productSummary: [{ _id: productName, orderCount, totalQuantity, grossTotal }, ...],
+	//   stateSummary: [{ _id: stateName, measure }, ...],
+	//   statusSummary: [{ _id: status, measure }, ...],
+	//   scoreboard: [{ _id: null, totalOrders, totalQuantity, grossTotal, totalExpenses, netTotal }],
+	//   orders: [the partial orders themselves],
+	// }
+
+	// 1) dayOverDay => group by date
+	const dayOverDayMap = new Map();
+	// 2) productSummary => group by product name
+	const productMap = new Map();
+	// 3) stateSummary => group by state
+	const stateMap = new Map();
+	// 4) statusSummary => group by status
+	const statusMap = new Map();
+
+	// 5) scoreboard
+	let totalOrders = 0;
+	let totalQuantity = 0;
+	let grossSum = 0;
+	let expensesSum = 0;
+	let netSum = 0;
+
+	/**
+	 * Helper: returns the numeric "measure" from a single partial order
+	 * based on measureType.
+	 */
+	function getMeasure(order) {
+		switch (measureType) {
+			case "totalQuantity":
+				return order.sellerView.storeQty;
+			case "grossTotal":
+				return order.sellerView.storeGrossTotal;
+			case "netTotal":
+				return order.sellerView.storeNetTotal;
+			case "orderCount":
+			default:
+				return 1;
+		}
+	}
+
+	// 6) Iterate each partial order
+	for (const order of transformedOrders) {
+		totalOrders += 1; // always increment total orders by 1
+		totalQuantity += order.sellerView.storeQty;
+		grossSum += order.sellerView.storeGrossTotal;
+		expensesSum += order.sellerView.partialOrderExpenses; // partial expenses
+		netSum += order.sellerView.storeNetTotal;
+
+		// dayOverDay => group by dayString. We'll parse from orderCreationDate or do a separate field
+		const dayString = order.orderCreationDate
+			? new Date(order.orderCreationDate).toISOString().slice(0, 10)
+			: "Unknown-Date";
+		const dayVal = dayOverDayMap.get(dayString) || 0;
+		dayOverDayMap.set(dayString, dayVal + getMeasure(order));
+
+		// stateSummary => group by order.customerDetails.state (case or empty check)
+		const st = (order.customerDetails?.state || "Unknown-State").trim();
+		const stateVal = stateMap.get(st) || 0;
+		stateMap.set(st, stateVal + getMeasure(order));
+
+		// statusSummary => group by order.status
+		const statusKey = order.status || "Unknown-Status";
+		const statusVal = statusMap.get(statusKey) || 0;
+		statusMap.set(statusKey, statusVal + getMeasure(order));
+
+		// productSummary => combine the partial arrays (noVar, var, exNoVar, exVar)
+		// then group by name
+		const combinedProducts = [
+			...(order.productsNoVariable || []),
+			...(order.chosenProductQtyWithVariables || []),
+			...(order.exchangedProductsNoVariable || []),
+			...(order.exchangedProductQtyWithVariables || []),
+		];
+		for (const p of combinedProducts) {
+			const productName = p.name || "Unnamed-Product";
+			let productRec = productMap.get(productName);
+			if (!productRec) {
+				productRec = {
+					_id: productName,
+					orderCount: 0,
+					totalQuantity: 0,
+					grossTotal: 0,
+				};
+			}
+			productRec.orderCount += 1;
+			const qty =
+				p.ordered_quantity != null ? p.ordered_quantity : p.orderedQty;
+			productRec.totalQuantity += qty;
+			productRec.grossTotal += p.price * qty;
+
+			productMap.set(productName, productRec);
+		}
+	}
+
+	// Build the arrays from the maps
+	const dayOverDay = [...dayOverDayMap.entries()]
+		.map(([k, v]) => ({ _id: k, measure: +v }))
+		.sort((a, b) => (a._id < b._id ? -1 : 1));
+
+	const stateSummary = [...stateMap.entries()]
+		.map(([k, v]) => ({ _id: k, measure: +v }))
+		.sort((a, b) => (a._id < b._id ? -1 : 1));
+
+	const statusSummary = [...statusMap.entries()]
+		.map(([k, v]) => ({ _id: k, measure: +v }))
+		.sort((a, b) => (a._id < b._id ? -1 : 1));
+
+	const productSummary = [...productMap.values()];
+
+	// Sort productSummary by grossTotal descending
+	productSummary.sort((a, b) => b.grossTotal - a.grossTotal);
+
+	// scoreboard => same shape as admin
+	const scoreboard = [
+		{
+			_id: null,
+			totalOrders,
+			totalQuantity,
+			grossTotal: +grossSum.toFixed(2),
+			totalExpenses: +expensesSum.toFixed(2),
+			netTotal: +netSum.toFixed(2),
+		},
+	];
+
+	return {
+		dayOverDay,
+		productSummary,
+		stateSummary,
+		statusSummary,
+		scoreboard,
+	};
+}
+
+/**
+ * GET /api/seller/order-report/report/:userId/:storeId?startDate=...&endDate=...&measureType=...
+ *
+ * This function:
+ * 1) Finds all orders that contain sub-items for the given storeId (and date range).
+ * 2) Transforms each order with `transformOrderForSellerOrderReport`.
+ * 3) Builds an aggregated "report" in memory (dayOverDay, scoreboard, productSummary, etc.).
+ * 4) Returns the final structure to the frontend.
+ */
 
 exports.sellerOrderReport = async (req, res) => {
 	try {
-		// Turn off caching => no 304 Not Modified
-		res.set("Cache-Control", "no-store");
+		res.set("Cache-Control", "no-store"); // disable caching
 
-		const { userId, storeId } = req.params;
-		const { startDate, endDate, measureType } = req.query;
+		const { storeId } = req.params;
+		const { startDate, endDate, measureType = "orderCount" } = req.query;
 
 		// 1) Build date range
 		const now = new Date();
@@ -2690,293 +3039,46 @@ exports.sellerOrderReport = async (req, res) => {
 			59
 		);
 
-		// parse or fallback
 		let start = firstOfMonth;
 		let finish = endOfMonth;
 		if (startDate && startDate !== "null") {
 			start = new Date(`${startDate}T00:00:00Z`);
 		}
 		if (endDate && endDate !== "null") {
-			// parse the end date, then add +1 day
 			finish = new Date(`${endDate}T00:00:00Z`);
-			finish.setDate(finish.getDate() + 1); // add 1 day
-			finish.setHours(23, 59, 59, 999); // end of that next day
+			finish.setDate(finish.getDate() + 1); // inclusive
+			finish.setHours(23, 59, 59, 999);
 		}
 
-		// 2) Decide measure (orderCount, totalQuantity, grossTotal, netTotal)
-		let dayOverDayGroup;
-		let stateGroup;
-		let statusGroup;
-
-		switch (measureType) {
-			case "totalQuantity":
-				dayOverDayGroup = { $sum: "$totalOrderQty" };
-				stateGroup = { $sum: "$totalOrderQty" };
-				statusGroup = { $sum: "$totalOrderQty" };
-				break;
-			case "grossTotal":
-				dayOverDayGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
-				stateGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
-				statusGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
-				break;
-			case "netTotal":
-				// net = totalAmount - sum(orderExpenses)
-				dayOverDayGroup = { $sum: netTotalExpression };
-				stateGroup = { $sum: netTotalExpression };
-				statusGroup = { $sum: netTotalExpression };
-				break;
-			case "orderCount":
-			default:
-				dayOverDayGroup = { $sum: 1 };
-				stateGroup = { $sum: 1 };
-				statusGroup = { $sum: 1 };
-				break;
-		}
-
-		// 3) Build $match
-		// If storeId is a string in your DB, do exact string match
-		const matchStage = {
-			$match: {
-				orderCreationDate: { $gte: start, $lte: finish },
-				$or: [
-					{ "productsNoVariable.storeId": storeId },
-					{ "chosenProductQtyWithVariables.storeId": storeId },
-				],
-			},
+		// 2) Query for all Orders that have sub-items for this seller,
+		//    within the date range
+		const match = {
+			orderCreationDate: { $gte: start, $lte: finish },
+			$or: [
+				{ "productsNoVariable.storeId": storeId },
+				{ "chosenProductQtyWithVariables.storeId": storeId },
+				{ "exchangedProductsNoVariable.storeId": storeId },
+				{ "exchangedProductQtyWithVariables.storeId": storeId },
+			],
 		};
 
-		// 4) Build aggregator sub-stages for dayOverDay, productSummary, scoreboard, etc.
+		// 3) Fetch from DB (no pagination here; if needed, you can add an approach)
+		const orders = await Order.find(match).sort({ orderCreationDate: -1 });
 
-		const dayOverDayStage = [
-			{
-				$group: {
-					_id: {
-						$dateToString: {
-							format: "%Y-%m-%d",
-							date: "$orderCreationDate",
-						},
-					},
-					measure: dayOverDayGroup,
-				},
-			},
-			{ $sort: { _id: 1 } },
-		];
-
-		// productSummaryNoVar
-		const productSummaryNoVarStage = [
-			{ $unwind: "$productsNoVariable" },
-			{
-				$group: {
-					_id: "$productsNoVariable.name",
-					orderCount: { $sum: 1 },
-					totalQuantity: { $sum: "$productsNoVariable.ordered_quantity" },
-					grossTotal: {
-						$sum: {
-							$multiply: [
-								"$productsNoVariable.ordered_quantity",
-								"$productsNoVariable.price",
-							],
-						},
-					},
-					netTotal: {
-						$sum: {
-							$multiply: [
-								"$productsNoVariable.ordered_quantity",
-								"$productsNoVariable.price",
-							],
-						},
-					},
-				},
-			},
-		];
-
-		// productSummaryVar
-		const productSummaryVarStage = [
-			{ $unwind: "$chosenProductQtyWithVariables" },
-			{
-				$group: {
-					_id: "$chosenProductQtyWithVariables.name",
-					orderCount: { $sum: 1 },
-					totalQuantity: { $sum: "$chosenProductQtyWithVariables.orderedQty" },
-					grossTotal: {
-						$sum: {
-							$multiply: [
-								"$chosenProductQtyWithVariables.orderedQty",
-								"$chosenProductQtyWithVariables.price",
-							],
-						},
-					},
-					netTotal: {
-						$sum: {
-							$multiply: [
-								"$chosenProductQtyWithVariables.orderedQty",
-								"$chosenProductQtyWithVariables.price",
-							],
-						},
-					},
-				},
-			},
-		];
-
-		// productSummaryExchangeNoVar
-		const productSummaryExchangeNoVarStage = [
-			{ $unwind: "$exchangedProductsNoVariable" },
-			{
-				$group: {
-					_id: "$exchangedProductsNoVariable.name",
-					orderCount: { $sum: 1 },
-					totalQuantity: {
-						$sum: "$exchangedProductsNoVariable.ordered_quantity",
-					},
-					grossTotal: {
-						$sum: {
-							$multiply: [
-								"$exchangedProductsNoVariable.ordered_quantity",
-								"$exchangedProductsNoVariable.price",
-							],
-						},
-					},
-					netTotal: {
-						$sum: {
-							$multiply: [
-								"$exchangedProductsNoVariable.ordered_quantity",
-								"$exchangedProductsNoVariable.price",
-							],
-						},
-					},
-				},
-			},
-		];
-
-		// productSummaryExchangeVar
-		const productSummaryExchangeVarStage = [
-			{ $unwind: "$exchangedProductQtyWithVariables" },
-			{
-				$group: {
-					_id: "$exchangedProductQtyWithVariables.name",
-					orderCount: { $sum: 1 },
-					totalQuantity: {
-						$sum: "$exchangedProductQtyWithVariables.orderedQty",
-					},
-					grossTotal: {
-						$sum: {
-							$multiply: [
-								"$exchangedProductQtyWithVariables.orderedQty",
-								"$exchangedProductQtyWithVariables.price",
-							],
-						},
-					},
-					netTotal: {
-						$sum: {
-							$multiply: [
-								"$exchangedProductQtyWithVariables.orderedQty",
-								"$exchangedProductQtyWithVariables.price",
-							],
-						},
-					},
-				},
-			},
-		];
-
-		// scoreboard => sums totalOrders => 1, totalQuantity => $totalOrderQty, grossTotal => $totalAmount, netTotal => $totalAmount minus orderExpenses
-		const scoreboardStage = [
-			{
-				$group: {
-					_id: null,
-					totalOrders: { $sum: 1 },
-					totalQuantity: { $sum: "$totalOrderQty" },
-					grossTotal: { $sum: { $ifNull: ["$totalAmount", 0] } },
-					totalExpenses: { $sum: totalExpensesExpression },
-					netTotal: { $sum: netTotalExpression },
-				},
-			},
-		];
-
-		// stateSummary => group by state
-		const stateSummaryStage = [
-			{
-				$group: {
-					_id: "$customerDetails.state",
-					measure: stateGroup,
-				},
-			},
-		];
-
-		// statusSummary => group by status
-		const statusSummaryStage = [
-			{
-				$group: {
-					_id: "$status",
-					measure: statusGroup,
-				},
-			},
-		];
-
-		// 5) We'll also want the raw "orders" so we can transform sub-docs after aggregator
-		const ordersFacetStage = [
-			{ $sort: { orderCreationDate: -1 } },
-			// e.g. if you want to limit or skip
-			// { $limit: 200 },
-		];
-
-		// 6) Combine into one big pipeline
-		const aggregatePipeline = [
-			matchStage,
-			{
-				$facet: {
-					dayOverDay: dayOverDayStage,
-					productSummaryNoVar: productSummaryNoVarStage,
-					productSummaryVar: productSummaryVarStage,
-					productSummaryExchangeNoVar: productSummaryExchangeNoVarStage,
-					productSummaryExchangeVar: productSummaryExchangeVarStage,
-					stateSummary: stateSummaryStage,
-					statusSummary: statusSummaryStage,
-					scoreboard: scoreboardStage,
-
-					// The raw matched orders
-					orders: ordersFacetStage,
-				},
-			},
-			{
-				$project: {
-					dayOverDay: 1,
-					stateSummary: 1,
-					statusSummary: 1,
-					scoreboard: 1,
-					productSummary: {
-						$concatArrays: [
-							"$productSummaryNoVar",
-							"$productSummaryVar",
-							"$productSummaryExchangeNoVar",
-							"$productSummaryExchangeVar",
-						],
-					},
-					orders: 1,
-				},
-			},
-		];
-
-		// 7) Execute aggregator
-		const results = await Order.aggregate(aggregatePipeline);
-		if (!results.length) {
-			return res.json({ success: true, data: {} });
-		}
-
-		const finalData = results[0];
-
-		// 8) Sort productSummary by grossTotal desc
-		if (finalData.productSummary?.length) {
-			finalData.productSummary.sort((a, b) => b.grossTotal - a.grossTotal);
-		}
-
-		// 9) Transform raw orders => sub-docs only for "storeId"
-		const rawOrders = finalData.orders;
-		const transformedOrders = rawOrders.map((doc) =>
-			transformOrderForSeller(doc, storeId)
+		// 4) Transform each to partial
+		const transformedOrders = orders.map((ord) =>
+			transformOrderForSellerOrderReport(ord, storeId)
 		);
-		finalData.orders = transformedOrders;
 
-		// 10) Return
+		// 5) Build the in-memory aggregator result
+		const aggregated = buildSellerReport(transformedOrders, measureType);
+
+		// 6) Return the final structure, including the raw "orders"
+		const finalData = {
+			...aggregated,
+			orders: transformedOrders,
+		};
+
 		return res.json({ success: true, data: finalData });
 	} catch (error) {
 		console.error("Error in sellerOrderReport:", error);
@@ -3042,7 +3144,7 @@ exports.getDetailedOrdersForSeller = async (req, res) => {
 
 		// Transform each one
 		const transformed = orders.map((ord) =>
-			transformOrderForSeller(ord, storeId)
+			transformOrderForSellerOrderReport(ord, storeId)
 		);
 
 		return res.json({
@@ -3055,6 +3157,79 @@ exports.getDetailedOrdersForSeller = async (req, res) => {
 			success: false,
 			message: "Failed to get filtered orders",
 			error: error.message,
+		});
+	}
+};
+
+exports.getStoreIdsInAGivenOrder = async (req, res) => {
+	try {
+		const { orderId } = req.params;
+
+		// 1) Find the order
+		const order = await Order.findById(orderId).exec();
+		if (!order) {
+			return res.status(404).json({ message: "Order not found." });
+		}
+
+		// 2) Gather all storeId strings from each array
+		const storeIdsNoVar = (order.productsNoVariable || []).map(
+			(p) => p.storeId
+		);
+		const storeIdsVar = (order.chosenProductQtyWithVariables || []).map(
+			(p) => p.storeId
+		);
+		const storeIdsExNoVar = (order.exchangedProductsNoVariable || []).map(
+			(p) => p.storeId
+		);
+		const storeIdsExVar = (order.exchangedProductQtyWithVariables || []).map(
+			(p) => p.storeId
+		);
+
+		// Combine them into one array
+		const allStoreIds = [
+			...storeIdsNoVar,
+			...storeIdsVar,
+			...storeIdsExNoVar,
+			...storeIdsExVar,
+		].filter(Boolean); // remove null/undefined if any
+
+		// 3) Get distinct set of storeIds (still strings)
+		const distinctStoreIds = [...new Set(allStoreIds)];
+
+		if (distinctStoreIds.length === 0) {
+			// No storeIds found
+			return res.json({ storeIdsForTheOrder: [] });
+		}
+
+		// 4) Cast each storeId string to ObjectId
+		//    (assuming your StoreManagement._id is an ObjectId)
+		//    If your StoreManagement._id is a string, skip this casting step.
+		const objectIds = distinctStoreIds
+			.map((sid) => {
+				try {
+					return sid;
+				} catch (err) {
+					// In case any storeId is not a valid ObjectId
+					return null;
+				}
+			})
+			.filter(Boolean);
+
+		// 5) Look up corresponding stores from StoreManagement
+		//    Only select _id and addStoreName
+		const stores = await StoreManagement.find(
+			{ _id: { $in: objectIds } },
+			{ _id: 1, addStoreName: 1 }
+		).exec();
+
+		// 6) Respond
+		return res.json({
+			storeIdsForTheOrder: stores, // each store doc with { _id, addStoreName }
+		});
+	} catch (error) {
+		console.error("Error in getStoreIdsInAGivenOrder:", error);
+		return res.status(500).json({
+			message: "Server error. Please try again later.",
 		});
 	}
 };

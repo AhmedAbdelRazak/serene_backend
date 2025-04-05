@@ -27,6 +27,7 @@ const {
 	getDetailedOrdersForSeller,
 	listOfAggregatedForPaginationSeller,
 	orderSearchSeller,
+	getStoreIdsInAGivenOrder,
 } = require("../controllers/order");
 
 router.post("/order/creation/:userId", requireSignin, isAuth, create);
@@ -102,6 +103,13 @@ router.get(
 	requireSignin,
 	isSeller,
 	getDetailedOrdersForSeller
+);
+
+router.get(
+	"/get-storeids-connected-to-an-order/:orderId/:userId",
+	requireSignin,
+	isSeller,
+	getStoreIdsInAGivenOrder
 );
 
 router.get("/orders/check-invoice/for-chat", checkInvoiceNumber);

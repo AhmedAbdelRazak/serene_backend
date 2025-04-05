@@ -1,12 +1,11 @@
 const moment = require("moment-timezone");
 
 function newSupportCaseEmail(supportCase, hotelName) {
-	// Convert creation date to Indian time (Asia/Kolkata)
-	const createdAtIndia = supportCase.createdAt
+	const createdAtPST = supportCase.createdAt
 		? moment(supportCase.createdAt)
-				.tz("Asia/Kolkata")
+				.tz("America/Los_Angeles")
 				.format("dddd, MMMM Do YYYY, h:mm A")
-		: moment().tz("Asia/Kolkata").format("dddd, MMMM Do YYYY, h:mm A");
+		: moment().tz("America/Los_Angeles").format("dddd, MMMM Do YYYY, h:mm A");
 
 	// Extract first conversation entry for top-level inquiry details
 	const firstMessage = supportCase?.conversation?.[0] || {};
@@ -185,7 +184,7 @@ function newSupportCaseEmail(supportCase, hotelName) {
             </tr>
             <tr>
               <th>Created At (IST)</th>
-              <td>${createdAtIndia}</td>
+              <td>${createdAtPST}</td>
             </tr>
             <tr>
               <th>Opened By</th>
@@ -234,99 +233,176 @@ function newSupportCaseEmail(supportCase, hotelName) {
   `;
 }
 
-function transformOrderForSeller(order, storeIdString) {
-	// Convert storeIdString to actual string in case we have an ObjectId
-	const storeId = storeIdString.toString();
+const buildSellerHtmlBody = (firstName, storeName) => {
+	return `
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="UTF-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+        <title>New Order Notification</title>
+        <style>
+          /* --------------------------------- */
+          /* Root Variables & Responsive Styling */
+          /* --------------------------------- */
+          :root {
+            --primaryBlue: #1f3a52;
+            --primaryBlueDarker: #17293b;
+            --orangeDark: #6f2d00;
+            --orangeLight: #ffe4cc;
+            --mainGrey: #f8f8f8;
+            --darkGrey: #5a5a5a;
+            --mainWhite: #ffffff;
+            --mainBlack: #222222;
+            --border-color-light: #e0e0e0;
+            --box-shadow-light: 0 2px 4px rgba(0, 0, 0, 0.1);
+            --button-bg-primary: var(--primaryBlue);
+            --button-font-color: var(--mainWhite);
 
-	// Filter arrays
-	const filteredNoVar = (order.productsNoVariable || []).filter(
-		(p) => p.storeId?.toString() === storeId
-	);
-	const filteredVar = (order.chosenProductQtyWithVariables || []).filter(
-		(p) => p.storeId?.toString() === storeId
-	);
-	const filteredExNoVar = (order.exchangedProductsNoVariable || []).filter(
-		(p) => p.storeId?.toString() === storeId
-	);
-	const filteredExVar = (order.exchangedProductQtyWithVariables || []).filter(
-		(p) => p.storeId?.toString() === storeId
-	);
+            --primary-color: var(--primaryBlue);
+            --primary-color-dark: var(--primaryBlueDarker);
+            --neutral-light: var(--mainGrey);
+            --neutral-dark: var(--darkGrey);
 
-	// Compute store sub-total (just sum price * quantity)
-	const storeSubtotal = [
-		...filteredNoVar.map((p) => p.price * p.ordered_quantity),
-		...filteredVar.map((p) => p.price * p.orderedQty),
-		...filteredExNoVar.map((p) => p.price * p.ordered_quantity),
-		...filteredExVar.map((p) => p.price * p.orderedQty),
-	].reduce((a, b) => a + b, 0);
+            --main-transition: all 0.3s ease-in-out;
+            --main-spacing: 0.3rem;
+          }
 
-	// Compute storeQty
-	const storeQty = [
-		...filteredNoVar.map((p) => p.ordered_quantity),
-		...filteredVar.map((p) => p.orderedQty),
-		...filteredExNoVar.map((p) => p.ordered_quantity),
-		...filteredExVar.map((p) => p.orderedQty),
-	].reduce((a, b) => a + b, 0);
+          body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--neutral-light);
+            color: var(--mainBlack);
+          }
 
-	// Entire order quantity:
-	let entireQty = 0;
-	entireQty += (order.productsNoVariable || []).reduce(
-		(acc, x) => acc + (x.ordered_quantity || 0),
-		0
-	);
-	entireQty += (order.chosenProductQtyWithVariables || []).reduce(
-		(acc, x) => acc + (x.orderedQty || 0),
-		0
-	);
-	entireQty += (order.exchangedProductsNoVariable || []).reduce(
-		(acc, x) => acc + (x.ordered_quantity || 0),
-		0
-	);
-	entireQty += (order.exchangedProductQtyWithVariables || []).reduce(
-		(acc, x) => acc + (x.orderedQty || 0),
-		0
-	);
+          .container {
+            background-color: var(--mainWhite);
+            max-width: 700px;
+            margin: 30px auto;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: var(--box-shadow-light);
+          }
 
-	const shippingFees = order.shippingFees || 0;
-	const totalAmount = order.customerDetails?.totalAmount || 0;
-	const totalAmountAfterDiscount =
-		order.customerDetails?.totalAmountAfterDiscount || totalAmount;
-	const entireDiscount = totalAmount - totalAmountAfterDiscount;
+          .header {
+            background-color: var(--primaryBlueDarker);
+            color: var(--mainWhite);
+            text-align: center;
+            padding: 20px;
+            border-radius: 8px 8px 0 0;
+          }
 
-	// Partial shipping & discount
-	let partialShipping = 0;
-	let partialDiscount = 0;
-	if (entireQty > 0) {
-		partialShipping = shippingFees * (storeQty / entireQty);
-		partialDiscount = entireDiscount * (storeQty / entireQty);
-	}
+          .header h1 {
+            margin: 0;
+            font-size: 1.8rem;
+          }
 
-	// final partial net
-	const storeTotalAfterDiscount =
-		storeSubtotal - partialDiscount + partialShipping;
+          .content {
+            padding: 20px;
+            line-height: 1.6;
+          }
 
-	// Build a new plain object so we can override arrays
-	const obj = order.toObject ? order.toObject() : { ...order };
-	return {
-		...obj,
-		productsNoVariable: filteredNoVar,
-		chosenProductQtyWithVariables: filteredVar,
-		exchangedProductsNoVariable: filteredExNoVar,
-		exchangedProductQtyWithVariables: filteredExVar,
-		sellerView: {
-			storeQty,
-			storeSubtotal: +storeSubtotal.toFixed(2),
-			partialShipping: +partialShipping.toFixed(2),
-			partialDiscount: +partialDiscount.toFixed(2),
-			storeTotalAfterDiscount: +storeTotalAfterDiscount.toFixed(2),
-		},
-	};
-}
+          .content p {
+            margin-bottom: 1em;
+          }
+
+          .button-container {
+            text-align: center;
+            margin: 25px 0;
+          }
+
+          .button {
+            font-size: 1.1rem;
+            background: var(--primaryBlue);
+            color: var(--button-font-color);
+            text-decoration: none;
+            padding: 10px 25px;
+            border-radius: 6px;
+            font-weight: bold;
+            border: none;
+            transition: background 0.3s ease-in-out;
+            display: inline-block;
+          }
+
+          .button:hover {
+            background: #2a5070; /* slightly lighter shade of primaryBlue */
+          }
+
+          .footer {
+            background-color: var(--primaryBlueDarker);
+            color: var(--mainWhite);
+            text-align: center;
+            padding: 15px;
+            font-size: 0.9rem;
+            border-radius: 0 0 8px 8px;
+          }
+
+          .footer a {
+            color: var(--orangeLight);
+            text-decoration: none;
+            font-weight: bold;
+          }
+          .footer a:hover {
+            text-decoration: underline;
+          }
+
+          @media (max-width: 600px) {
+            .header h1 {
+              font-size: 1.4rem;
+            }
+            .button {
+              font-size: 1rem;
+              padding: 10px 20px;
+            }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <!-- Header -->
+          <div class="header">
+            <h1>New Order Notification</h1>
+          </div>
+
+          <!-- Content -->
+          <div class="content">
+            <p>Hi ${firstName},</p>
+            <p>There's a new order containing items from <strong>${storeName}</strong>.</p>
+            <p>Please log in to your Serene Jannat seller dashboard for more details.</p>
+
+            <div class="button-container">
+              <a
+                href="https://serenejannat.com/seller/dashboard"
+                class="button"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                View Orders
+              </a>
+            </div>
+
+            <p>Best Regards,<br/>
+            Serene Jannat Team</p>
+          </div>
+
+          <!-- Footer -->
+          <div class="footer">
+            <p>
+              &copy; ${new Date().getFullYear()} Serene Jannat.
+              Need help? <a href="https://serenejannat.com/contact">Contact us</a>
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+};
 
 /**
  * Exports
  */
 module.exports = {
 	newSupportCaseEmail,
-	transformOrderForSeller,
+	buildSellerHtmlBody,
 };
