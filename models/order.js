@@ -82,12 +82,6 @@ const OrderSchema = new mongoose.Schema(
 			type: Object,
 			default: {},
 		},
-
-		store: {
-			type: ObjectId,
-			ref: "StoreManagement",
-			default: "67ef147140130b857c44ba75",
-		},
 	},
 	{ timestamps: true }
 );

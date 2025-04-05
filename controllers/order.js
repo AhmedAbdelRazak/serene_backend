@@ -26,7 +26,7 @@ const orderStatusSMS = require("twilio")(
 
 // ==================== SQUARE SETUP ======================
 const squareClient = new Client({
-	environment: Environment.Production, // for sandbox 'cnon:...' token
+	environment: Environment.Sandbox, // for sandbox 'cnon:...' token Production
 	accessToken: process.env.SQUARE_ACCESS_TOKEN_TEST,
 });
 
@@ -1976,20 +1976,6 @@ exports.orderSearch = async (req, res) => {
 	}
 };
 
-// Helper to sum up all keys in orderExpenses object, defaulting to {} if null
-const totalExpensesExpression = {
-	$reduce: {
-		input: { $objectToArray: { $ifNull: ["$orderExpenses", {}] } },
-		initialValue: 0,
-		in: { $add: ["$$value", "$$this.v"] },
-	},
-};
-
-// Helper for net = totalAmount - totalExpenses, defaulting totalAmount to 0
-const netTotalExpression = {
-	$subtract: [{ $ifNull: ["$totalAmount", 0] }, totalExpensesExpression],
-};
-
 /**
  * GET /order-report/report/:userId
  * A comprehensive report generator
@@ -2363,6 +2349,712 @@ exports.checkInvoiceNumber = async (req, res) => {
 		console.error("Error in checkInvoiceNumber:", error);
 		res.status(500).json({
 			error: "Server error occurred while checking invoice number.",
+		});
+	}
+};
+
+// Example inline transform helper:
+function transformOrderForSeller(order, storeIdString) {
+	// If your DB stores storeId as a string, just compare strings
+	const storeId = storeIdString;
+
+	// 1) Filter out sub-docs that don't belong to this seller
+	const filteredNoVar = (order.productsNoVariable || []).filter(
+		(p) => p.storeId === storeId
+	);
+	const filteredVar = (order.chosenProductQtyWithVariables || []).filter(
+		(p) => p.storeId === storeId
+	);
+	const filteredExNoVar = (order.exchangedProductsNoVariable || []).filter(
+		(p) => p.storeId === storeId
+	);
+	const filteredExVar = (order.exchangedProductQtyWithVariables || []).filter(
+		(p) => p.storeId === storeId
+	);
+
+	// 2) Compute the store’s own subtotal
+	const storeSubtotal = [
+		...filteredNoVar.map((p) => p.price * p.ordered_quantity),
+		...filteredVar.map((p) => p.price * p.orderedQty),
+		...filteredExNoVar.map((p) => p.price * p.ordered_quantity),
+		...filteredExVar.map((p) => p.price * p.orderedQty),
+	].reduce((acc, val) => acc + val, 0);
+
+	// 3) Compute the store’s own quantity
+	const storeQty = [
+		...filteredNoVar.map((p) => p.ordered_quantity),
+		...filteredVar.map((p) => p.orderedQty),
+		...filteredExNoVar.map((p) => p.ordered_quantity),
+		...filteredExVar.map((p) => p.orderedQty),
+	].reduce((acc, val) => acc + val, 0);
+
+	// 4) Entire order’s quantity
+	let entireQty = 0;
+	entireQty += (order.productsNoVariable || []).reduce(
+		(acc, x) => acc + (x.ordered_quantity || 0),
+		0
+	);
+	entireQty += (order.chosenProductQtyWithVariables || []).reduce(
+		(acc, x) => acc + (x.orderedQty || 0),
+		0
+	);
+	entireQty += (order.exchangedProductsNoVariable || []).reduce(
+		(acc, x) => acc + (x.ordered_quantity || 0),
+		0
+	);
+	entireQty += (order.exchangedProductQtyWithVariables || []).reduce(
+		(acc, x) => acc + (x.orderedQty || 0),
+		0
+	);
+
+	// 5) Partial shipping & discount
+	const shippingFees = order.shippingFees || 0;
+
+	// totalAmount in the *original* order
+	const fullTotal = order.customerDetails?.totalAmount || 0;
+	// totalAmountAfterDiscount in the original order
+	const fullTotalAfterDiscount =
+		order.customerDetails?.totalAmountAfterDiscount || fullTotal;
+
+	const entireDiscount = fullTotal - fullTotalAfterDiscount;
+
+	let partialShipping = 0;
+	let partialDiscount = 0;
+	if (entireQty > 0) {
+		partialShipping = shippingFees * (storeQty / entireQty);
+		partialDiscount = entireDiscount * (storeQty / entireQty);
+	}
+
+	// 6) The store’s partial total
+	const storeTotalAfterDiscount =
+		storeSubtotal - partialDiscount + partialShipping;
+
+	// 7) Build a plain object so we can overwrite fields
+	const newOrder = order.toObject ? order.toObject() : { ...order };
+
+	// 8) Overwrite arrays with filtered arrays
+	newOrder.productsNoVariable = filteredNoVar;
+	newOrder.chosenProductQtyWithVariables = filteredVar;
+	newOrder.exchangedProductsNoVariable = filteredExNoVar;
+	newOrder.exchangedProductQtyWithVariables = filteredExVar;
+
+	// 9) Overwrite shippingFees, totalOrderQty, totalAmount, totalAmountAfterDiscount
+	// so the seller sees partial amounts
+	newOrder.shippingFees = +partialShipping.toFixed(2);
+
+	// If you keep `customerDetails` for address info, let's override some fields inside it:
+	if (!newOrder.customerDetails) {
+		newOrder.customerDetails = {};
+	}
+	newOrder.customerDetails.totalOrderQty = storeQty;
+	newOrder.customerDetails.totalAmount = +storeTotalAfterDiscount.toFixed(2);
+	newOrder.customerDetails.totalAmountAfterDiscount =
+		+storeTotalAfterDiscount.toFixed(2);
+	// or if you keep any other references to totalOrderQty, set them too
+	newOrder.totalOrderQty = storeQty; // if you have it at top-level
+	newOrder.totalAmount = +storeTotalAfterDiscount.toFixed(2);
+	newOrder.totalAmountAfterDiscount = +storeTotalAfterDiscount.toFixed(2);
+
+	// 10) Attach a "sellerView" object if you want
+	newOrder.sellerView = {
+		storeQty,
+		storeSubtotal: +storeSubtotal.toFixed(2),
+		partialShipping: +partialShipping.toFixed(2),
+		partialDiscount: +partialDiscount.toFixed(2),
+		storeTotalAfterDiscount: +storeTotalAfterDiscount.toFixed(2),
+	};
+
+	return newOrder;
+}
+
+exports.listOfAggregatedForPaginationSeller = async (req, res) => {
+	const {
+		page = 1,
+		records = 50,
+		startDate,
+		endDate,
+		status = "all",
+		storeId,
+	} = req.params;
+
+	const pageNum = parseInt(page, 10) || 1;
+	const recordsNum = parseInt(records, 10) || 50;
+
+	// storeFilter is a string if your sub-docs store string storeId
+	const storeFilter = storeId;
+
+	const matchConditions = [];
+
+	// 1) Status filter:
+	if (status === "open") {
+		// purely filter by open statuses => no date range
+		matchConditions.push({
+			status: { $nin: ["Shipped", "Delivered", "Cancelled", "fulfilled"] },
+		});
+	} else if (status === "closed") {
+		// closed statuses
+		matchConditions.push({
+			status: { $in: ["Shipped", "Delivered", "Cancelled", "fulfilled"] },
+		});
+		// Optionally handle date if not "null"
+		if (startDate && endDate && startDate !== "null" && endDate !== "null") {
+			const start = new Date(`${startDate}T00:00:00Z`);
+			const finish = new Date(`${endDate}T00:00:00Z`);
+			finish.setDate(finish.getDate() + 1);
+			finish.setHours(23, 59, 59, 999);
+			matchConditions.push({
+				orderCreationDate: { $gte: start, $lte: finish },
+			});
+		}
+	} else {
+		// status="all" => use extended date range if provided
+		if (startDate && endDate && startDate !== "null" && endDate !== "null") {
+			const start = new Date(`${startDate}T00:00:00Z`);
+			const finish = new Date(`${endDate}T00:00:00Z`);
+			finish.setDate(finish.getDate() + 1);
+			finish.setHours(23, 59, 59, 999);
+
+			matchConditions.push({
+				orderCreationDate: { $gte: start, $lte: finish },
+			});
+		}
+	}
+
+	// 2) Must match storeId
+	matchConditions.push({
+		$or: [
+			{ "productsNoVariable.storeId": storeFilter },
+			{ "chosenProductQtyWithVariables.storeId": storeFilter },
+		],
+	});
+
+	// 3) final $match
+	const finalMatch = matchConditions.length
+		? { $match: { $and: matchConditions } }
+		: { $match: {} };
+
+	console.log("listOfAggregatedForPaginationSeller finalMatch =>", finalMatch);
+
+	try {
+		// disable cache => no 304
+		res.set("Cache-Control", "no-store");
+
+		const pipeline = [
+			finalMatch,
+			{
+				$facet: {
+					totalRecords: [{ $count: "count" }],
+					orders: [
+						{ $sort: { orderCreationDate: -1 } },
+						{ $skip: (pageNum - 1) * recordsNum },
+						{ $limit: recordsNum },
+						// If you do $lookup, etc., do it here
+					],
+				},
+			},
+			{
+				$project: {
+					totalRecords: { $arrayElemAt: ["$totalRecords.count", 0] },
+					orders: 1,
+				},
+			},
+		];
+
+		// 4) Aggregate
+		const result = await Order.aggregate(pipeline);
+		const totalRecords = result[0]?.totalRecords || 0;
+		const orders = result[0]?.orders || [];
+
+		// 5) Transform each order so partial shipping, partial discount, partial quantity
+		const transformedOrders = orders.map((ord) =>
+			transformOrderForSeller(ord, storeId)
+		);
+
+		// 6) Return final
+		return res.json({
+			page: pageNum,
+			records: recordsNum,
+			totalRecords,
+			totalPages: Math.ceil(totalRecords / recordsNum),
+			orders: transformedOrders,
+		});
+	} catch (error) {
+		console.error("Error fetching user orders:", error);
+		return res.status(500).json({
+			message: "Server error. Please try again later.",
+		});
+	}
+};
+
+exports.orderSearchSeller = async (req, res) => {
+	try {
+		// Disable caching => always fetch fresh data
+		res.set("Cache-Control", "no-store");
+
+		const { orderquery, storeId } = req.params;
+		if (!orderquery) {
+			return res.status(400).json({ message: "No search query provided." });
+		}
+
+		const storeFilter = storeId;
+		// Build case-insensitive regex for your search fields
+		const regex = new RegExp(orderquery, "i");
+
+		// Only match if the storeId is in productsNoVariable or chosenProductQtyWithVariables
+		// Then also match the text fields (customerDetails, payment, etc.)
+		const orders = await Order.find({
+			$and: [
+				{
+					$or: [
+						{ "productsNoVariable.storeId": storeFilter },
+						{ "chosenProductQtyWithVariables.storeId": storeFilter },
+					],
+				},
+				{
+					$or: [
+						{ "customerDetails.name": { $regex: regex } },
+						{ "customerDetails.email": { $regex: regex } },
+						{ "customerDetails.phone": { $regex: regex } },
+						{ "customerDetails.address": { $regex: regex } },
+						{ "customerDetails.state": { $regex: regex } },
+						{ "customerDetails.zipcode": { $regex: regex } },
+						{ trackingNumber: { $regex: regex } },
+						{ invoiceNumber: { $regex: regex } },
+						{ "paymentDetails.payment.id": { $regex: regex } },
+						{ "paymentDetails.payment.status": { $regex: regex } },
+						{
+							"paymentDetails.payment.cardDetails.receiptNumber": {
+								$regex: regex,
+							},
+						},
+						{
+							"paymentDetails.payment.cardDetails.receiptUrl": {
+								$regex: regex,
+							},
+						},
+					],
+				},
+			],
+		}).sort({ orderCreationDate: -1 });
+
+		if (!orders.length) {
+			return res
+				.status(404)
+				.json({ message: "No orders found matching the query." });
+		}
+
+		// Transform each one
+		const transformed = orders.map((ord) =>
+			transformOrderForSeller(ord, storeId)
+		);
+		return res.json(transformed);
+	} catch (error) {
+		console.error("Error searching for orders:", error);
+		return res
+			.status(500)
+			.json({ message: "Server error. Please try again later." });
+	}
+};
+
+// Helper to sum up all keys in orderExpenses object, defaulting to {} if null
+const totalExpensesExpression = {
+	$reduce: {
+		input: { $objectToArray: { $ifNull: ["$orderExpenses", {}] } },
+		initialValue: 0,
+		in: { $add: ["$$value", "$$this.v"] },
+	},
+};
+
+// Helper for net = totalAmount - totalExpenses, defaulting totalAmount to 0
+const netTotalExpression = {
+	$subtract: [{ $ifNull: ["$totalAmount", 0] }, totalExpensesExpression],
+};
+
+exports.sellerOrderReport = async (req, res) => {
+	try {
+		// Turn off caching => no 304 Not Modified
+		res.set("Cache-Control", "no-store");
+
+		const { userId, storeId } = req.params;
+		const { startDate, endDate, measureType } = req.query;
+
+		// 1) Build date range
+		const now = new Date();
+		const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+		const endOfMonth = new Date(
+			now.getFullYear(),
+			now.getMonth() + 1,
+			0,
+			23,
+			59,
+			59
+		);
+
+		// parse or fallback
+		let start = firstOfMonth;
+		let finish = endOfMonth;
+		if (startDate && startDate !== "null") {
+			start = new Date(`${startDate}T00:00:00Z`);
+		}
+		if (endDate && endDate !== "null") {
+			// parse the end date, then add +1 day
+			finish = new Date(`${endDate}T00:00:00Z`);
+			finish.setDate(finish.getDate() + 1); // add 1 day
+			finish.setHours(23, 59, 59, 999); // end of that next day
+		}
+
+		// 2) Decide measure (orderCount, totalQuantity, grossTotal, netTotal)
+		let dayOverDayGroup;
+		let stateGroup;
+		let statusGroup;
+
+		switch (measureType) {
+			case "totalQuantity":
+				dayOverDayGroup = { $sum: "$totalOrderQty" };
+				stateGroup = { $sum: "$totalOrderQty" };
+				statusGroup = { $sum: "$totalOrderQty" };
+				break;
+			case "grossTotal":
+				dayOverDayGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
+				stateGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
+				statusGroup = { $sum: { $ifNull: ["$totalAmount", 0] } };
+				break;
+			case "netTotal":
+				// net = totalAmount - sum(orderExpenses)
+				dayOverDayGroup = { $sum: netTotalExpression };
+				stateGroup = { $sum: netTotalExpression };
+				statusGroup = { $sum: netTotalExpression };
+				break;
+			case "orderCount":
+			default:
+				dayOverDayGroup = { $sum: 1 };
+				stateGroup = { $sum: 1 };
+				statusGroup = { $sum: 1 };
+				break;
+		}
+
+		// 3) Build $match
+		// If storeId is a string in your DB, do exact string match
+		const matchStage = {
+			$match: {
+				orderCreationDate: { $gte: start, $lte: finish },
+				$or: [
+					{ "productsNoVariable.storeId": storeId },
+					{ "chosenProductQtyWithVariables.storeId": storeId },
+				],
+			},
+		};
+
+		// 4) Build aggregator sub-stages for dayOverDay, productSummary, scoreboard, etc.
+
+		const dayOverDayStage = [
+			{
+				$group: {
+					_id: {
+						$dateToString: {
+							format: "%Y-%m-%d",
+							date: "$orderCreationDate",
+						},
+					},
+					measure: dayOverDayGroup,
+				},
+			},
+			{ $sort: { _id: 1 } },
+		];
+
+		// productSummaryNoVar
+		const productSummaryNoVarStage = [
+			{ $unwind: "$productsNoVariable" },
+			{
+				$group: {
+					_id: "$productsNoVariable.name",
+					orderCount: { $sum: 1 },
+					totalQuantity: { $sum: "$productsNoVariable.ordered_quantity" },
+					grossTotal: {
+						$sum: {
+							$multiply: [
+								"$productsNoVariable.ordered_quantity",
+								"$productsNoVariable.price",
+							],
+						},
+					},
+					netTotal: {
+						$sum: {
+							$multiply: [
+								"$productsNoVariable.ordered_quantity",
+								"$productsNoVariable.price",
+							],
+						},
+					},
+				},
+			},
+		];
+
+		// productSummaryVar
+		const productSummaryVarStage = [
+			{ $unwind: "$chosenProductQtyWithVariables" },
+			{
+				$group: {
+					_id: "$chosenProductQtyWithVariables.name",
+					orderCount: { $sum: 1 },
+					totalQuantity: { $sum: "$chosenProductQtyWithVariables.orderedQty" },
+					grossTotal: {
+						$sum: {
+							$multiply: [
+								"$chosenProductQtyWithVariables.orderedQty",
+								"$chosenProductQtyWithVariables.price",
+							],
+						},
+					},
+					netTotal: {
+						$sum: {
+							$multiply: [
+								"$chosenProductQtyWithVariables.orderedQty",
+								"$chosenProductQtyWithVariables.price",
+							],
+						},
+					},
+				},
+			},
+		];
+
+		// productSummaryExchangeNoVar
+		const productSummaryExchangeNoVarStage = [
+			{ $unwind: "$exchangedProductsNoVariable" },
+			{
+				$group: {
+					_id: "$exchangedProductsNoVariable.name",
+					orderCount: { $sum: 1 },
+					totalQuantity: {
+						$sum: "$exchangedProductsNoVariable.ordered_quantity",
+					},
+					grossTotal: {
+						$sum: {
+							$multiply: [
+								"$exchangedProductsNoVariable.ordered_quantity",
+								"$exchangedProductsNoVariable.price",
+							],
+						},
+					},
+					netTotal: {
+						$sum: {
+							$multiply: [
+								"$exchangedProductsNoVariable.ordered_quantity",
+								"$exchangedProductsNoVariable.price",
+							],
+						},
+					},
+				},
+			},
+		];
+
+		// productSummaryExchangeVar
+		const productSummaryExchangeVarStage = [
+			{ $unwind: "$exchangedProductQtyWithVariables" },
+			{
+				$group: {
+					_id: "$exchangedProductQtyWithVariables.name",
+					orderCount: { $sum: 1 },
+					totalQuantity: {
+						$sum: "$exchangedProductQtyWithVariables.orderedQty",
+					},
+					grossTotal: {
+						$sum: {
+							$multiply: [
+								"$exchangedProductQtyWithVariables.orderedQty",
+								"$exchangedProductQtyWithVariables.price",
+							],
+						},
+					},
+					netTotal: {
+						$sum: {
+							$multiply: [
+								"$exchangedProductQtyWithVariables.orderedQty",
+								"$exchangedProductQtyWithVariables.price",
+							],
+						},
+					},
+				},
+			},
+		];
+
+		// scoreboard => sums totalOrders => 1, totalQuantity => $totalOrderQty, grossTotal => $totalAmount, netTotal => $totalAmount minus orderExpenses
+		const scoreboardStage = [
+			{
+				$group: {
+					_id: null,
+					totalOrders: { $sum: 1 },
+					totalQuantity: { $sum: "$totalOrderQty" },
+					grossTotal: { $sum: { $ifNull: ["$totalAmount", 0] } },
+					totalExpenses: { $sum: totalExpensesExpression },
+					netTotal: { $sum: netTotalExpression },
+				},
+			},
+		];
+
+		// stateSummary => group by state
+		const stateSummaryStage = [
+			{
+				$group: {
+					_id: "$customerDetails.state",
+					measure: stateGroup,
+				},
+			},
+		];
+
+		// statusSummary => group by status
+		const statusSummaryStage = [
+			{
+				$group: {
+					_id: "$status",
+					measure: statusGroup,
+				},
+			},
+		];
+
+		// 5) We'll also want the raw "orders" so we can transform sub-docs after aggregator
+		const ordersFacetStage = [
+			{ $sort: { orderCreationDate: -1 } },
+			// e.g. if you want to limit or skip
+			// { $limit: 200 },
+		];
+
+		// 6) Combine into one big pipeline
+		const aggregatePipeline = [
+			matchStage,
+			{
+				$facet: {
+					dayOverDay: dayOverDayStage,
+					productSummaryNoVar: productSummaryNoVarStage,
+					productSummaryVar: productSummaryVarStage,
+					productSummaryExchangeNoVar: productSummaryExchangeNoVarStage,
+					productSummaryExchangeVar: productSummaryExchangeVarStage,
+					stateSummary: stateSummaryStage,
+					statusSummary: statusSummaryStage,
+					scoreboard: scoreboardStage,
+
+					// The raw matched orders
+					orders: ordersFacetStage,
+				},
+			},
+			{
+				$project: {
+					dayOverDay: 1,
+					stateSummary: 1,
+					statusSummary: 1,
+					scoreboard: 1,
+					productSummary: {
+						$concatArrays: [
+							"$productSummaryNoVar",
+							"$productSummaryVar",
+							"$productSummaryExchangeNoVar",
+							"$productSummaryExchangeVar",
+						],
+					},
+					orders: 1,
+				},
+			},
+		];
+
+		// 7) Execute aggregator
+		const results = await Order.aggregate(aggregatePipeline);
+		if (!results.length) {
+			return res.json({ success: true, data: {} });
+		}
+
+		const finalData = results[0];
+
+		// 8) Sort productSummary by grossTotal desc
+		if (finalData.productSummary?.length) {
+			finalData.productSummary.sort((a, b) => b.grossTotal - a.grossTotal);
+		}
+
+		// 9) Transform raw orders => sub-docs only for "storeId"
+		const rawOrders = finalData.orders;
+		const transformedOrders = rawOrders.map((doc) =>
+			transformOrderForSeller(doc, storeId)
+		);
+		finalData.orders = transformedOrders;
+
+		// 10) Return
+		return res.json({ success: true, data: finalData });
+	} catch (error) {
+		console.error("Error in sellerOrderReport:", error);
+		return res.status(500).json({
+			success: false,
+			message: "Failed to generate seller order report",
+			error: error.message,
+		});
+	}
+};
+
+exports.getDetailedOrdersForSeller = async (req, res) => {
+	try {
+		// Disable caching => always fetch fresh data
+		res.set("Cache-Control", "no-store");
+
+		const { userId, storeId } = req.params;
+		const { filterType, filterValue, startDate, endDate } = req.query;
+
+		// We'll just keep storeFilter as a string to match sub-docs that store the same string
+		const storeFilter = storeId;
+
+		// Build fallback date range
+		const now = new Date();
+		const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+		const endOfMonth = new Date(
+			now.getFullYear(),
+			now.getMonth() + 1,
+			0,
+			23,
+			59,
+			59
+		);
+		const start = startDate ? new Date(`${startDate}T00:00:00Z`) : firstOfMonth;
+		const finish = endDate ? new Date(`${endDate}T23:59:59Z`) : endOfMonth;
+
+		// Only match if storeId is in productsNoVariable or chosenProductQtyWithVariables
+		const match = {
+			orderCreationDate: { $gte: start, $lte: finish },
+			$or: [
+				{ "productsNoVariable.storeId": storeFilter },
+				{ "chosenProductQtyWithVariables.storeId": storeFilter },
+			],
+		};
+
+		// Additional filters
+		if (filterType === "state") {
+			// e.g., must match the customer's state
+			match["customerDetails.state"] = {
+				$regex: new RegExp(`^${filterValue}$`, "i"),
+			};
+		} else if (filterType === "product") {
+			// e.g., product name search
+			const caseInsensitive = { $regex: new RegExp(filterValue, "i") };
+			match.$or.push(
+				{ "productsNoVariable.name": caseInsensitive },
+				{ "chosenProductQtyWithVariables.name": caseInsensitive }
+			);
+		}
+
+		// Fetch all matching orders
+		const orders = await Order.find(match).sort({ orderCreationDate: -1 });
+
+		// Transform each one
+		const transformed = orders.map((ord) =>
+			transformOrderForSeller(ord, storeId)
+		);
+
+		return res.json({
+			success: true,
+			orders: transformed,
+		});
+	} catch (error) {
+		console.error("Error in getDetailedOrdersForSeller:", error);
+		return res.status(500).json({
+			success: false,
+			message: "Failed to get filtered orders",
+			error: error.message,
 		});
 	}
 };

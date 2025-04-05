@@ -3,7 +3,12 @@
 const express = require("express");
 const router = express.Router();
 
-const { requireSignin, isAuth, isAdmin } = require("../controllers/auth");
+const {
+	requireSignin,
+	isAuth,
+	isAdmin,
+	isSeller,
+} = require("../controllers/auth");
 const { userById } = require("../controllers/user");
 const {
 	orderById,
@@ -18,6 +23,10 @@ const {
 	adminOrderReport,
 	getDetailedOrders,
 	checkInvoiceNumber,
+	sellerOrderReport,
+	getDetailedOrdersForSeller,
+	listOfAggregatedForPaginationSeller,
+	orderSearchSeller,
 } = require("../controllers/order");
 
 router.post("/order/creation/:userId", requireSignin, isAuth, create);
@@ -34,12 +43,12 @@ router.get(
 	listOfAggregatedForPagination
 );
 
-router.put(
-	"/single-order/:orderId/:userId",
+router.get(
+	"/seller/list-of-orders-aggregated/:page/:records/:startDate/:endDate/:status/:userId/:storeId",
 	requireSignin,
 	isAuth,
 	isAdmin,
-	updateSingleOrder
+	listOfAggregatedForPaginationSeller
 );
 
 router.get(
@@ -48,6 +57,14 @@ router.get(
 	isAuth,
 	isAdmin,
 	orderSearch
+);
+
+router.get(
+	"/seller/search-for-order/:orderquery/:userId/:storeId",
+	requireSignin,
+	isAuth,
+	isAdmin,
+	orderSearchSeller
 );
 
 router.get(
@@ -64,6 +81,27 @@ router.get(
 	isAuth,
 	isAdmin,
 	getDetailedOrders
+);
+
+router.put(
+	"/single-order/:orderId/:userId",
+	requireSignin,
+	isSeller,
+	updateSingleOrder
+);
+
+router.get(
+	"/seller/order-report/:orderquery/:userId/:storeId",
+	requireSignin,
+	isSeller,
+	sellerOrderReport
+);
+
+router.get(
+	"/seller/order-report-modal/detailed-orders/:userId/:storeId",
+	requireSignin,
+	isSeller,
+	getDetailedOrdersForSeller
 );
 
 router.get("/orders/check-invoice/for-chat", checkInvoiceNumber);

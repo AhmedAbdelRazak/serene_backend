@@ -234,9 +234,99 @@ function newSupportCaseEmail(supportCase, hotelName) {
   `;
 }
 
+function transformOrderForSeller(order, storeIdString) {
+	// Convert storeIdString to actual string in case we have an ObjectId
+	const storeId = storeIdString.toString();
+
+	// Filter arrays
+	const filteredNoVar = (order.productsNoVariable || []).filter(
+		(p) => p.storeId?.toString() === storeId
+	);
+	const filteredVar = (order.chosenProductQtyWithVariables || []).filter(
+		(p) => p.storeId?.toString() === storeId
+	);
+	const filteredExNoVar = (order.exchangedProductsNoVariable || []).filter(
+		(p) => p.storeId?.toString() === storeId
+	);
+	const filteredExVar = (order.exchangedProductQtyWithVariables || []).filter(
+		(p) => p.storeId?.toString() === storeId
+	);
+
+	// Compute store sub-total (just sum price * quantity)
+	const storeSubtotal = [
+		...filteredNoVar.map((p) => p.price * p.ordered_quantity),
+		...filteredVar.map((p) => p.price * p.orderedQty),
+		...filteredExNoVar.map((p) => p.price * p.ordered_quantity),
+		...filteredExVar.map((p) => p.price * p.orderedQty),
+	].reduce((a, b) => a + b, 0);
+
+	// Compute storeQty
+	const storeQty = [
+		...filteredNoVar.map((p) => p.ordered_quantity),
+		...filteredVar.map((p) => p.orderedQty),
+		...filteredExNoVar.map((p) => p.ordered_quantity),
+		...filteredExVar.map((p) => p.orderedQty),
+	].reduce((a, b) => a + b, 0);
+
+	// Entire order quantity:
+	let entireQty = 0;
+	entireQty += (order.productsNoVariable || []).reduce(
+		(acc, x) => acc + (x.ordered_quantity || 0),
+		0
+	);
+	entireQty += (order.chosenProductQtyWithVariables || []).reduce(
+		(acc, x) => acc + (x.orderedQty || 0),
+		0
+	);
+	entireQty += (order.exchangedProductsNoVariable || []).reduce(
+		(acc, x) => acc + (x.ordered_quantity || 0),
+		0
+	);
+	entireQty += (order.exchangedProductQtyWithVariables || []).reduce(
+		(acc, x) => acc + (x.orderedQty || 0),
+		0
+	);
+
+	const shippingFees = order.shippingFees || 0;
+	const totalAmount = order.customerDetails?.totalAmount || 0;
+	const totalAmountAfterDiscount =
+		order.customerDetails?.totalAmountAfterDiscount || totalAmount;
+	const entireDiscount = totalAmount - totalAmountAfterDiscount;
+
+	// Partial shipping & discount
+	let partialShipping = 0;
+	let partialDiscount = 0;
+	if (entireQty > 0) {
+		partialShipping = shippingFees * (storeQty / entireQty);
+		partialDiscount = entireDiscount * (storeQty / entireQty);
+	}
+
+	// final partial net
+	const storeTotalAfterDiscount =
+		storeSubtotal - partialDiscount + partialShipping;
+
+	// Build a new plain object so we can override arrays
+	const obj = order.toObject ? order.toObject() : { ...order };
+	return {
+		...obj,
+		productsNoVariable: filteredNoVar,
+		chosenProductQtyWithVariables: filteredVar,
+		exchangedProductsNoVariable: filteredExNoVar,
+		exchangedProductQtyWithVariables: filteredExVar,
+		sellerView: {
+			storeQty,
+			storeSubtotal: +storeSubtotal.toFixed(2),
+			partialShipping: +partialShipping.toFixed(2),
+			partialDiscount: +partialDiscount.toFixed(2),
+			storeTotalAfterDiscount: +storeTotalAfterDiscount.toFixed(2),
+		},
+	};
+}
+
 /**
  * Exports
  */
 module.exports = {
 	newSupportCaseEmail,
+	transformOrderForSeller,
 };

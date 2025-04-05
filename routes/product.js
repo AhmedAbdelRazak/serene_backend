@@ -30,6 +30,7 @@ const {
 	listPODProducts,
 	listProductsNoFilterForSeller,
 	autoCompleteProducts,
+	createDistinctCategoriesActiveProducts,
 } = require("../controllers/product");
 
 router.post("/product/create/:userId", requireSignin, isSeller, create);
@@ -42,6 +43,12 @@ router.get("/product/:productId", read);
 router.get("/single-product/:slug/:categorySlug/:productId", readSingleProduct);
 
 //get distinct categories & subcategories
+
+router.post(
+	"/create/product/categories/subcategories",
+	createDistinctCategoriesActiveProducts
+);
+
 router.get(
 	"/product/categories/subcategories",
 	getDistinctCategoriesActiveProducts

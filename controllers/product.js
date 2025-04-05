@@ -1,5 +1,6 @@
 /** @format */
 
+const ActiveCategories = require("../models/activeCategories");
 const Product = require("../models/product");
 const User = require("../models/user");
 const Category = require("../models/category"); // Adjust paths as necessary
@@ -7,6 +8,7 @@ const Subcategory = require("../models/subcategory"); // Adjust paths as necessa
 const Gender = require("../models/gender"); // Adjust paths as necessary
 const querystring = require("querystring");
 const mongoose = require("mongoose");
+const ObjectId = mongoose.Types.ObjectId;
 const axios = require("axios");
 
 exports.productById = async (req, res, next, id) => {
@@ -561,48 +563,127 @@ exports.remove = (req, res) => {
 	});
 };
 
-exports.getDistinctCategoriesActiveProducts = (req, res, next) => {
-	Product.aggregate([
-		{ $match: { activeProduct: true } }, // Match only active products
+exports.createDistinctCategoriesActiveProducts = async (req, res) => {
+	try {
+		const { featured, newArrivals, customDesigns, storeId } = req.query;
 
-		// Join with the Category collection
-		{
-			$lookup: {
-				from: Category.collection.name,
-				localField: "category",
-				foreignField: "_id",
-				as: "categoryDetails",
+		// 1) Build baseMatch
+		let baseMatch = { activeProduct: true };
+
+		if (storeId) {
+			baseMatch.store = new ObjectId(storeId);
+		}
+		if (customDesigns === "1") {
+			baseMatch["printifyProductDetails.POD"] = true;
+		}
+		if (featured === "1") {
+			baseMatch.featuredProduct = true;
+			baseMatch["printifyProductDetails.POD"] = { $ne: true };
+		}
+
+		let pipeline = [];
+
+		// (A) Match base
+		pipeline.push({ $match: baseMatch });
+
+		// (B) Lookup store + ensure store is active
+		pipeline.push(
+			{
+				$lookup: {
+					from: "storemanagements", // Adjust if your store collection is named differently
+					localField: "store",
+					foreignField: "_id",
+					as: "storeDetails",
+				},
 			},
-		},
-		{ $unwind: "$categoryDetails" },
-		{ $match: { "categoryDetails.categoryStatus": true } }, // Ensure the category is active
+			{ $unwind: "$storeDetails" },
+			{
+				$match: {
+					"storeDetails.activeStoreByAdmin": true,
+					"storeDetails.activeStoreBySeller": true,
+				},
+			}
+		);
 
-		// Join with the Subcategory collection
-		{
-			$lookup: {
-				from: Subcategory.collection.name,
-				localField: "subcategory",
-				foreignField: "_id",
-				as: "subcategoryDetails",
+		// If newArrivals=1 => exclude POD
+		if (newArrivals === "1") {
+			pipeline.push({
+				$match: {
+					"printifyProductDetails.POD": { $ne: true },
+				},
+			});
+		}
+
+		// (C) Category / Subcategory / Gender lookups
+		pipeline.push(
+			{
+				$lookup: {
+					from: Category.collection.name,
+					localField: "category",
+					foreignField: "_id",
+					as: "categoryDetails",
+				},
 			},
-		},
-		{ $unwind: "$subcategoryDetails" },
-		{ $match: { "subcategoryDetails.subCategoryStatus": true } }, // Ensure the subcategory is active
-
-		// Join with the Gender collection
-		{
-			$lookup: {
-				from: Gender.collection.name,
-				localField: "gender",
-				foreignField: "_id",
-				as: "genderDetails",
+			{ $unwind: "$categoryDetails" },
+			{
+				$match: {
+					"categoryDetails.categoryStatus": true,
+					// Exclude category "6691981f25cf79d0a7dca70e"
+					"categoryDetails._id": {
+						$ne: new ObjectId("6691981f25cf79d0a7dca70e"),
+					},
+				},
 			},
-		},
-		{ $unwind: "$genderDetails" },
-		{ $match: { "genderDetails.genderNameStatus": true } }, // Ensure the gender is active
+			{
+				$lookup: {
+					from: Subcategory.collection.name,
+					localField: "subcategory",
+					foreignField: "_id",
+					as: "subcategoryDetails",
+				},
+			},
+			{ $unwind: "$subcategoryDetails" },
+			{
+				$match: {
+					"subcategoryDetails.subCategoryStatus": true,
+				},
+			},
+			{
+				$lookup: {
+					from: Gender.collection.name,
+					localField: "gender",
+					foreignField: "_id",
+					as: "genderDetails",
+				},
+			},
+			{ $unwind: "$genderDetails" },
+			{
+				$match: {
+					"genderDetails.genderNameStatus": true,
+				},
+			}
+		);
 
-		// Grouping to get distinct values
-		{
+		// (D) Exclude out-of-stock => totalQuantity > 0
+		pipeline.push(
+			{
+				$addFields: {
+					totalQuantity: {
+						$cond: {
+							if: { $gt: [{ $size: "$productAttributes" }, 0] },
+							then: { $sum: "$productAttributes.quantity" },
+							else: "$quantity",
+						},
+					},
+				},
+			},
+			{
+				$match: { totalQuantity: { $gt: 0 } },
+			}
+		);
+
+		// (E) Group
+		pipeline.push({
 			$group: {
 				_id: null,
 				categories: { $addToSet: "$categoryDetails" },
@@ -610,33 +691,81 @@ exports.getDistinctCategoriesActiveProducts = (req, res, next) => {
 				genders: { $addToSet: "$genderDetails" },
 				chosenSeasons: { $addToSet: "$chosenSeason" },
 			},
-		},
-	])
-		.then((result) => {
-			if (result && result.length > 0) {
-				res.json({
-					categories: result[0].categories,
-					subcategories: result[0].subcategories,
-					genders: result[0].genders,
-					chosenSeasons: result[0].chosenSeasons.filter((season) => season), // Filter to remove any null or undefined seasons
-				});
-			} else {
-				res.json({
-					categories: [],
-					subcategories: [],
-					genders: [],
-					chosenSeasons: [],
-				});
-			}
-		})
-		.catch((error) => {
-			res
-				.status(500)
-				.json({ error: "There was an error processing your request." });
 		});
+
+		const results = await Product.aggregate(pipeline);
+
+		let categories = [];
+		let subcategories = [];
+		let genders = [];
+		let chosenSeasons = [];
+
+		if (results && results.length > 0) {
+			const data = results[0];
+			categories = data.categories;
+			subcategories = data.subcategories;
+			genders = data.genders;
+			chosenSeasons = data.chosenSeasons.filter((season) => season); // filter out null/undefined
+		}
+
+		// 2) Delete any existing docs in ActiveCategories
+		await ActiveCategories.deleteMany({});
+
+		// 3) Create a new doc
+		const doc = new ActiveCategories({
+			categories,
+			subcategories,
+			genders,
+			chosenSeasons,
+		});
+
+		await doc.save();
+
+		// 4) Return newly created doc
+		res.json({
+			message: "ActiveCategories updated successfully",
+			activeCategories: doc,
+		});
+	} catch (error) {
+		console.error("Error in createDistinctCategoriesActiveProducts:", error);
+		res.status(500).json({
+			error: "There was an error creating/updating active categories.",
+		});
+	}
 };
 
-exports.gettingSpecificSetOfProducts = async (req, res, next) => {
+exports.getDistinctCategoriesActiveProducts = async (req, res) => {
+	try {
+		// If you only store one doc, you can do findOne() without sorting.
+		// Or if you want the latest updated doc, we can sort descending by createdAt.
+		const doc = await ActiveCategories.findOne().sort({ createdAt: -1 });
+
+		if (!doc) {
+			// No doc found, return empty arrays
+			return res.json({
+				categories: [],
+				subcategories: [],
+				genders: [],
+				chosenSeasons: [],
+			});
+		}
+
+		// Return the arrays from the stored doc
+		return res.json({
+			categories: doc.categories || [],
+			subcategories: doc.subcategories || [],
+			genders: doc.genders || [],
+			chosenSeasons: doc.chosenSeasons || [],
+		});
+	} catch (error) {
+		console.error("Error in getDistinctCategoriesActiveProducts:", error);
+		return res
+			.status(500)
+			.json({ error: "There was an error retrieving active categories." });
+	}
+};
+
+exports.gettingSpecificSetOfProducts = async (req, res) => {
 	try {
 		const {
 			featured,
@@ -645,54 +774,102 @@ exports.gettingSpecificSetOfProducts = async (req, res, next) => {
 			sortByRate,
 			offers,
 			records,
-		} = req.params;
+		} = req.params; // from path
 
-		// Base query always requires activeProduct = true
+		const { skip, storeId } = req.query; // from query
+
+		// Convert them to numbers if needed
+		const limitNumber = parseInt(records, 10) || 5;
+		const skipNumber = parseInt(skip, 10) || 0;
+
+		// 1) Base match
 		let baseMatch = { activeProduct: true };
-		let pipeline = [];
 
-		// 1) Handle customDesigns => only printify POD products
-		//    e.g. customDesigns=1 => "printifyProductDetails.POD === true"
+		// 2) If storeId is provided, match that store
+		if (storeId) {
+			baseMatch.store = new ObjectId(storeId);
+		}
+
+		// 3) customDesigns => only POD
 		if (customDesigns === "1") {
 			baseMatch["printifyProductDetails.POD"] = true;
 		}
 
-		// 2) Featured => exclude POD
+		// 4) featured => also exclude POD
 		if (featured === "1") {
 			baseMatch.featuredProduct = true;
-			// Exclude POD from featured
 			baseMatch["printifyProductDetails.POD"] = { $ne: true };
 		}
 
-		// 3) New arrivals => sort by createdAt desc, also exclude POD
-		if (newArrivals === "1") {
-			pipeline.push({ $sort: { createdAt: -1 } });
-			// Exclude POD from newArrivals
-			baseMatch["printifyProductDetails.POD"] = { $ne: true };
-		}
+		// Build the pipeline
+		let pipeline = [];
 
-		// 4) Sort by rating => after we gather everything else
-		//    We only want to sort by rating if explicitly requested
-		//    We'll handle that further down as a separate pipeline step
-		let doSortByRating = false;
-		if (sortByRate === "1") {
-			doSortByRating = true;
-		}
-
-		// 5) Offers => same logic as your code (priceAfterDiscount < price OR < MSRPBasic)
-		if (offers === "1") {
-			baseMatch.$or = [
-				{ $expr: { $gt: ["$MSRPPriceBasic", "$priceAfterDiscount"] } },
-				{ $expr: { $gt: ["$price", "$priceAfterDiscount"] } },
-			];
-		}
-
-		// Now push the match stage
+		// First stage match
 		pipeline.push({ $match: baseMatch });
 
-		// If we need to sort by rating, do it here
-		if (doSortByRating) {
-			// We only want to match items that have a non-empty ratings array
+		// (A) Lookup store
+		pipeline.push(
+			{
+				$lookup: {
+					from: "storemanagements", // <-- Adjust if your store collection is named differently
+					localField: "store",
+					foreignField: "_id",
+					as: "storeDetails",
+				},
+			},
+			{ $unwind: "$storeDetails" },
+			{
+				$match: {
+					"storeDetails.activeStoreByAdmin": true,
+					"storeDetails.activeStoreBySeller": true,
+				},
+			}
+		);
+
+		// (B) If newArrivals=1 => sort by createdAt desc and exclude POD
+		if (newArrivals === "1") {
+			pipeline.push({ $sort: { createdAt: -1 } });
+			pipeline.push({
+				$match: {
+					"printifyProductDetails.POD": { $ne: true },
+				},
+			});
+		}
+
+		// (C) If offers=1 => items that have a discounted price
+		if (offers === "1") {
+			pipeline.push({
+				$match: {
+					$or: [
+						{ $expr: { $gt: ["$MSRPPriceBasic", "$priceAfterDiscount"] } },
+						{ $expr: { $gt: ["$price", "$priceAfterDiscount"] } },
+					],
+				},
+			});
+		}
+
+		// (D) Category lookup
+		pipeline.push(
+			{
+				$lookup: {
+					from: "categories",
+					localField: "category",
+					foreignField: "_id",
+					as: "category",
+				},
+			},
+			{ $unwind: "$category" }
+		);
+
+		// Exclude category= "6691981f25cf79d0a7dca70e"
+		pipeline.push({
+			$match: {
+				"category._id": { $ne: new ObjectId("6691981f25cf79d0a7dca70e") },
+			},
+		});
+
+		// (E) Sort by rating if needed
+		if (sortByRate === "1") {
 			pipeline.push({
 				$match: {
 					ratings: { $exists: true, $not: { $size: 0 } },
@@ -704,50 +881,70 @@ exports.gettingSpecificSetOfProducts = async (req, res, next) => {
 			);
 		}
 
-		// If featured=1 or newArrivals=1, remove the entire printifyProductDetails field
-		// so it appears "blank" in the final output.
+		// (F) If featured=1 or newArrivals=1 => remove "printifyProductDetails"
 		if (featured === "1" || newArrivals === "1") {
 			pipeline.push({ $unset: "printifyProductDetails" });
 		}
 
-		// Lookup the category
-		pipeline.push({
-			$lookup: {
-				from: "categories",
-				localField: "category",
-				foreignField: "_id",
-				as: "category",
+		// (G) Exclude out-of-stock by computing totalQuantity
+		pipeline.push(
+			{
+				$addFields: {
+					totalQuantity: {
+						$cond: {
+							if: { $gt: [{ $size: "$productAttributes" }, 0] },
+							then: { $sum: "$productAttributes.quantity" },
+							else: "$quantity",
+						},
+					},
+				},
 			},
-		});
+			{
+				$match: {
+					totalQuantity: { $gt: 0 },
+				},
+			}
+		);
 
-		// Unwind category array
-		pipeline.push({ $unwind: "$category" });
-
-		// Limit the number of returned docs if "records" is present
-		if (records) {
-			pipeline.push({ $limit: parseInt(records, 10) });
-		}
+		// (H) Pagination
+		pipeline.push({ $skip: skipNumber }, { $limit: limitNumber });
 
 		// Execute the pipeline
 		let products = await Product.aggregate(pipeline);
 
-		// If we tried to sort by rating but got no products, and it's *not* featured=1,
-		// your original code does a fallback to featured products.
-		if (doSortByRating && products.length === 0 && featured !== "1") {
-			products = await Product.find({
+		// (I) Fallback if sortByRate=1 yields no products but featured!=1
+		if (sortByRate === "1" && products.length === 0 && featured !== "1") {
+			// We'll do a .find on featured products, filter out-of-stock manually
+			let fallback = await Product.find({
 				activeProduct: true,
 				featuredProduct: true,
 			})
-				.limit(parseInt(records, 10))
 				.populate("category")
 				.lean();
+
+			// Filter out-of-stock
+			fallback = fallback.filter((prod) => {
+				if (prod.productAttributes && prod.productAttributes.length > 0) {
+					const sumQty = prod.productAttributes.reduce(
+						(acc, a) => acc + a.quantity,
+						0
+					);
+					return sumQty > 0;
+				} else {
+					return prod.quantity > 0;
+				}
+			});
+
+			// Then limit the result
+			fallback = fallback.slice(0, limitNumber);
+
+			products = fallback;
 		}
 
-		// === GROUP EACH PRODUCT BY COLOR (like your original code) ===
+		// (J) Group each product by color
 		const processedProducts = products
 			.map((product) => {
 				if (product.productAttributes && product.productAttributes.length > 0) {
-					// Group by color
 					const byColor = product.productAttributes.reduce((acc, attr) => {
 						const colorKey = attr.color || "unknown";
 						if (!acc[colorKey]) {
@@ -760,11 +957,9 @@ exports.gettingSpecificSetOfProducts = async (req, res, next) => {
 						acc[colorKey].productAttributes.push(attr);
 						return acc;
 					}, {});
-
-					// Return an array of sub-products split by color
 					return Object.values(byColor);
 				}
-				// Otherwise, it's a simple product
+				// otherwise it's a simple product
 				return [product];
 			})
 			.flat();
@@ -772,7 +967,7 @@ exports.gettingSpecificSetOfProducts = async (req, res, next) => {
 		return res.json(processedProducts);
 	} catch (err) {
 		console.error(err);
-		res.status(500).json({ error: err.message });
+		return res.status(500).json({ error: err.message });
 	}
 };
 
