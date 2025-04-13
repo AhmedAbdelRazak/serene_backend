@@ -458,14 +458,12 @@ exports.syncPrintifyProducts = async (req, res) => {
 		const POD_CATEGORY_ID = "679bb2a7dba50a58933d01eb";
 		const POD_SUBCATEGORY_ID = "679bb2bfdba50a58933d0233";
 
-		// Tokens from environment
+		// Token from environment (ONLY design token now)
 		const DESIGN_TOKEN = process.env.DESIGN_PRINTIFY_TOKEN;
-		const STANDARD_TOKEN = process.env.PRINTIFY_TOKEN;
-
-		if (!DESIGN_TOKEN || !STANDARD_TOKEN) {
-			return res.status(500).json({
-				error: "Both DESIGN_PRINTIFY_TOKEN and PRINTIFY_TOKEN must be set.",
-			});
+		if (!DESIGN_TOKEN) {
+			return res
+				.status(500)
+				.json({ error: "DESIGN_PRINTIFY_TOKEN must be set." });
 		}
 
 		//-------------------------------------------------------------------
@@ -476,9 +474,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 		const colors = await Colors.find(); // If you're actually using it
 
 		//-------------------------------------------------------------------
-		// 2. HELPER: FETCH SHOP + PRODUCTS for a given token
+		// 2. HELPER: FETCH SHOP + PRODUCTS for the DESIGN token
 		//-------------------------------------------------------------------
-		const fetchAllProducts = async (tokenName, token) => {
+		const fetchDesignProducts = async (tokenName, token) => {
 			const shopRes = await axios.get(
 				"https://api.printify.com/v1/shops.json",
 				{
@@ -508,27 +506,19 @@ exports.syncPrintifyProducts = async (req, res) => {
 		};
 
 		//-------------------------------------------------------------------
-		// 3. FETCH PRODUCTS FROM BOTH TOKENS, COMBINE & DEDUPE
+		// 3. FETCH PRODUCTS ONLY FROM DESIGN TOKEN
 		//-------------------------------------------------------------------
-		console.log("🚀 Fetching products from Standard token + Design token...");
-		const standardProducts = await fetchAllProducts("STANDARD", STANDARD_TOKEN);
-		const designProducts = await fetchAllProducts("DESIGN", DESIGN_TOKEN);
+		console.log("🚀 Fetching products from Design token only...");
+		const designProducts = await fetchDesignProducts("DESIGN", DESIGN_TOKEN);
 
-		// Merge them by product id. A product could exist in both lists
-		const allProductsMap = new Map();
-		[...standardProducts, ...designProducts].forEach((prod) => {
-			allProductsMap.set(prod.id, prod); // Overwrites if duplicate
-		});
-		const combinedProducts = Array.from(allProductsMap.values());
-		console.log(
-			`✅ Combined total products after merge: ${combinedProducts.length}`
-		);
-
-		if (!combinedProducts.length) {
-			return res
-				.status(404)
-				.json({ error: "No products found from either Printify shop" });
+		if (!designProducts.length) {
+			return res.status(404).json({
+				error: "No products found from the Printify design shop",
+			});
 		}
+
+		// We’ll call these our “combinedProducts,” but in reality it’s just one list:
+		const combinedProducts = designProducts;
 
 		//-------------------------------------------------------------------
 		// 4. IMAGE UPLOAD HELPER (LIMIT TO 5)
@@ -556,14 +546,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 		};
 
 		//-------------------------------------------------------------------
-		// 5. MASTER SYNC HANDLER (CREATE/UPDATE in Mongo; then set “Draft” in Printify)
+		// 5. MASTER SYNC HANDLER (CREATE/UPDATE in Mongo; then set “Draft”)
 		//-------------------------------------------------------------------
-		async function handleProductSync(
-			productData,
-			variantSKU,
-			printifyProduct,
-			tokenToUse
-		) {
+		async function handleProductSync(productData, variantSKU, printifyProduct) {
 			if (!variantSKU) {
 				console.warn(
 					`❌ Variant SKU is missing for product: ${printifyProduct.title}`
@@ -576,9 +561,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			//-------------------------------------------------------------------
 			const existingProduct = await Product.findOne({ productSKU: variantSKU });
 			if (existingProduct) {
-				//------------------------------------------------------
-				// PARTIAL UPDATE
-				//------------------------------------------------------
+				// Update existing
 				existingProduct.productName = productData.productName;
 				existingProduct.description = productData.description;
 				existingProduct.price = productData.price;
@@ -602,7 +585,6 @@ exports.syncPrintifyProducts = async (req, res) => {
 				if (productData.scent) {
 					existingProduct.scent = productData.scent;
 				}
-
 				if (productData.productAttributes?.length) {
 					existingProduct.productAttributes = productData.productAttributes;
 				}
@@ -613,9 +595,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				await existingProduct.save();
 				console.log(`↺ Updated product in Mongo: ${productData.productName}`);
 			} else {
-				//------------------------------------------------------
-				// NEW DOCUMENT
-				//------------------------------------------------------
+				// Create new
 				const newProduct = new Product({
 					productSKU: variantSKU,
 					...productData,
@@ -632,7 +612,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			try {
 				const variantSettings = (printifyProduct.variants || []).map((v) => ({
 					...v,
-					is_enabled: true, // keep them enabled in the draft
+					is_enabled: true,
 				}));
 
 				await axios.put(
@@ -645,7 +625,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 					},
 					{
 						headers: {
-							Authorization: `Bearer ${tokenToUse}`,
+							Authorization: `Bearer ${DESIGN_TOKEN}`,
 						},
 					}
 				);
@@ -659,26 +639,27 @@ exports.syncPrintifyProducts = async (req, res) => {
 					draftError.response?.data || draftError.message
 				);
 			}
-		} // end handleProductSync
+		}
 
 		//-------------------------------------------------------------------
-		// 6. LOOP + PROCESS EACH PRINTIFY PRODUCT
+		// 6. LOOP + PROCESS EACH PRINTIFY PRODUCT (Design Only)
 		//-------------------------------------------------------------------
 		const failedProducts = [];
 		const processedProducts = [];
 
 		for (const printifyProduct of combinedProducts) {
-			// 6A. Determine POD => pick which token
+			// Determine if product is in the POD list
 			const isPOD = productIdsWithPOD.includes(printifyProduct.id);
-			const tokenToUse = isPOD ? DESIGN_TOKEN : STANDARD_TOKEN;
 
-			// 6B. If product is POD => fix category, else try to match
+			// If product is POD => fixed category, else auto-match
 			let matchingCategory = null;
 			let matchingSubcategories = [];
+
 			if (isPOD) {
 				matchingCategory = { _id: POD_CATEGORY_ID };
 				matchingSubcategories = [{ _id: POD_SUBCATEGORY_ID }];
 			} else {
+				// Attempt to find a matching category by tags
 				matchingCategory = categories.find((cat) =>
 					printifyProduct.tags.some(
 						(tag) =>
@@ -700,7 +681,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				continue;
 			}
 
-			// 6C. Basic Info
+			// Create slugified strings
 			const productSlug = slugify(printifyProduct.title, {
 				lower: true,
 				strict: true,
@@ -723,8 +704,8 @@ exports.syncPrintifyProducts = async (req, res) => {
 				);
 
 			if (isCandle) {
+				// If it has multiple variants (options), treat each variant as separate product in Mongo
 				if (addVariables) {
-					// Candle with multiple variants => each variant is its own doc
 					for (const variant of printifyProduct.variants || []) {
 						if (!variant.is_enabled) continue;
 						if (!variant.sku) {
@@ -776,7 +757,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 							slug_Arabic: uniqueSlugArabic,
 							category: matchingCategory?._id,
 							subcategory: matchingSubcategories.map((s) => s._id),
-							gender: "6635ab22898104005c96250a",
+							gender: "6635ab22898104005c96250a", // example gender ref
 							chosenSeason: "all",
 							thumbnailImage: [
 								{
@@ -819,15 +800,10 @@ exports.syncPrintifyProducts = async (req, res) => {
 							productAttributes: [],
 						};
 
-						await handleProductSync(
-							productData,
-							variant.sku,
-							printifyProduct,
-							tokenToUse
-						);
+						await handleProductSync(productData, variant.sku, printifyProduct);
 					}
 				} else {
-					// Candle single variant
+					// Single-variant candle
 					const firstVar = printifyProduct.variants?.[0];
 					if (!firstVar?.sku) {
 						failedProducts.push(printifyProduct.title);
@@ -857,7 +833,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						slug_Arabic: `${productSlugArabic}-${printifyProduct.id}`,
 						category: matchingCategory?._id,
 						subcategory: matchingSubcategories.map((s) => s._id),
-						gender: "6635ab22898104005c96250a",
+						gender: "6635ab22898104005c96250a", // example
 						chosenSeason: "all",
 						thumbnailImage: [
 							{
@@ -898,19 +874,15 @@ exports.syncPrintifyProducts = async (req, res) => {
 						},
 						productAttributes: [],
 					};
-					await handleProductSync(
-						productData,
-						firstVar.sku,
-						printifyProduct,
-						tokenToUse
-					);
+					await handleProductSync(productData, firstVar.sku, printifyProduct);
 				}
+
 				processedProducts.push(printifyProduct.id);
 				continue;
-			} // end candle
+			}
 
 			//-------------------------------------------------------------------
-			// NON‐CANDLE / MULTI‐VARIANT LOGIC
+			// NON-CANDLE / MULTI-VARIANT LOGIC
 			//-------------------------------------------------------------------
 			const enabledVariants = (printifyProduct.variants || []).filter(
 				(v) => v.is_enabled
@@ -931,7 +903,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				(o) => o.type === "scent"
 			);
 
-			// Sort by size if we have a size option
+			// Sort variants by size, if there's a size option
 			if (sizeOption) {
 				const sizeOrder = ["S", "M", "L", "XL", "XXL", "3XL", "4XL", "5XL"];
 				enabledVariants.sort((a, b) => {
@@ -956,6 +928,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 
 			let validUploadedImages = [];
 			if (!existingTopLevel) {
+				// Upload images that are relevant to any enabled variant
 				const relevantImagesForProduct = (printifyProduct.images || []).filter(
 					(img) => {
 						return img.variant_ids.some((vId) =>
@@ -1025,12 +998,8 @@ exports.syncPrintifyProducts = async (req, res) => {
 			};
 
 			if (hasSingleVariant) {
-				await handleProductSync(
-					productData,
-					firstVariantSKU,
-					printifyProduct,
-					tokenToUse
-				);
+				// Single-variant product
+				await handleProductSync(productData, firstVariantSKU, printifyProduct);
 				processedProducts.push(printifyProduct.id);
 				continue;
 			} else {
@@ -1060,12 +1029,14 @@ exports.syncPrintifyProducts = async (req, res) => {
 
 						let variantUploadedImages = [];
 						if (existingTopLevel) {
+							// If the top-level product exists, see if we already have images
 							const existingAttr = existingTopLevel.productAttributes?.find(
 								(a) => a.SubSKU === variant.sku
 							);
 							if (existingAttr) {
 								variantUploadedImages = existingAttr.productImages || [];
 							} else {
+								// Otherwise, upload new variant images
 								const vImages = (printifyProduct.images || []).filter((img) =>
 									img.variant_ids.includes(variant.id)
 								);
@@ -1075,6 +1046,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 								);
 							}
 						} else {
+							// No top-level product: always upload
 							const vImages = (printifyProduct.images || []).filter((img) =>
 								img.variant_ids.includes(variant.id)
 							);
@@ -1101,15 +1073,10 @@ exports.syncPrintifyProducts = async (req, res) => {
 					})
 				);
 
-				await handleProductSync(
-					productData,
-					firstVariantSKU,
-					printifyProduct,
-					tokenToUse
-				);
+				await handleProductSync(productData, firstVariantSKU, printifyProduct);
 				processedProducts.push(printifyProduct.id);
 			}
-		} // end for
+		}
 
 		//-------------------------------------------------------------------
 		// 7. FINISH + REPORT
