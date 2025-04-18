@@ -10,7 +10,6 @@ const Colors = require("../models/colors");
 
 // --------------------------
 // 1) Google Category Mapping
-//    (If you do want to keep these for certain categories, fine.)
 // --------------------------
 const categoryMapping = {
 	vases: "Home & Garden > Decor > Vases",
@@ -21,26 +20,17 @@ const categoryMapping = {
 	"t shirts": "Apparel & Accessories > Clothing > Shirts & Tops",
 	seasonal: "Home & Garden > Decor > Seasonal & Holiday Decorations",
 	votives: "Home & Garden > Decor > Home Fragrances > Candles",
-
-	// If you have a category named "custom design" in your DB,
-	// previously we mapped it here, but let's keep it as fallback logic.
-	// "custom design": "Apparel & Accessories",
 };
 
 // --------------------------
 // 2) Keyword-based fallback
-//    if categoryMapping doesn't supply a match
 // --------------------------
 function computeGoogleCategory(product) {
-	// 1) First see if product.category is in our categoryMapping:
 	const catName = product.category?.categoryName?.toLowerCase() || "";
 	if (categoryMapping[catName]) {
 		return categoryMapping[catName];
 	}
-
-	// 2) If not, let's see if productName has keywords.
 	const name = (product.productName || "").toLowerCase();
-
 	if (name.includes("mug")) {
 		return "Home & Garden > Kitchen & Dining > Tableware > Drinkware > Mugs";
 	}
@@ -60,12 +50,11 @@ function computeGoogleCategory(product) {
 	if (name.includes("phone")) {
 		return "Electronics > Communications > Telephony > Mobile Phones";
 	}
-
 	// 3) Otherwise, default:
 	return "Apparel & Accessories";
 }
 
-// Function to escape XML special characters
+// Escape XML
 function escapeXml(unsafe) {
 	return unsafe.replace(/[<>&'"]/g, (c) => {
 		switch (c) {
@@ -111,10 +100,8 @@ function extractFirstNumber(value) {
 	return match ? parseFloat(match[0]) : "Not available";
 }
 
-// Generate up to 5 images. We'll only display 3 in the feed.
 function generateImageLinks(product) {
 	let images = [];
-
 	// If product has variant attributes w/images
 	if (product.productAttributes && product.productAttributes.length > 0) {
 		product.productAttributes.forEach((attr) => {
@@ -129,7 +116,6 @@ function generateImageLinks(product) {
 			...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
 		);
 	}
-
 	const validImages = images.filter((img) =>
 		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(img)
 	);
@@ -153,23 +139,23 @@ function convertInchesToCm(inches) {
 }
 
 async function resolveColorName(hexCode) {
-	if (!hexCode) return "Unspecified";
+	// If your color is stored as a text already, or if you have an actual hex code, adapt as needed.
+	if (!hexCode) return "";
 	const color = await Colors.findOne({ hexa: hexCode.toLowerCase() });
-	return color ? color.color : "Unspecified";
+	return color ? color.color : hexCode; // if your DB is storing "blue" or hex
 }
 
 function getProductLink(product, color, size) {
-	// If product is POD => /custom-gifts/:id?color=xx&size=yy
 	if (
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
 	) {
 		let url = `https://serenejannat.com/custom-gifts/${product._id}`;
 		const queryParams = [];
-		if (color && color !== "Unspecified") {
+		if (color && color.toLowerCase() !== "unspecified") {
 			queryParams.push(`color=${encodeURIComponent(color)}`);
 		}
-		if (size && size !== "Unspecified") {
+		if (size && size.toLowerCase() !== "unspecified") {
 			queryParams.push(`size=${encodeURIComponent(size)}`);
 		}
 		if (queryParams.length > 0) {
@@ -177,7 +163,6 @@ function getProductLink(product, color, size) {
 		}
 		return url;
 	}
-	// else normal link
 	return `https://serenejannat.com/single-product/${escapeXml(
 		product.slug
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
@@ -185,15 +170,15 @@ function getProductLink(product, color, size) {
 
 function parseSizeColorFromVariantTitle(title) {
 	if (!title || typeof title !== "string") {
-		return { variantColor: "Unspecified", variantSize: "Unspecified" };
+		return { variantColor: "", variantSize: "" };
 	}
 	const parts = title.split(" / ");
-	const variantColor = parts[0] ? parts[0].trim() : "Unspecified";
-	const variantSize = parts[1] ? parts[1].trim() : "Unspecified";
+	const variantColor = parts[0] ? parts[0].trim() : "";
+	const variantSize = parts[1] ? parts[1].trim() : "";
 	return { variantColor, variantSize };
 }
 
-// If price is >=100 and integer => treat as cents
+// If price >= 100 and is integer => treat as cents
 function getFinalVariantPrice(variant) {
 	let rawPrice = variant.priceAfterDiscount ?? variant.price;
 	if (!rawPrice) return "0.00";
@@ -211,12 +196,8 @@ function validateGender(gender) {
 	return validGenders.includes(g) ? g : "unisex";
 }
 
-/**
- * Convert an array of images to
- * - <g:image_link> the first
- * - <g:additional_image_link> for up to 2 more
- */
-function buildImageTags(imageArray) {
+// Build Google image tags (with g:)
+function buildGoogleImageTags(imageArray) {
 	const upTo3 = imageArray.slice(0, 3);
 	if (!upTo3.length) {
 		upTo3.push(
@@ -232,6 +213,29 @@ function buildImageTags(imageArray) {
 			xml += `\n<g:additional_image_link>${escapeXml(
 				img
 			)}</g:additional_image_link>`;
+		});
+	}
+	return xml;
+}
+
+// Build Facebook image tags (no g:)
+function buildFacebookImageTags(imageArray) {
+	const upTo3 = imageArray.slice(0, 3);
+	if (!upTo3.length) {
+		upTo3.push(
+			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
+		);
+	}
+	// The first is <image_link>, the rest are <additional_image_link>
+	const main = upTo3[0];
+	const additionals = upTo3.slice(1);
+
+	let xml = `<image_link>${escapeXml(main)}</image_link>`;
+	if (additionals.length > 0) {
+		additionals.forEach((img) => {
+			xml += `\n<additional_image_link>${escapeXml(
+				img
+			)}</additional_image_link>`;
 		});
 	}
 	return xml;
@@ -253,36 +257,62 @@ router.get("/generate-feeds", async (req, res) => {
 			const brand = "Serene Jannat";
 			const defaultGender = validateGender(product.gender || "unisex");
 
-			// The new function decides final category:
+			// Google product category
 			const googleProductCategory = escapeXml(computeGoogleCategory(product));
 
-			// Custom labels
+			// Custom labels (for Google)
 			const categoryLabel = product.category.categoryName
 				? product.category.categoryName.toLowerCase().replace(/\s+/g, "_")
 				: "general";
 			const generalLabel = "general_campaign";
 
-			// Short description
+			// Clean the description of HTML tags, then escape
 			const cleanedDesc = escapeXml(
 				product.description.replace(/<[^>]+>/g, "")
 			);
 
-			// -----------------------------------
-			// 1) Printify POD => multi or single variant
-			// -----------------------------------
+			// Helper to build color/size tags (conditionally)
+			function buildGoogleColorTag(colorValue) {
+				// If colorValue is empty or "Unspecified", skip
+				if (!colorValue || colorValue.toLowerCase() === "unspecified")
+					return "";
+				return `<g:color><![CDATA[${colorValue}]]></g:color>`;
+			}
+			function buildGoogleSizeTag(sizeValue) {
+				if (!sizeValue || sizeValue.toLowerCase() === "unspecified") return "";
+				return `<g:size><![CDATA[${sizeValue}]]></g:size>`;
+			}
+			function buildFacebookColorTag(colorValue) {
+				if (!colorValue || colorValue.toLowerCase() === "unspecified")
+					return "";
+				return `<color><![CDATA[${colorValue}]]></color>`;
+			}
+			function buildFacebookSizeTag(sizeValue) {
+				if (!sizeValue || sizeValue.toLowerCase() === "unspecified") return "";
+				return `<size><![CDATA[${sizeValue}]]></size>`;
+			}
+
+			// -----------------------------------------
+			// Check if the product is Printify POD
+			// -----------------------------------------
 			if (product.printifyProductDetails?.POD) {
 				const itemGroupId = escapeXml(product._id.toString());
 				const variants = product.printifyProductDetails.variants || [];
 
 				if (variants.length > 0) {
-					// multi-variant
+					// Multi-variant
 					for (let [index, variant] of variants.entries()) {
 						const { variantColor, variantSize } =
 							parseSizeColorFromVariantTitle(variant.title);
 						const variantPrice = getFinalVariantPrice(variant);
-						const variantAvailability = "in stock";
 
-						// Images for this variant
+						// For Google: availability is "in stock" or "out of stock"
+						const googleAvailability = "in stock"; // POD implies in stock?
+						// For Facebook: availability also "in stock", but we show numeric in <inventory>
+						const facebookAvailability = "in stock";
+						const facebookInventory = variant.quantity || 9999;
+
+						// Attempt to find images for that variant
 						let variantImages = [];
 						if (
 							product.productAttributes &&
@@ -298,9 +328,12 @@ router.get("/generate-feeds", async (req, res) => {
 						if (!variantImages.length) {
 							variantImages = generateImageLinks(product);
 						}
-						const imageLinksXML = buildImageTags(variantImages);
 
-						// link with color/size
+						// Build image tags
+						const googleImageXML = buildGoogleImageTags(variantImages);
+						const facebookImageXML = buildFacebookImageTags(variantImages);
+
+						// Link with color/size
 						const finalLink = getProductLink(
 							product,
 							variantColor,
@@ -310,14 +343,23 @@ router.get("/generate-feeds", async (req, res) => {
 							product.productName
 						)} (Custom Design, ${variantSize}, ${variantColor})`;
 
-						const variantItem = `
+						// Conditionals for color/size tags
+						const googleColorTag = buildGoogleColorTag(variantColor);
+						const googleSizeTag = buildGoogleSizeTag(variantSize);
+						const facebookColorTag = buildFacebookColorTag(variantColor);
+						const facebookSizeTag = buildFacebookSizeTag(variantSize);
+
+						// --------------------
+						// 1) Google item
+						// --------------------
+						const googleVariantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
                 <g:title><![CDATA[${podTitle}]]></g:title>
                 <g:description><![CDATA[${cleanedDesc}]]></g:description>
                 <g:link>${escapeXml(finalLink)}</g:link>
-                ${imageLinksXML}
-                <g:availability>${variantAvailability}</g:availability>
+                ${googleImageXML}
+                <g:availability>${googleAvailability}</g:availability>
                 <g:price>${variantPrice} USD</g:price>
                 <g:brand>${escapeXml(brand)}</g:brand>
                 <g:condition>${escapeXml(condition)}</g:condition>
@@ -326,8 +368,8 @@ router.get("/generate-feeds", async (req, res) => {
 									product.category.categoryName
 								)}]]></g:product_type>
                 <g:item_group_id>${itemGroupId}</g:item_group_id>
-                <g:size><![CDATA[${variantSize}]]></g:size>
-                <g:color><![CDATA[${variantColor}]]></g:color>
+                ${googleSizeTag}
+                ${googleColorTag}
                 <g:age_group>adult</g:age_group>
                 <g:gender>${defaultGender}</g:gender>
                 <g:identifier_exists>false</g:identifier_exists>
@@ -339,44 +381,78 @@ router.get("/generate-feeds", async (req, res) => {
                 <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
               </item>
             `;
-						googleItems.push(variantItem);
-						facebookItems.push(variantItem);
+						googleItems.push(googleVariantItem);
+
+						// --------------------
+						// 2) Facebook item
+						// --------------------
+						const facebookVariantItem = `
+              <item>
+                <id>${escapeXml(product._id.toString())}-${index}</id>
+                <title><![CDATA[${podTitle}]]></title>
+                <description><![CDATA[${cleanedDesc}]]></description>
+                <link>${escapeXml(finalLink)}</link>
+                ${facebookImageXML}
+                <availability>${facebookAvailability}</availability>
+                <inventory>${facebookInventory}</inventory>
+                <price>${variantPrice} USD</price>
+                <brand>${escapeXml(brand)}</brand>
+                <condition>${escapeXml(condition)}</condition>
+                <item_group_id>${itemGroupId}</item_group_id>
+                ${facebookColorTag}
+                ${facebookSizeTag}
+                <google_product_category>${googleProductCategory}</google_product_category>
+              </item>
+            `;
+						facebookItems.push(facebookVariantItem);
 					}
 				} else {
-					// single variant or no "variants" array
-					const finalLink = getProductLink(product);
+					// Single variant or no variants array
 					let rawFallbackPrice = parseFloat(
 						product.priceAfterDiscount || product.price || 0
 					);
 					if (Number.isInteger(rawFallbackPrice) && rawFallbackPrice >= 100) {
 						rawFallbackPrice /= 100;
 					}
+					const fallbackPrice = rawFallbackPrice.toFixed(2);
+
 					const fallbackImages = generateImageLinks(product);
-					const imageLinksXML = buildImageTags(fallbackImages);
+					const googleImageXML = buildGoogleImageTags(fallbackImages);
+					const facebookImageXML = buildFacebookImageTags(fallbackImages);
 
 					const podFallbackTitle = `${capitalizeWords(
 						product.productName
 					)} (Custom Design)`;
+					const finalLink = getProductLink(product);
+					const googleAvailability =
+						product.quantity > 0 ? "in stock" : "out of stock";
+					const facebookAvailability = googleAvailability;
+					const facebookInventory = product.quantity || 9999;
 
-					const podItem = `
+					// No specific color/size, so typically we skip
+					const googleSizeTag = "";
+					const googleColorTag = "";
+					const facebookSizeTag = "";
+					const facebookColorTag = "";
+
+					// Google single POD
+					const googleItem = `
             <item>
               <g:id>${escapeXml(product._id.toString())}</g:id>
               <g:title><![CDATA[${podFallbackTitle}]]></g:title>
               <g:description><![CDATA[${cleanedDesc}]]></g:description>
               <g:link>${escapeXml(finalLink)}</g:link>
-              ${imageLinksXML}
-              <g:availability>${
-								product.quantity > 0 ? "in stock" : "out of stock"
-							}</g:availability>
-              <g:price>${rawFallbackPrice.toFixed(2)} USD</g:price>
+              ${googleImageXML}
+              <g:availability>${googleAvailability}</g:availability>
+              <g:price>${fallbackPrice} USD</g:price>
               <g:brand>${escapeXml(brand)}</g:brand>
               <g:condition>${escapeXml(condition)}</g:condition>
               <g:google_product_category>${googleProductCategory}</g:google_product_category>
               <g:product_type><![CDATA[${escapeXml(
 								product.category.categoryName
 							)}]]></g:product_type>
-              <g:size>Unspecified</g:size>
-              <g:color>Unspecified</g:color>
+              ${googleSizeTag}
+              ${googleColorTag}
               <g:age_group>adult</g:age_group>
               <g:gender>${defaultGender}</g:gender>
               <g:identifier_exists>false</g:identifier_exists>
@@ -388,13 +464,32 @@ router.get("/generate-feeds", async (req, res) => {
               <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
             </item>
           `;
-					googleItems.push(podItem);
-					facebookItems.push(podItem);
+					googleItems.push(googleItem);
+
+					// Facebook single POD
+					const facebookItem = `
+            <item>
+              <id>${escapeXml(product._id.toString())}</id>
+              <title><![CDATA[${podFallbackTitle}]]></title>
+              <description><![CDATA[${cleanedDesc}]]></description>
+              <link>${escapeXml(finalLink)}</link>
+              ${facebookImageXML}
+              <availability>${facebookAvailability}</availability>
+              <inventory>${facebookInventory}</inventory>
+              <price>${fallbackPrice} USD</price>
+              <brand>${escapeXml(brand)}</brand>
+              <condition>${escapeXml(condition)}</condition>
+              ${facebookColorTag}
+              ${facebookSizeTag}
+              <google_product_category>${googleProductCategory}</google_product_category>
+            </item>
+          `;
+					facebookItems.push(facebookItem);
 				}
 			}
-			// ------------------------------
-			// 2) Non-POD products
-			// ------------------------------
+			// -----------------------------------
+			// Non-POD products
+			// -----------------------------------
 			else {
 				const hasVariants =
 					product.productAttributes && product.productAttributes.length > 0;
@@ -411,13 +506,20 @@ router.get("/generate-feeds", async (req, res) => {
 						if (!variantImages.length) {
 							variantImages = generateImageLinks(product);
 						}
-						const imageLinksXML = buildImageTags(variantImages);
+						const googleImageXML = buildGoogleImageTags(variantImages);
+						const facebookImageXML = buildFacebookImageTags(variantImages);
 
-						const variantSize = variant.size || "Unspecified";
+						// Attempt to resolve color if you store hex
 						const variantHexColor = variant.color || "";
-						const variantColor = await resolveColorName(variantHexColor);
-						const variantAvailability =
+						const resolvedVariantColor = await resolveColorName(
+							variantHexColor
+						);
+
+						const variantSize = variant.size || "";
+						const googleAvailability =
 							variant.quantity > 0 ? "in stock" : "out of stock";
+						const facebookAvailability = googleAvailability;
+						const facebookInventory = variant.quantity || 9999;
 
 						const variantWeight = validateDimension(
 							variant.weight || product.geodata?.weight,
@@ -439,16 +541,24 @@ router.get("/generate-feeds", async (req, res) => {
 						const finalLink = getProductLink(product);
 						const variantTitle = `${capitalizeWords(
 							product.productName
-						)} (${variantSize}, ${variantColor})`;
+						)} (${variantSize}, ${resolvedVariantColor})`;
 
-						const variantItem = `
+						// Conditionals for color/size tags
+						const googleColorTag = buildGoogleColorTag(resolvedVariantColor);
+						const googleSizeTag = buildGoogleSizeTag(variantSize);
+						const facebookColorTag =
+							buildFacebookColorTag(resolvedVariantColor);
+						const facebookSizeTag = buildFacebookSizeTag(variantSize);
+
+						// 1) Google variant
+						const googleVariantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
                 <g:title><![CDATA[${variantTitle}]]></g:title>
                 <g:description><![CDATA[${cleanedDesc}]]></g:description>
                 <g:link>${escapeXml(finalLink)}</g:link>
-                ${imageLinksXML}
-                <g:availability>${variantAvailability}</g:availability>
+                ${googleImageXML}
+                <g:availability>${googleAvailability}</g:availability>
                 <g:price>${variantPrice} USD</g:price>
                 <g:brand>${escapeXml(brand)}</g:brand>
                 <g:condition>${escapeXml(condition)}</g:condition>
@@ -457,8 +567,8 @@ router.get("/generate-feeds", async (req, res) => {
 									product.category.categoryName
 								)}]]></g:product_type>
                 <g:item_group_id>${itemGroupId}</g:item_group_id>
-                <g:size>${escapeXml(variantSize)}</g:size>
-                <g:color>${escapeXml(variantColor)}</g:color>
+                ${googleSizeTag}
+                ${googleColorTag}
                 <g:age_group>adult</g:age_group>
                 <g:gender>${defaultGender}</g:gender>
                 <g:identifier_exists>false</g:identifier_exists>
@@ -473,24 +583,62 @@ router.get("/generate-feeds", async (req, res) => {
                 <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
               </item>
             `;
-						googleItems.push(variantItem);
-						facebookItems.push(variantItem);
+						googleItems.push(googleVariantItem);
+
+						// 2) Facebook variant
+						const facebookVariantItem = `
+              <item>
+                <id>${escapeXml(product._id.toString())}-${index}</id>
+                <title><![CDATA[${variantTitle}]]></title>
+                <description><![CDATA[${cleanedDesc}]]></description>
+                <link>${escapeXml(finalLink)}</link>
+                ${facebookImageXML}
+                <availability>${facebookAvailability}</availability>
+                <inventory>${facebookInventory}</inventory>
+                <price>${variantPrice} USD</price>
+                <brand>${escapeXml(brand)}</brand>
+                <condition>${escapeXml(condition)}</condition>
+                <item_group_id>${itemGroupId}</item_group_id>
+                ${facebookColorTag}
+                ${facebookSizeTag}
+                <google_product_category>${googleProductCategory}</google_product_category>
+              </item>
+            `;
+						facebookItems.push(facebookVariantItem);
 					}
 				} else {
-					// single product
+					// Single product (no variants)
 					const weight = convertLbsToKg(product.geodata?.weight || 0);
 					const length = convertInchesToCm(product.geodata?.length || 0);
 					const width = convertInchesToCm(product.geodata?.width || 0);
 					const height = convertInchesToCm(product.geodata?.height || 0);
-					const size = product.size || "Unspecified";
-					const variantHexColor = product.color || "";
-					const resolvedColor = await resolveColorName(variantHexColor);
+
+					// Possibly your product.color is a text or hex
+					const resolvedColor = await resolveColorName(product.color || "");
+					const size = product.size || "";
 					const finalLink = getProductLink(product);
 
 					const fallbackImages = generateImageLinks(product);
-					const imageLinksXML = buildImageTags(fallbackImages);
+					const googleImageXML = buildGoogleImageTags(fallbackImages);
+					const facebookImageXML = buildFacebookImageTags(fallbackImages);
 
-					const itemXML = `
+					const googleAvailability =
+						product.quantity > 0 ? "in stock" : "out of stock";
+					const facebookAvailability = googleAvailability;
+					const facebookInventory = product.quantity || 9999;
+
+					const priceVal = parseFloat(
+						product.priceAfterDiscount || product.price || 0
+					).toFixed(2);
+
+					// Conditionals for color/size
+					const googleColorTag = buildGoogleColorTag(resolvedColor);
+					const googleSizeTag = buildGoogleSizeTag(size);
+					const facebookColorTag = buildFacebookColorTag(resolvedColor);
+					const facebookSizeTag = buildFacebookSizeTag(size);
+
+					// Google single
+					const googleItemXML = `
             <item>
               <g:id>${escapeXml(product._id.toString())}</g:id>
               <g:title><![CDATA[${capitalizeWords(
@@ -498,21 +646,17 @@ router.get("/generate-feeds", async (req, res) => {
 							)}]]></g:title>
               <g:description><![CDATA[${cleanedDesc}]]></g:description>
               <g:link>${escapeXml(finalLink)}</g:link>
-              ${imageLinksXML}
-              <g:availability>${
-								product.quantity > 0 ? "in stock" : "out of stock"
-							}</g:availability>
-              <g:price>${parseFloat(
-								product.priceAfterDiscount || product.price || 0
-							).toFixed(2)} USD</g:price>
+              ${googleImageXML}
+              <g:availability>${googleAvailability}</g:availability>
+              <g:price>${priceVal} USD</g:price>
               <g:brand>${escapeXml(brand)}</g:brand>
               <g:condition>${escapeXml(condition)}</g:condition>
               <g:google_product_category>${googleProductCategory}</g:google_product_category>
               <g:product_type><![CDATA[${escapeXml(
 								product.category.categoryName
 							)}]]></g:product_type>
-              <g:size>${escapeXml(size)}</g:size>
-              <g:color>${escapeXml(resolvedColor)}</g:color>
+              ${googleSizeTag}
+              ${googleColorTag}
               <g:age_group>adult</g:age_group>
               <g:gender>${defaultGender}</g:gender>
               <g:identifier_exists>false</g:identifier_exists>
@@ -527,8 +671,27 @@ router.get("/generate-feeds", async (req, res) => {
               <g:additional_link>https://serenejannat.com/return-refund-policy</g:additional_link>
             </item>
           `;
-					googleItems.push(itemXML);
-					facebookItems.push(itemXML);
+					googleItems.push(googleItemXML);
+
+					// Facebook single
+					const facebookItemXML = `
+            <item>
+              <id>${escapeXml(product._id.toString())}</id>
+              <title><![CDATA[${capitalizeWords(product.productName)}]]></title>
+              <description><![CDATA[${cleanedDesc}]]></description>
+              <link>${escapeXml(finalLink)}</link>
+              ${facebookImageXML}
+              <availability>${facebookAvailability}</availability>
+              <inventory>${facebookInventory}</inventory>
+              <price>${priceVal} USD</price>
+              <brand>${escapeXml(brand)}</brand>
+              <condition>${escapeXml(condition)}</condition>
+              ${facebookColorTag}
+              ${facebookSizeTag}
+              <google_product_category>${googleProductCategory}</google_product_category>
+            </item>
+          `;
+					facebookItems.push(facebookItemXML);
 				}
 			}
 		}
