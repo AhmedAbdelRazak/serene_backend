@@ -139,13 +139,14 @@ function convertInchesToCm(inches) {
 }
 
 async function resolveColorName(hexCode) {
-	// If your color is stored as a text already, or if you have an actual hex code, adapt as needed.
+	// If your color is stored as text or as a real hex, adapt as needed.
 	if (!hexCode) return "";
 	const color = await Colors.findOne({ hexa: hexCode.toLowerCase() });
 	return color ? color.color : hexCode; // if your DB is storing "blue" or hex
 }
 
 function getProductLink(product, color, size) {
+	// If product is POD => /custom-gifts/:id?color=xx&size=yy
 	if (
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
@@ -163,6 +164,7 @@ function getProductLink(product, color, size) {
 		}
 		return url;
 	}
+	// else normal link
 	return `https://serenejannat.com/single-product/${escapeXml(
 		product.slug
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
@@ -226,7 +228,6 @@ function buildFacebookImageTags(imageArray) {
 			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
 		);
 	}
-	// The first is <image_link>, the rest are <additional_image_link>
 	const main = upTo3[0];
 	const additionals = upTo3.slice(1);
 
@@ -271,9 +272,8 @@ router.get("/generate-feeds", async (req, res) => {
 				product.description.replace(/<[^>]+>/g, "")
 			);
 
-			// Helper to build color/size tags (conditionally)
+			// Helper to build color/size tags (conditionally) for Google & FB
 			function buildGoogleColorTag(colorValue) {
-				// If colorValue is empty or "Unspecified", skip
 				if (!colorValue || colorValue.toLowerCase() === "unspecified")
 					return "";
 				return `<g:color><![CDATA[${colorValue}]]></g:color>`;
@@ -293,7 +293,7 @@ router.get("/generate-feeds", async (req, res) => {
 			}
 
 			// -----------------------------------------
-			// Check if the product is Printify POD
+			// Check if product is Printify POD
 			// -----------------------------------------
 			if (product.printifyProductDetails?.POD) {
 				const itemGroupId = escapeXml(product._id.toString());
@@ -306,9 +306,9 @@ router.get("/generate-feeds", async (req, res) => {
 							parseSizeColorFromVariantTitle(variant.title);
 						const variantPrice = getFinalVariantPrice(variant);
 
-						// For Google: availability is "in stock" or "out of stock"
+						// For Google: availability is "in stock" / "out of stock"
 						const googleAvailability = "in stock"; // POD implies in stock?
-						// For Facebook: availability also "in stock", but we show numeric in <inventory>
+						// For Facebook: also "in stock", plus numeric inventory
 						const facebookAvailability = "in stock";
 						const facebookInventory = variant.quantity || 9999;
 
@@ -333,7 +333,7 @@ router.get("/generate-feeds", async (req, res) => {
 						const googleImageXML = buildGoogleImageTags(variantImages);
 						const facebookImageXML = buildFacebookImageTags(variantImages);
 
-						// Link with color/size
+						// Build final link with color/size
 						const finalLink = getProductLink(
 							product,
 							variantColor,
@@ -350,7 +350,7 @@ router.get("/generate-feeds", async (req, res) => {
 						const facebookSizeTag = buildFacebookSizeTag(variantSize);
 
 						// --------------------
-						// 1) Google item
+						// 1) Google variant
 						// --------------------
 						const googleVariantItem = `
               <item>
@@ -384,8 +384,9 @@ router.get("/generate-feeds", async (req, res) => {
 						googleItems.push(googleVariantItem);
 
 						// --------------------
-						// 2) Facebook item
+						// 2) Facebook variant
 						// --------------------
+						// NOTE: We add <quantity_to_sell_on_facebook> as well:
 						const facebookVariantItem = `
               <item>
                 <id>${escapeXml(product._id.toString())}-${index}</id>
@@ -395,6 +396,7 @@ router.get("/generate-feeds", async (req, res) => {
                 ${facebookImageXML}
                 <availability>${facebookAvailability}</availability>
                 <inventory>${facebookInventory}</inventory>
+                <quantity_to_sell_on_facebook>${facebookInventory}</quantity_to_sell_on_facebook>
                 <price>${variantPrice} USD</price>
                 <brand>${escapeXml(brand)}</brand>
                 <condition>${escapeXml(condition)}</condition>
@@ -429,7 +431,6 @@ router.get("/generate-feeds", async (req, res) => {
 					const facebookAvailability = googleAvailability;
 					const facebookInventory = product.quantity || 9999;
 
-					// No specific color/size, so typically we skip
 					const googleSizeTag = "";
 					const googleColorTag = "";
 					const facebookSizeTag = "";
@@ -476,6 +477,7 @@ router.get("/generate-feeds", async (req, res) => {
               ${facebookImageXML}
               <availability>${facebookAvailability}</availability>
               <inventory>${facebookInventory}</inventory>
+              <quantity_to_sell_on_facebook>${facebookInventory}</quantity_to_sell_on_facebook>
               <price>${fallbackPrice} USD</price>
               <brand>${escapeXml(brand)}</brand>
               <condition>${escapeXml(condition)}</condition>
@@ -509,13 +511,12 @@ router.get("/generate-feeds", async (req, res) => {
 						const googleImageXML = buildGoogleImageTags(variantImages);
 						const facebookImageXML = buildFacebookImageTags(variantImages);
 
-						// Attempt to resolve color if you store hex
 						const variantHexColor = variant.color || "";
 						const resolvedVariantColor = await resolveColorName(
 							variantHexColor
 						);
-
 						const variantSize = variant.size || "";
+
 						const googleAvailability =
 							variant.quantity > 0 ? "in stock" : "out of stock";
 						const facebookAvailability = googleAvailability;
@@ -595,6 +596,7 @@ router.get("/generate-feeds", async (req, res) => {
                 ${facebookImageXML}
                 <availability>${facebookAvailability}</availability>
                 <inventory>${facebookInventory}</inventory>
+                <quantity_to_sell_on_facebook>${facebookInventory}</quantity_to_sell_on_facebook>
                 <price>${variantPrice} USD</price>
                 <brand>${escapeXml(brand)}</brand>
                 <condition>${escapeXml(condition)}</condition>
@@ -613,7 +615,6 @@ router.get("/generate-feeds", async (req, res) => {
 					const width = convertInchesToCm(product.geodata?.width || 0);
 					const height = convertInchesToCm(product.geodata?.height || 0);
 
-					// Possibly your product.color is a text or hex
 					const resolvedColor = await resolveColorName(product.color || "");
 					const size = product.size || "";
 					const finalLink = getProductLink(product);
@@ -683,6 +684,7 @@ router.get("/generate-feeds", async (req, res) => {
               ${facebookImageXML}
               <availability>${facebookAvailability}</availability>
               <inventory>${facebookInventory}</inventory>
+              <quantity_to_sell_on_facebook>${facebookInventory}</quantity_to_sell_on_facebook>
               <price>${priceVal} USD</price>
               <brand>${escapeXml(brand)}</brand>
               <condition>${escapeXml(condition)}</condition>
@@ -714,6 +716,7 @@ router.get("/generate-feeds", async (req, res) => {
 	// ----------------------------
 	// Build Facebook Feed
 	// ----------------------------
+	// Here we add <quantity_to_sell_on_facebook> for each item to avoid the "Missing quantity" error.
 	const facebookFeedContent = `
     <rss version="2.0">
       <channel>
