@@ -322,23 +322,21 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 
 exports.printifyOrders = async (req, res) => {
 	try {
-		// 1. Fetch orders from MongoDB that we need to sync (exclude delivered/cancelled)
+		// 1. Fetch local orders that still need tracking updates (exclude delivered/cancelled)
 		const ordersToCheck = await Order.find({
 			status: { $nin: ["delivered", "cancelled"] },
 			"printifyOrderDetails.id": { $exists: true },
 		});
 
 		// 2. Create a map of Printify Order IDs => local Order docs
-		//    for quick lookup & updates later.
 		const orderMap = new Map();
 		ordersToCheck.forEach((order) => {
 			orderMap.set(order.printifyOrderDetails.id, order);
 		});
 
-		// 3. Helper to fetch shops & orders for a given token, then update local DB
+		// 3. Helper function to fetch shops & orders for the DESIGN token
 		const fetchAndSyncShopsForToken = async (token) => {
-			const tokenLabel =
-				token === process.env.PRINTIFY_TOKEN ? "STANDARD" : "DESIGN";
+			const tokenLabel = "DESIGN";
 
 			// Attempt to fetch shops
 			const shopResponse = await axios.get(
@@ -353,7 +351,7 @@ exports.printifyOrders = async (req, res) => {
 				!Array.isArray(shopResponse.data) ||
 				!shopResponse.data.length
 			) {
-				console.log(`⚠️ [${tokenLabel}] No shops found.`);
+				console.log(`⚠️ [${tokenLabel}] No shops found under this token.`);
 				return { tokenLabel, shopsCount: 0, ordersSyncedCount: 0 };
 			}
 
@@ -395,7 +393,7 @@ exports.printifyOrders = async (req, res) => {
 						updatedFields.trackingNumber = printifyTracking;
 					}
 
-					// If we have changes, update the local DB
+					// If we have changes, update in local DB
 					if (Object.keys(updatedFields).length > 0) {
 						await Order.updateOne(
 							{ _id: existingOrder._id },
@@ -413,20 +411,22 @@ exports.printifyOrders = async (req, res) => {
 			};
 		};
 
-		// 4. Call our helper for both tokens
-		const resultsStandard = await fetchAndSyncShopsForToken(
-			process.env.PRINTIFY_TOKEN
-		);
-		const resultsDesign = await fetchAndSyncShopsForToken(
-			process.env.DESIGN_PRINTIFY_TOKEN
-		);
+		// 4. Sync only with the DESIGN token
+		const DESIGN_TOKEN = process.env.DESIGN_PRINTIFY_TOKEN;
+		if (!DESIGN_TOKEN) {
+			return res
+				.status(500)
+				.json({ error: "DESIGN_PRINTIFY_TOKEN must be set in environment." });
+		}
 
-		// 5. Return a combined response
+		const designResults = await fetchAndSyncShopsForToken(DESIGN_TOKEN);
+
+		// 5. Return response
 		return res.json({
 			success: true,
 			message:
-				"Orders have been successfully synced from both Printify tokens.",
-			details: [resultsStandard, resultsDesign],
+				"Orders have been successfully synced from the DESIGN Printify token.",
+			details: designResults,
 		});
 	} catch (error) {
 		console.error("Error fetching orders:", error.message);
