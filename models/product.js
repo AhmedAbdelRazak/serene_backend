@@ -224,6 +224,10 @@ const productSchema = new mongoose.Schema(
 					type: Number,
 					default: 0,
 				},
+				scent: {
+					type: String,
+					default: "",
+				},
 				price: {
 					type: Number,
 					default: 0,

@@ -452,6 +452,8 @@ exports.syncPrintifyProducts = async (req, res) => {
 			"679ab14d7fc1cdd41f08a20a",
 			"679aafdff6537a44d9023235",
 			"679aae24f6537a44d90231b7",
+			"680a6dbc82aa6fcd4901beaa",
+			"680a79254feb8fbd64074b22",
 		];
 
 		// Category & Subcategory IDs for POD
@@ -471,7 +473,8 @@ exports.syncPrintifyProducts = async (req, res) => {
 		//-------------------------------------------------------------------
 		const categories = await Category.find().sort({ createdAt: -1 });
 		const subcategories = await Subcategory.find();
-		const colors = await Colors.find(); // If you're actually using it
+		// If you need color sets from DB:
+		// const colors = await Colors.find(); // Example (not strictly necessary)
 
 		//-------------------------------------------------------------------
 		// 2. HELPER: FETCH SHOP + PRODUCTS for the DESIGN token
@@ -512,9 +515,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 		const designProducts = await fetchDesignProducts("DESIGN", DESIGN_TOKEN);
 
 		if (!designProducts.length) {
-			return res.status(404).json({
-				error: "No products found from the Printify design shop",
-			});
+			return res
+				.status(404)
+				.json({ error: "No products found from the Printify design shop" });
 		}
 
 		// We’ll call these our “combinedProducts,” but in reality it’s just one list:
@@ -681,7 +684,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				continue;
 			}
 
-			// Create slugified strings
+			// Build product slug
 			const productSlug = slugify(printifyProduct.title, {
 				lower: true,
 				strict: true,
@@ -690,200 +693,13 @@ exports.syncPrintifyProducts = async (req, res) => {
 				lower: true,
 				strict: true,
 			});
+
+			// For toggling addVariables
 			const addVariables =
 				Array.isArray(printifyProduct.options) &&
 				printifyProduct.options.length > 0;
 
-			//-------------------------------------------------------------------
-			// CANDLE LOGIC
-			//-------------------------------------------------------------------
-			const isCandle =
-				printifyProduct.title.toLowerCase().includes("candle") ||
-				printifyProduct.tags.some((tag) =>
-					tag.toLowerCase().includes("candles")
-				);
-
-			if (isCandle) {
-				// If it has multiple variants (options), treat each variant as separate product in Mongo
-				if (addVariables) {
-					for (const variant of printifyProduct.variants || []) {
-						if (!variant.is_enabled) continue;
-						if (!variant.sku) {
-							failedProducts.push(printifyProduct.title);
-							continue;
-						}
-						// Extract scent
-						const scentOpt = printifyProduct.options.find(
-							(o) => o.type === "scent"
-						);
-						let scent = "";
-						if (scentOpt && variant.options?.length) {
-							const scentId = variant.options[0];
-							const foundScentValue = scentOpt.values.find(
-								(v) => v.id === scentId
-							);
-							scent = foundScentValue?.title || "";
-						}
-
-						// Possibly upload images
-						const existingVariantDoc = await Product.findOne({
-							productSKU: variant.sku,
-						});
-						let validUploadedImages = [];
-						if (!existingVariantDoc) {
-							const variantImages = (printifyProduct.images || []).filter(
-								(img) => img.variant_ids.includes(variant.id)
-							);
-							validUploadedImages = await uploadImageToCloudinaryLimited(
-								variantImages,
-								5
-							);
-						} else {
-							validUploadedImages =
-								existingVariantDoc.thumbnailImage?.[0]?.images || [];
-						}
-
-						const uniqueSlug = `${productSlug}-${variant.sku}`;
-						const uniqueSlugArabic = `${productSlugArabic}-${variant.sku}`;
-
-						const productData = {
-							productName: `${printifyProduct.title} - ${variant.title}`,
-							description: printifyProduct.description || "",
-							price: (variant.price / 100) * 1.2,
-							priceAfterDiscount: variant.price / 100,
-							MSRPPriceBasic: ((variant.price / 100) * 0.75).toFixed(2),
-							quantity: 100,
-							slug: uniqueSlug,
-							slug_Arabic: uniqueSlugArabic,
-							category: matchingCategory?._id,
-							subcategory: matchingSubcategories.map((s) => s._id),
-							gender: "6635ab22898104005c96250a", // example gender ref
-							chosenSeason: "all",
-							thumbnailImage: [
-								{
-									images: validUploadedImages,
-								},
-							],
-							isPrintifyProduct: true,
-							addVariables: false,
-							printifyProductDetails: {
-								POD: isPOD,
-								id: printifyProduct.id,
-								title: printifyProduct.title,
-								description: printifyProduct.description,
-								tags: printifyProduct.tags,
-								options: printifyProduct.options,
-								variants: [variant],
-								images: printifyProduct.images,
-								created_at: printifyProduct.created_at,
-								updated_at: printifyProduct.updated_at,
-								visible: printifyProduct.visible,
-								is_locked: printifyProduct.is_locked,
-								blueprint_id: printifyProduct.blueprint_id,
-								user_id: printifyProduct.user_id,
-								shop_id: printifyProduct.__shopId,
-								print_provider_id: printifyProduct.print_provider_id,
-								print_areas: printifyProduct.print_areas,
-								print_details: printifyProduct.print_details,
-								sales_channel_properties:
-									printifyProduct.sales_channel_properties,
-								is_printify_express_eligible:
-									printifyProduct.is_printify_express_eligible,
-								is_printify_express_enabled:
-									printifyProduct.is_printify_express_enabled,
-								is_economy_shipping_eligible:
-									printifyProduct.is_economy_shipping_eligible,
-								is_economy_shipping_enabled:
-									printifyProduct.is_economy_shipping_enabled,
-							},
-							scent,
-							productAttributes: [],
-						};
-
-						await handleProductSync(productData, variant.sku, printifyProduct);
-					}
-				} else {
-					// Single-variant candle
-					const firstVar = printifyProduct.variants?.[0];
-					if (!firstVar?.sku) {
-						failedProducts.push(printifyProduct.title);
-						continue;
-					}
-					let validUploadedImages = [];
-					const existingDoc = await Product.findOne({
-						productSKU: firstVar.sku,
-					});
-					if (!existingDoc) {
-						validUploadedImages = await uploadImageToCloudinaryLimited(
-							printifyProduct.images || [],
-							5
-						);
-					} else {
-						validUploadedImages = existingDoc.thumbnailImage?.[0]?.images || [];
-					}
-
-					const productData = {
-						productName: printifyProduct.title,
-						description: printifyProduct.description || "",
-						price: (firstVar.price / 100) * 1.2,
-						priceAfterDiscount: firstVar.price / 100,
-						MSRPPriceBasic: ((firstVar.price / 100) * 0.75).toFixed(2),
-						quantity: 100,
-						slug: `${productSlug}-${printifyProduct.id}`,
-						slug_Arabic: `${productSlugArabic}-${printifyProduct.id}`,
-						category: matchingCategory?._id,
-						subcategory: matchingSubcategories.map((s) => s._id),
-						gender: "6635ab22898104005c96250a", // example
-						chosenSeason: "all",
-						thumbnailImage: [
-							{
-								images: validUploadedImages,
-							},
-						],
-						isPrintifyProduct: true,
-						addVariables: false,
-						printifyProductDetails: {
-							POD: isPOD,
-							id: printifyProduct.id,
-							title: printifyProduct.title,
-							description: printifyProduct.description,
-							tags: printifyProduct.tags,
-							options: printifyProduct.options,
-							variants: printifyProduct.variants,
-							images: printifyProduct.images,
-							created_at: printifyProduct.created_at,
-							updated_at: printifyProduct.updated_at,
-							visible: printifyProduct.visible,
-							is_locked: printifyProduct.is_locked,
-							blueprint_id: printifyProduct.blueprint_id,
-							user_id: printifyProduct.user_id,
-							shop_id: printifyProduct.__shopId,
-							print_provider_id: printifyProduct.print_provider_id,
-							print_areas: printifyProduct.print_areas,
-							print_details: printifyProduct.print_details,
-							sales_channel_properties:
-								printifyProduct.sales_channel_properties,
-							is_printify_express_eligible:
-								printifyProduct.is_printify_express_eligible,
-							is_printify_express_enabled:
-								printifyProduct.is_printify_express_enabled,
-							is_economy_shipping_eligible:
-								printifyProduct.is_economy_shipping_eligible,
-							is_economy_shipping_enabled:
-								printifyProduct.is_economy_shipping_enabled,
-						},
-						productAttributes: [],
-					};
-					await handleProductSync(productData, firstVar.sku, printifyProduct);
-				}
-
-				processedProducts.push(printifyProduct.id);
-				continue;
-			}
-
-			//-------------------------------------------------------------------
-			// NON-CANDLE / MULTI-VARIANT LOGIC
-			//-------------------------------------------------------------------
+			// Check for variants
 			const enabledVariants = (printifyProduct.variants || []).filter(
 				(v) => v.is_enabled
 			);
@@ -893,44 +709,84 @@ exports.syncPrintifyProducts = async (req, res) => {
 				continue;
 			}
 
-			const colorOption = printifyProduct.options?.find(
-				(o) => o.type === "color"
-			);
-			const sizeOption = printifyProduct.options?.find(
-				(o) => o.type === "size"
-			);
-			const scentOption = printifyProduct.options?.find(
-				(o) => o.type === "scent"
-			);
-
-			// Sort variants by size, if there's a size option
-			if (sizeOption) {
-				const sizeOrder = ["S", "M", "L", "XL", "XXL", "3XL", "4XL", "5XL"];
-				enabledVariants.sort((a, b) => {
-					const sizeAId = a.options?.[1];
-					const sizeBId = b.options?.[1];
-					const sizeA = sizeOption.values.find((x) => x.id === sizeAId)?.title;
-					const sizeB = sizeOption.values.find((x) => x.id === sizeBId)?.title;
-					return sizeOrder.indexOf(sizeA) - sizeOrder.indexOf(sizeB);
+			// ---------------------------------------------------------
+			// Build an option map => { [valueId]: { type, title, colors? } }
+			// This ensures we can handle color/size/scent in ANY order
+			// ---------------------------------------------------------
+			const optionValueMap = {}; // key = value.id, val = { type, title, colors? }
+			(printifyProduct.options || []).forEach((option) => {
+				(option.values || []).forEach((val) => {
+					// e.g. val = { id, title, colors }
+					optionValueMap[val.id] = {
+						type: option.type, // "color", "size", "scent", ...
+						title: val.title,
+						colors: val.colors || [],
+					};
 				});
-			}
+			});
 
-			const hasSingleVariant =
-				enabledVariants.length === 1 &&
-				!colorOption &&
-				!sizeOption &&
-				!scentOption;
+			// ---------------------------------------------------------
+			// Sort by size if a size option is present
+			// Example size ordering array. Adjust as needed.
+			// ---------------------------------------------------------
+			const sizeOrdering = [
+				"XS",
+				"S",
+				"M",
+				"L",
+				"XL",
+				"2XL",
+				"XXL",
+				"3XL",
+				"4XL",
+				"5XL",
+			];
+			enabledVariants.sort((a, b) => {
+				// Attempt to find size strings from the variant options
+				// Because variant.options is an array of value-IDs
+				let sizeA = "";
+				let sizeB = "";
+				for (let valId of a.options || []) {
+					if (optionValueMap[valId]?.type === "size") {
+						sizeA = optionValueMap[valId].title;
+						break;
+					}
+				}
+				for (let valId of b.options || []) {
+					if (optionValueMap[valId]?.type === "size") {
+						sizeB = optionValueMap[valId].title;
+						break;
+					}
+				}
 
+				const idxA = sizeOrdering.indexOf(sizeA);
+				const idxB = sizeOrdering.indexOf(sizeB);
+
+				// If either size not found in list => sort them to the end
+				if (idxA === -1 && idxB === -1) return 0;
+				if (idxA === -1) return 1;
+				if (idxB === -1) return -1;
+
+				return idxA - idxB;
+			});
+
+			// We'll use the FIRST variant’s SKU for the top-level product (slug, etc.)
 			const firstVariantSKU = enabledVariants[0].sku || "NOSKU";
+
+			// Check if there's already a top-level product
 			const existingTopLevel = await Product.findOne({
 				productSKU: firstVariantSKU,
 			});
 
+			// -----------------------------------------
+			// Upload a handful of images for top-level
+			// -----------------------------------------
 			let validUploadedImages = [];
 			if (!existingTopLevel) {
-				// Upload images that are relevant to any enabled variant
+				// If top-level doesn’t exist yet, we upload
 				const relevantImagesForProduct = (printifyProduct.images || []).filter(
 					(img) => {
+						// Keep if any of its variant_ids matches an enabled variant
 						return img.variant_ids.some((vId) =>
 							enabledVariants.some((ev) => ev.id === vId)
 						);
@@ -941,17 +797,23 @@ exports.syncPrintifyProducts = async (req, res) => {
 					5
 				);
 			} else {
+				// If product already exists, just reuse its images
 				validUploadedImages =
 					existingTopLevel.thumbnailImage?.[0]?.images || [];
 			}
 
+			// -----------------------------------------
+			// Build top-level product data (w/o attributes)
+			// -----------------------------------------
+			const baseVariantPrice = enabledVariants[0].price / 100;
+
 			const productData = {
 				productName: printifyProduct.title,
 				description: printifyProduct.description || "",
-				price: (enabledVariants[0].price / 100) * 1.2,
-				priceAfterDiscount: enabledVariants[0].price / 100,
-				MSRPPriceBasic: ((enabledVariants[0].price / 100) * 0.75).toFixed(2),
-				quantity: 100,
+				price: (baseVariantPrice * 1.2).toFixed(2),
+				priceAfterDiscount: baseVariantPrice.toFixed(2),
+				MSRPPriceBasic: (baseVariantPrice * 0.75).toFixed(2),
+				quantity: 20,
 				slug: `${productSlug}-${firstVariantSKU}`,
 				slug_Arabic: `${productSlugArabic}-${firstVariantSKU}`,
 				category: matchingCategory?._id,
@@ -964,7 +826,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 					},
 				],
 				isPrintifyProduct: true,
-				addVariables: !hasSingleVariant && addVariables,
+				addVariables: addVariables, // If there’s at least 1 “options” in Printify
 				printifyProductDetails: {
 					POD: isPOD,
 					id: printifyProduct.id,
@@ -997,56 +859,49 @@ exports.syncPrintifyProducts = async (req, res) => {
 				productAttributes: [],
 			};
 
-			if (hasSingleVariant) {
-				// Single-variant product
-				await handleProductSync(productData, firstVariantSKU, printifyProduct);
-				processedProducts.push(printifyProduct.id);
-				continue;
-			} else {
-				// Multi-variant => build productAttributes
-				productData.productAttributes = await Promise.all(
-					enabledVariants.map(async (variant) => {
-						const colorVal = colorOption
-							? colorOption.values.find(
-									(val) => val.id === variant.options?.[0]
-							  )?.colors?.[0] || ""
-							: "";
-						const sizeVal = sizeOption
-							? sizeOption.values.find((val) => val.id === variant.options?.[1])
-									?.title || ""
-							: "";
-						const scentVal = scentOption
-							? scentOption.values.find(
-									(val) => val.id === variant.options?.[0]
-							  )?.title || ""
-							: "";
+			// -----------------------------------------
+			// Build productAttributes array
+			// -----------------------------------------
+			productData.productAttributes = await Promise.all(
+				enabledVariants.map(async (variant) => {
+					// For each variant, find color/size/scent (etc.)
+					let colorVal = "";
+					let sizeVal = "";
+					let scentVal = "";
 
-						const pkParts = [];
-						if (sizeVal) pkParts.push(sizeVal);
-						if (colorVal) pkParts.push(colorVal);
-						if (scentVal) pkParts.push(scentVal);
-						const PK = pkParts.filter(Boolean).join("#") || variant.sku;
+					// Each variant has an array of option IDs. We look them up in the map.
+					for (let valId of variant.options || []) {
+						const foundOption = optionValueMap[valId];
+						if (!foundOption) continue;
+						if (foundOption.type === "color") {
+							// If "colors" array is present, usually the first color is the name
+							// or it might just be foundOption.title if you prefer
+							colorVal = foundOption.colors?.[0] || foundOption.title || "";
+						} else if (foundOption.type === "size") {
+							sizeVal = foundOption.title;
+						} else if (foundOption.type === "scent") {
+							scentVal = foundOption.title;
+						}
+						// If you have more option types, handle them here
+					}
 
-						let variantUploadedImages = [];
-						if (existingTopLevel) {
-							// If the top-level product exists, see if we already have images
-							const existingAttr = existingTopLevel.productAttributes?.find(
-								(a) => a.SubSKU === variant.sku
-							);
-							if (existingAttr) {
-								variantUploadedImages = existingAttr.productImages || [];
-							} else {
-								// Otherwise, upload new variant images
-								const vImages = (printifyProduct.images || []).filter((img) =>
-									img.variant_ids.includes(variant.id)
-								);
-								variantUploadedImages = await uploadImageToCloudinaryLimited(
-									vImages,
-									5
-								);
-							}
+					// Build PK: e.g. "S#Black#Sea Salt + Orchid"
+					const pkParts = [];
+					if (sizeVal) pkParts.push(sizeVal);
+					if (colorVal) pkParts.push(colorVal);
+					if (scentVal) pkParts.push(scentVal);
+					const PK = pkParts.length ? pkParts.join("#") : variant.sku;
+
+					// Upload or reuse variant images
+					let variantUploadedImages = [];
+					if (existingTopLevel) {
+						const existingAttr = existingTopLevel.productAttributes?.find(
+							(a) => a.SubSKU === variant.sku
+						);
+						if (existingAttr) {
+							variantUploadedImages = existingAttr.productImages || [];
 						} else {
-							// No top-level product: always upload
+							// Otherwise, upload new for this variant
 							const vImages = (printifyProduct.images || []).filter((img) =>
 								img.variant_ids.includes(variant.id)
 							);
@@ -1055,27 +910,42 @@ exports.syncPrintifyProducts = async (req, res) => {
 								5
 							);
 						}
+					} else {
+						// top-level not exist => always upload
+						const vImages = (printifyProduct.images || []).filter((img) =>
+							img.variant_ids.includes(variant.id)
+						);
+						variantUploadedImages = await uploadImageToCloudinaryLimited(
+							vImages,
+							5
+						);
+					}
 
-						return {
-							PK,
-							color: colorVal,
-							size: sizeVal,
-							scent: scentVal,
-							SubSKU: variant.sku,
-							quantity: 100,
-							price: (variant.price / 100) * 1.2,
-							priceAfterDiscount: variant.price / 100,
-							MSRP: ((variant.price / 100) * 0.75).toFixed(2),
-							WholeSalePrice: ((variant.price / 100) * 0.75).toFixed(2),
-							DropShippingPrice: ((variant.price / 100) * 0.85).toFixed(2),
-							productImages: variantUploadedImages,
-						};
-					})
-				);
+					const rawPrice = variant.price / 100;
+					return {
+						PK,
+						color: colorVal,
+						size: sizeVal,
+						scent: scentVal,
+						SubSKU: variant.sku,
+						quantity: 20,
+						price: (rawPrice * 1.2).toFixed(2),
+						priceAfterDiscount: rawPrice.toFixed(2),
+						MSRP: (rawPrice * 0.75).toFixed(2),
+						WholeSalePrice: (rawPrice * 0.75).toFixed(2),
+						DropShippingPrice: (rawPrice * 0.85).toFixed(2),
+						productImages: variantUploadedImages,
+					};
+				})
+			);
 
-				await handleProductSync(productData, firstVariantSKU, printifyProduct);
-				processedProducts.push(printifyProduct.id);
-			}
+			// -----------------------------------------
+			// Now create/update top-level product
+			// (We pass the FIRST variant’s SKU so
+			//  we can do a proper lookup in handleProductSync)
+			// -----------------------------------------
+			await handleProductSync(productData, firstVariantSKU, printifyProduct);
+			processedProducts.push(printifyProduct.id);
 		}
 
 		//-------------------------------------------------------------------
