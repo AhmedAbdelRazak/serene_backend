@@ -322,9 +322,9 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 
 exports.printifyOrders = async (req, res) => {
 	try {
-		// 1. Grab orders, excluding any whose status matches
-		//    "delivered", "cancelled", "shipped", or "ready to ship"
-		//    in a case-insensitive manner.
+		// 1. Grab orders, excluding any whose status is
+		//    "delivered", "cancelled", "shipped", or "ready to ship" (case-insensitive),
+		//    plus "fulfilled" if it happens to be stored locally.
 		const ordersToCheck = await Order.find({
 			status: {
 				$nin: [
@@ -332,7 +332,7 @@ exports.printifyOrders = async (req, res) => {
 					/^cancelled$/i,
 					/^shipped$/i,
 					/^ready to ship$/i,
-					/^fulfilled$/i,
+					/^fulfilled$/i, // just in case
 				],
 			},
 			"printifyOrderDetails.0.ephemeralOrder.id": { $exists: true },
@@ -346,6 +346,28 @@ exports.printifyOrders = async (req, res) => {
 				orderMap.set(printifyId, order);
 			}
 		});
+
+		// Helper function: map Printify status => local status
+		function mapPrintifyStatusToLocalStatus(printifyStatus) {
+			if (!printifyStatus) return "";
+			const ps = printifyStatus.toLowerCase();
+
+			switch (ps) {
+				case "in_transit":
+					return "Shipped";
+				case "fulfilled":
+					return "Delivered";
+				case "canceled":
+					return "Cancelled";
+				case "in_production":
+				case "pre_transit":
+					return "Ready to Ship";
+				default:
+					// For other statuses, e.g. "unsubmitted", "payment_not_received", etc.,
+					// just use the raw Printify status (or map them as you like).
+					return printifyStatus;
+			}
+		}
 
 		// 3. Fetch shops/orders using DESIGN_PRINTIFY_TOKEN only
 		const token = process.env.DESIGN_PRINTIFY_TOKEN;
@@ -379,18 +401,23 @@ exports.printifyOrders = async (req, res) => {
 
 				const updatedFields = {};
 
-				// If local status differs from Printify, update it
-				if (existingOrder.status !== printifyOrder.status) {
-					updatedFields.status = printifyOrder.status;
+				// Map the Printify status to your local status
+				const mappedLocalStatus = mapPrintifyStatusToLocalStatus(
+					printifyOrder.status
+				);
+
+				// If your local order's status differs, update it
+				if (existingOrder.status !== mappedLocalStatus) {
+					updatedFields.status = mappedLocalStatus;
 				}
 
-				// If tracking number differs, update it
+				// If the tracking number differs, update it
 				const printifyTracking = printifyOrder?.printify_connect?.url || null;
 				if (existingOrder.trackingNumber !== printifyTracking) {
 					updatedFields.trackingNumber = printifyTracking;
 				}
 
-				// If we have changes, update
+				// Update only if we have changes
 				if (Object.keys(updatedFields).length > 0) {
 					await Order.updateOne(
 						{ _id: existingOrder._id },
