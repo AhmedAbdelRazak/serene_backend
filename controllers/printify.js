@@ -322,120 +322,96 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 
 exports.printifyOrders = async (req, res) => {
 	try {
-		// 1. Fetch orders from MongoDB that we need to sync (exclude delivered/cancelled)
+		// 1. Grab orders, excluding any whose status matches
+		//    "delivered", "cancelled", "shipped", or "ready to ship"
+		//    in a case-insensitive manner.
 		const ordersToCheck = await Order.find({
-			status: { $nin: ["delivered", "cancelled"] },
-			"printifyOrderDetails.id": { $exists: true },
+			status: {
+				$nin: [
+					/^delivered$/i,
+					/^cancelled$/i,
+					/^shipped$/i,
+					/^ready to ship$/i,
+					/^fulfilled$/i,
+				],
+			},
+			"printifyOrderDetails.0.ephemeralOrder.id": { $exists: true },
 		});
 
-		// 2. Create a map of Printify Order IDs => local Order docs
-		//    for quick lookup & updates later.
+		// 2. Build a map of ephemeralOrder.id => local Order doc
 		const orderMap = new Map();
 		ordersToCheck.forEach((order) => {
-			orderMap.set(order.printifyOrderDetails.id, order);
+			const printifyId = order.printifyOrderDetails?.[0]?.ephemeralOrder?.id;
+			if (printifyId) {
+				orderMap.set(printifyId, order);
+			}
 		});
 
-		// 3. Helper to fetch shops & orders for a given token, then update local DB
-		const fetchAndSyncShopsForToken = async (token) => {
-			const tokenLabel =
-				token === process.env.PRINTIFY_TOKEN ? "STANDARD" : "DESIGN";
-
-			// Attempt to fetch shops
-			const shopResponse = await axios.get(
-				"https://api.printify.com/v1/shops.json",
-				{
-					headers: { Authorization: `Bearer ${token}` },
-				}
-			);
-
-			if (
-				!shopResponse.data ||
-				!Array.isArray(shopResponse.data) ||
-				!shopResponse.data.length
-			) {
-				console.log(`⚠️ [${tokenLabel}] No shops found.`);
-				return { tokenLabel, shopsCount: 0, ordersSyncedCount: 0 };
-			}
-
-			let totalOrdersSynced = 0;
-
-			// Iterate over each shop found under this token
-			for (const shop of shopResponse.data) {
-				const shopId = shop.id;
-
-				// Fetch orders for this shop
-				const ordersResponse = await axios.get(
-					`https://api.printify.com/v1/shops/${shopId}/orders.json`,
-					{
-						headers: { Authorization: `Bearer ${token}` },
-					}
-				);
-
-				const fetchedOrders = ordersResponse.data?.data || [];
-				console.log(
-					`[${tokenLabel}] ShopID=${shopId} => ${fetchedOrders.length} orders fetched.`
-				);
-
-				// Loop through each Printify order from that shop
-				for (const printifyOrder of fetchedOrders) {
-					// Check if we have a matching local order
-					const existingOrder = orderMap.get(printifyOrder.id);
-					if (!existingOrder) continue; // Not a local order we care about
-
-					const updatedFields = {};
-
-					// If local status differs from the Printify order status, update it
-					if (existingOrder.status !== printifyOrder.status) {
-						updatedFields.status = printifyOrder.status;
-					}
-
-					// Check & update the tracking number if different
-					const printifyTracking = printifyOrder?.printify_connect?.url || null;
-					if (existingOrder.trackingNumber !== printifyTracking) {
-						updatedFields.trackingNumber = printifyTracking;
-					}
-
-					// If we have changes, update the local DB
-					if (Object.keys(updatedFields).length > 0) {
-						await Order.updateOne(
-							{ _id: existingOrder._id },
-							{ $set: updatedFields }
-						);
-						totalOrdersSynced += 1;
-					}
-				}
-			}
-
-			return {
-				tokenLabel,
-				shopsCount: shopResponse.data.length,
-				ordersSyncedCount: totalOrdersSynced,
-			};
-		};
-
-		// 4. Call our helper for both tokens
-		const resultsStandard = await fetchAndSyncShopsForToken(
-			process.env.PRINTIFY_TOKEN
-		);
-		const resultsDesign = await fetchAndSyncShopsForToken(
-			process.env.DESIGN_PRINTIFY_TOKEN
-		);
-
-		// 5. Return a combined response
-		return res.json({
-			success: true,
-			message:
-				"Orders have been successfully synced from both Printify tokens.",
-			details: [resultsStandard, resultsDesign],
-		});
-	} catch (error) {
-		console.error("Error fetching orders:", error.message);
-		if (error.response) {
-			console.error("Printify API response:", error.response.data);
+		// 3. Fetch shops/orders using DESIGN_PRINTIFY_TOKEN only
+		const token = process.env.DESIGN_PRINTIFY_TOKEN;
+		if (!token) {
+			return res.status(500).json({ error: "DESIGN_PRINTIFY_TOKEN missing." });
 		}
-		return res
-			.status(500)
-			.json({ error: "Error fetching orders from Printify" });
+
+		// Fetch shops
+		const shopResponse = await axios.get(
+			"https://api.printify.com/v1/shops.json",
+			{
+				headers: { Authorization: `Bearer ${token}` },
+			}
+		);
+		const shops = shopResponse.data || [];
+		let totalOrdersSynced = 0;
+
+		// For each shop, get orders and update local DB
+		for (const shop of shops) {
+			const shopId = shop.id;
+			const ordersResponse = await axios.get(
+				`https://api.printify.com/v1/shops/${shopId}/orders.json`,
+				{ headers: { Authorization: `Bearer ${token}` } }
+			);
+			const printifyOrders = ordersResponse.data?.data || [];
+
+			for (const printifyOrder of printifyOrders) {
+				// Attempt to find a matching local order
+				const existingOrder = orderMap.get(printifyOrder.id);
+				if (!existingOrder) continue;
+
+				const updatedFields = {};
+
+				// If local status differs from Printify, update it
+				if (existingOrder.status !== printifyOrder.status) {
+					updatedFields.status = printifyOrder.status;
+				}
+
+				// If tracking number differs, update it
+				const printifyTracking = printifyOrder?.printify_connect?.url || null;
+				if (existingOrder.trackingNumber !== printifyTracking) {
+					updatedFields.trackingNumber = printifyTracking;
+				}
+
+				// If we have changes, update
+				if (Object.keys(updatedFields).length > 0) {
+					await Order.updateOne(
+						{ _id: existingOrder._id },
+						{ $set: updatedFields }
+					);
+					totalOrdersSynced++;
+				}
+			}
+		}
+
+		res.json({
+			success: true,
+			message: "Orders synced with Printify (DESIGN token only).",
+			ordersSynced: totalOrdersSynced,
+		});
+	} catch (err) {
+		console.error("Error syncing Printify orders:", err.message);
+		if (err.response) {
+			console.error("Printify API Response:", err.response.data);
+		}
+		res.status(500).json({ error: "Error syncing Printify orders" });
 	}
 };
 
