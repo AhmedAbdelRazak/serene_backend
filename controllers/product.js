@@ -1332,7 +1332,9 @@ exports.filteredProducts = async (req, res, next) => {
 		let uniqueProductsMap = {};
 		let finalProducts = [];
 
-		// 1) Filter attributes by color/size if provided
+		// (1) Filter attributes by color/size if provided.
+		//     Instead of pushing into finalProducts here,
+		//     we build an intermediate array: processedProducts.
 		const processedProducts = products
 			.map((product) => {
 				if (
@@ -1340,7 +1342,7 @@ exports.filteredProducts = async (req, res, next) => {
 					product.productAttributes &&
 					product.productAttributes.length > 0
 				) {
-					// Store all attributes
+					// Store all attributes to keep track
 					const overallProductAttributes = [...product.productAttributes];
 
 					// Filter by color & size
@@ -1360,21 +1362,23 @@ exports.filteredProducts = async (req, res, next) => {
 					);
 
 					if (filteredAttributes.length > 0) {
-						const newProduct = {
+						return {
 							...product,
 							productAttributes: filteredAttributes,
 							overallProductAttributes,
 						};
-						finalProducts.push(newProduct);
+					} else {
+						// If no attributes match, skip
+						return null;
 					}
-				} else if (product) {
-					// No attributes => push as is
-					finalProducts.push(product);
+				} else {
+					// Product has no attributes or is null
+					return product; // if product is valid, just return
 				}
 			})
-			.flat();
+			.filter(Boolean); // remove null entries
 
-		// 2) Deduplicate logic
+		// (2) Deduplicate logic + build finalProducts
 		processedProducts.forEach((product) => {
 			if (product) {
 				if (product.addVariables) {
@@ -1402,28 +1406,15 @@ exports.filteredProducts = async (req, res, next) => {
 		// ===============================
 		// Custom Sorting w/ In-Stock First
 		// ===============================
-		//
-		// 1) Pinned IDs => rank 0 or 1
-		// 2) Other with printifyProductDetails => rank=3 (bottom)
-		// 3) Everything else => rank=2 (middle)
-		//    but for rank=2:
-		//      subRank=0 if totalQuantity>0 else subRank=1 (in-stock first)
-		//    then sort by updatedAt desc
-		//
-		// const pinnedIds = ["679dfc3ea7d26767d37667a6", "679dfc34a7d26767d376678b"];
-		const pinnedIds = [];
+		const pinnedIds = []; // e.g. ["someObjectId1","someObjectId2"]
 
-		// Helper to compute total quantity for each product
 		function getTotalQuantity(prod) {
-			// If product has overallProductAttributes or productAttributes
-			// sum them, else use product.quantity
 			let attrSum = 0;
 			if (prod.productAttributes && Array.isArray(prod.productAttributes)) {
 				attrSum = prod.productAttributes.reduce((acc, a) => {
 					return acc + (Number(a.quantity) || 0);
 				}, 0);
 			}
-			// If there's a top-level product.quantity, add it
 			const topLevelQty = Number(prod.quantity) || 0;
 			return topLevelQty + attrSum;
 		}
@@ -1434,11 +1425,9 @@ exports.filteredProducts = async (req, res, next) => {
 
 			if (pinnedIds.includes(strId)) {
 				// pinned => top
-				// rank is indexOf => 0 or 1
-				prod.sortRank = pinnedIds.indexOf(strId);
+				prod.sortRank = pinnedIds.indexOf(strId); // 0 or 1...
 				prod.sortMark = "pinnedProduct";
-				// pinned gets subRank=0 by default
-				prod.subRank = 0;
+				prod.subRank = 0; // pinned gets subRank=0
 			} else if (prod.printifyProductDetails) {
 				// bottom
 				prod.sortRank = 3;
@@ -1454,7 +1443,7 @@ exports.filteredProducts = async (req, res, next) => {
 			}
 		});
 
-		// Now final sort
+		// Final sort
 		finalProducts.sort((a, b) => {
 			// 1. sort by rank ascending
 			if (a.sortRank !== b.sortRank) {
