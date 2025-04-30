@@ -457,6 +457,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			"679aae24f6537a44d90231b7",
 			"680a6dbc82aa6fcd4901beaa",
 			"680a79254feb8fbd64074b22",
+			"680bd2d64feb8fbd6407a02b",
 		];
 
 		// Category & Subcategory IDs for POD
