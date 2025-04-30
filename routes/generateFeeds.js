@@ -301,10 +301,15 @@ router.get("/generate-feeds", async (req, res) => {
 	let googleItems = [];
 	let facebookItems = [];
 
-	// Fetch active products
-	const products = await Product.find({ activeProduct: true }).populate(
-		"category"
-	);
+	// Fetch products that are active or allowed for backorder or activated by the seller
+	// so we don't exclude the product that has activeProduct=false but activeProductBySeller=true, or activeBackorder=true
+	const products = await Product.find({
+		$or: [
+			{ activeProduct: true },
+			// { activeProductBySeller: true },
+			// { activeBackorder: true },
+		],
+	}).populate("category");
 
 	for (let product of products) {
 		// Only if product has an active category
@@ -362,9 +367,32 @@ router.get("/generate-feeds", async (req, res) => {
 							getVariantColorSizeScent(product, variant);
 
 						const variantPrice = getFinalVariantPrice(variant);
-						const googleAvailability = "in stock"; // or "out_of_stock"
-						const facebookAvailability = "in stock";
-						const facebookInventory = variant.quantity || 9999;
+
+						// Attempt to find the local matched attribute so we can use its quantity
+						let matchedAttr;
+						if (
+							product.productAttributes &&
+							product.productAttributes.length > 0
+						) {
+							matchedAttr = product.productAttributes.find(
+								(a) => a.SubSKU === variant.sku
+							);
+						}
+
+						// If we found a local attribute, use its quantity; otherwise fallback
+						let facebookInventory = 9999;
+						let googleAvailability = "in stock";
+						if (matchedAttr && matchedAttr.quantity != null) {
+							facebookInventory = matchedAttr.quantity;
+							googleAvailability =
+								matchedAttr.quantity > 0 ? "in stock" : "out_of_stock";
+						} else {
+							// fallback to variant.quantity or a default
+							facebookInventory = variant.quantity || 9999;
+							// we originally used "in stock" as a default
+							// can also do dynamic if variant.quantity is 0, but keep it simple
+						}
+						const facebookAvailability = googleAvailability;
 
 						// Attempt to find images for that variant
 						let variantImages = [];
@@ -372,11 +400,11 @@ router.get("/generate-feeds", async (req, res) => {
 							product.productAttributes &&
 							product.productAttributes.length > 0
 						) {
-							const matchedAttr = product.productAttributes.find(
+							const matchedAttrImgs = product.productAttributes.find(
 								(a) => a.SubSKU === variant.sku
 							);
-							if (matchedAttr && matchedAttr.productImages?.length) {
-								variantImages = matchedAttr.productImages.map((x) => x.url);
+							if (matchedAttrImgs && matchedAttrImgs.productImages?.length) {
+								variantImages = matchedAttrImgs.productImages.map((x) => x.url);
 							}
 						}
 						if (!variantImages.length) {
@@ -484,7 +512,7 @@ router.get("/generate-feeds", async (req, res) => {
 					)} (Custom Design)`;
 					const finalLink = getProductLink(product);
 					const googleAvailability =
-						product.quantity > 0 ? "in stock" : "out of stock";
+						product.quantity > 0 ? "in stock" : "out_of_stock";
 					const facebookAvailability = googleAvailability;
 					const facebookInventory = product.quantity || 9999;
 
@@ -576,7 +604,7 @@ router.get("/generate-feeds", async (req, res) => {
 						const variantSize = variant.size || "";
 
 						const googleAvailability =
-							variant.quantity > 0 ? "in stock" : "out of stock";
+							variant.quantity > 0 ? "in stock" : "out_of_stock";
 						const facebookAvailability = googleAvailability;
 						const facebookInventory = variant.quantity || 9999;
 
@@ -685,7 +713,7 @@ router.get("/generate-feeds", async (req, res) => {
 					const facebookImageXML = buildFacebookImageTags(fallbackImages);
 
 					const googleAvailability =
-						product.quantity > 0 ? "in stock" : "out of stock";
+						product.quantity > 0 ? "in stock" : "out_of_stock";
 					const facebookAvailability = googleAvailability;
 					const facebookInventory = product.quantity || 9999;
 
