@@ -6,6 +6,7 @@ const Subcategory = require("../models/subcategory");
 const Colors = require("../models/colors");
 const { Order } = require("../models/order");
 const cloudinary = require("cloudinary").v2;
+const path = require("path");
 
 // Configure Cloudinary
 cloudinary.config({
@@ -13,6 +14,11 @@ cloudinary.config({
 	api_key: process.env.CLOUDINARY_API_KEY,
 	api_secret: process.env.CLOUDINARY_API_SECRET,
 });
+
+const localYourDesignHerePath = path.join(
+	__dirname,
+	"../shopLogo/YourDesignHere.png"
+);
 
 exports.publishPrintifyProducts = async (req, res) => {
 	try {
@@ -442,6 +448,230 @@ exports.printifyOrders = async (req, res) => {
 	}
 };
 
+//------------------------------------------------------
+// 1) The HELPER function: createTempDesignPreview
+//------------------------------------------------------
+
+/**
+ * Creates a temporary product referencing "YourDesignHere.png" (centered on the front),
+ * fetches the ephemeral preview, uploads that preview to Cloudinary,
+ * then deletes the ephemeral product from Printify.
+ *
+ * Returns { previewUrl, previewPublicId } or throws on error.
+ */
+//
+// 1) createTempDesignPreview
+//
+
+async function createTempDesignPreview(
+	printifyProduct,
+	limitedVariants,
+	token
+) {
+	//------------------------------------------------------------------
+	// Decide how to place the "Your Design" placeholder
+	// for each blueprint_id (bags, pillows, mugs, etc.).
+	//------------------------------------------------------------------
+	const blueprintPlacementMap = {
+		// Example: "326" => a certain Weekender Bag
+		326: { x: 0.5, y: 0.2, scale: 0.35, angle: 0 },
+		// Example: "220" => a certain Pillow
+		220: { x: 0.25, y: 0.5, scale: 0.3, angle: 0 },
+		// Example mug blueprint ID, if needed:
+		911: { x: 0.5, y: 0.5, scale: 0.3, angle: 0 },
+
+		// fallback default
+		default: { x: 0.5, y: 0.5, scale: 0.75, angle: 0 },
+	};
+
+	function getPlacementForBlueprint(blueprintId) {
+		const placement = blueprintPlacementMap[String(blueprintId)];
+		return placement || blueprintPlacementMap.default;
+	}
+
+	//------------------------------------------------------------------
+	// 1) Upload "YourDesignHere.png" to Printify
+	//------------------------------------------------------------------
+	const yourDesignUrl =
+		"https://res.cloudinary.com/infiniteapps/image/upload/v1746240199/serene_janat/example_designs/YourDesignHere.png";
+
+	let printifyImageId = "";
+	try {
+		const resp = await axios.post(
+			"https://api.printify.com/v1/uploads/images.json",
+			{
+				url: yourDesignUrl,
+				file_name: "YourDesignHere.png",
+			},
+			{
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+			}
+		);
+		if (!resp.data?.id) {
+			throw new Error("No 'id' returned from Printify for YourDesignHere.png");
+		}
+		printifyImageId = resp.data.id;
+	} catch (err) {
+		console.error(
+			"❌ Printify Upload Error Full:",
+			JSON.stringify(err.response?.data, null, 2)
+		);
+		throw new Error(
+			`Unable to upload 'YourDesignHere.png' to Printify: ${
+				err.response?.data?.message || err.message
+			}`
+		);
+	}
+
+	//------------------------------------------------------------------
+	// 2) Create ephemeral product referencing that uploaded image
+	//------------------------------------------------------------------
+	const ephemeralVariants = limitedVariants.map((v) => ({
+		id: v.id,
+		enabled: true,
+		price: v.price, // price in cents
+	}));
+	const variantIdsForArea = ephemeralVariants.map((v) => v.id);
+
+	const { x, y, scale, angle } = getPlacementForBlueprint(
+		printifyProduct.blueprint_id
+	);
+
+	const createBody = {
+		title: `Temp - ${printifyProduct.title} (YourDesignHere)`,
+		blueprint_id: printifyProduct.blueprint_id,
+		print_provider_id: printifyProduct.print_provider_id,
+		variants: ephemeralVariants,
+		print_areas: [
+			{
+				variant_ids: variantIdsForArea,
+				placeholders: [
+					{
+						position: "front",
+						images: [
+							{
+								id: printifyImageId,
+								type: "image/png",
+								x,
+								y,
+								scale,
+								angle,
+							},
+						],
+					},
+				],
+			},
+		],
+	};
+
+	let ephemeralProductId;
+	try {
+		const createResp = await axios.post(
+			`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products.json`,
+			createBody,
+			{
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+				},
+			}
+		);
+		if (!createResp.data?.id) {
+			throw new Error("Printify did not return ephemeral product ID.");
+		}
+		ephemeralProductId = createResp.data.id;
+	} catch (err) {
+		console.error(
+			"❌ Create ephemeral product error (Full):",
+			JSON.stringify(err.response?.data, null, 2)
+		);
+		throw new Error(
+			`Failed to create ephemeral product. Reason: ${
+				err.response?.data?.message || err.message
+			}`
+		);
+	}
+
+	//------------------------------------------------------------------
+	// 3) Fetch ephemeral product => get all previews => upload to Cloudinary
+	//------------------------------------------------------------------
+	let ephemeralDetails;
+	try {
+		const details = await axios.get(
+			`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products/${ephemeralProductId}.json`,
+			{ headers: { Authorization: `Bearer ${token}` } }
+		);
+		ephemeralDetails = details.data;
+	} catch (err) {
+		console.error(
+			"❌ Fetch ephemeral product error:",
+			JSON.stringify(err.response?.data, null, 2)
+		);
+		throw new Error(
+			`Failed to fetch ephemeral product ${ephemeralProductId}: ${
+				err.response?.data?.message || err.message
+			}`
+		);
+	}
+
+	const ephemeralImages = ephemeralDetails.images || [];
+	if (!ephemeralImages.length) {
+		throw new Error("Ephemeral product has no preview images.");
+	}
+
+	// We'll map variantId -> { url, public_id } after Cloudinary upload
+	const variantIdToCloudImage = {};
+
+	// Each ephemeralImages entry has variant_ids that the image covers
+	for (const ephemeralImgObj of ephemeralImages) {
+		const { variant_ids = [], src = "" } = ephemeralImgObj;
+		if (!src) continue;
+
+		// Upload ephemeral preview to Cloudinary once
+		let uploaded;
+		try {
+			uploaded = await cloudinary.uploader.upload(src, {
+				folder: "serene_janat/example_designs",
+				resource_type: "image",
+			});
+		} catch (err) {
+			console.error("❌ Cloudinary upload ephemeral error:", err.message);
+			continue;
+		}
+
+		// Assign the same uploaded link to all variant_ids in ephemeralImgObj
+		for (const vId of variant_ids) {
+			if (!variantIdToCloudImage[vId]) {
+				variantIdToCloudImage[vId] = {
+					url: uploaded.secure_url,
+					public_id: uploaded.public_id,
+				};
+			}
+		}
+	}
+
+	//------------------------------------------------------------------
+	// 4) Delete ephemeral product
+	//------------------------------------------------------------------
+	try {
+		await axios.delete(
+			`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products/${ephemeralProductId}.json`,
+			{ headers: { Authorization: `Bearer ${token}` } }
+		);
+	} catch (err) {
+		console.warn(
+			`Could not delete ephemeral product ${ephemeralProductId}:`,
+			err.response?.data || err.message
+		);
+	}
+
+	// Return the map from ephemeral variantId -> { url, public_id }
+	return variantIdToCloudImage;
+}
+
 exports.syncPrintifyProducts = async (req, res) => {
 	try {
 		//-------------------------------------------------------------------
@@ -464,7 +694,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 		const POD_CATEGORY_ID = "679bb2a7dba50a58933d01eb";
 		const POD_SUBCATEGORY_ID = "679bb2bfdba50a58933d0233";
 
-		// Token from environment (ONLY design token now)
+		// Design token from environment
 		const DESIGN_TOKEN = process.env.DESIGN_PRINTIFY_TOKEN;
 		if (!DESIGN_TOKEN) {
 			return res
@@ -477,8 +707,6 @@ exports.syncPrintifyProducts = async (req, res) => {
 		//-------------------------------------------------------------------
 		const categories = await Category.find().sort({ createdAt: -1 });
 		const subcategories = await Subcategory.find();
-		// If you need color sets from DB:
-		// const colors = await Colors.find(); // Example (not strictly necessary)
 
 		//-------------------------------------------------------------------
 		// 2. HELPER: FETCH SHOP + PRODUCTS for the DESIGN token
@@ -508,6 +736,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			console.log(
 				`🔹 [${tokenName}] Fetched ${productsRes.data.data.length} products`
 			);
+
 			// Attach the shopId so we know which shop to update
 			return productsRes.data.data.map((p) => ({ ...p, __shopId: shopId }));
 		};
@@ -517,14 +746,11 @@ exports.syncPrintifyProducts = async (req, res) => {
 		//-------------------------------------------------------------------
 		console.log("🚀 Fetching products from Design token only...");
 		const designProducts = await fetchDesignProducts("DESIGN", DESIGN_TOKEN);
-
 		if (!designProducts.length) {
 			return res
 				.status(404)
 				.json({ error: "No products found from the Printify design shop" });
 		}
-
-		// We’ll call these our “combinedProducts,” but in reality it’s just one list:
 		const combinedProducts = designProducts;
 
 		//-------------------------------------------------------------------
@@ -553,7 +779,28 @@ exports.syncPrintifyProducts = async (req, res) => {
 		};
 
 		//-------------------------------------------------------------------
-		// 5. MASTER SYNC HANDLER (CREATE/UPDATE in Mongo; then set “Draft”)
+		// 5. HELPER: Distinct color extraction
+		//-------------------------------------------------------------------
+		function getDistinctColorVariants(variants, optionValueMap) {
+			const colorVariantMap = {}; // colorVal -> variant
+			for (const v of variants) {
+				let colorVal = "";
+				for (let valId of v.options || []) {
+					if (optionValueMap[valId]?.type === "color") {
+						colorVal =
+							optionValueMap[valId].colors?.[0] || optionValueMap[valId].title;
+					}
+				}
+				// store only first variant for each color
+				if (colorVal && !colorVariantMap[colorVal]) {
+					colorVariantMap[colorVal] = v;
+				}
+			}
+			return Object.values(colorVariantMap);
+		}
+
+		//-------------------------------------------------------------------
+		// 6. MASTER SYNC HANDLER (CREATE/UPDATE in Mongo; then set “Draft”)
 		//-------------------------------------------------------------------
 		async function handleProductSync(productData, variantSKU, printifyProduct) {
 			if (!variantSKU) {
@@ -563,12 +810,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 				return;
 			}
 
-			//-------------------------------------------------------------------
 			// A) CREATE or UPDATE in MONGODB
-			//-------------------------------------------------------------------
 			const existingProduct = await Product.findOne({ productSKU: variantSKU });
 			if (existingProduct) {
-				// Update existing
 				existingProduct.productName = productData.productName;
 				existingProduct.description = productData.description;
 				existingProduct.price = productData.price;
@@ -602,7 +846,6 @@ exports.syncPrintifyProducts = async (req, res) => {
 				await existingProduct.save();
 				console.log(`↺ Updated product in Mongo: ${productData.productName}`);
 			} else {
-				// Create new
 				const newProduct = new Product({
 					productSKU: variantSKU,
 					...productData,
@@ -611,11 +854,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				console.log(`➕ Added product in Mongo: ${productData.productName}`);
 			}
 
-			//-------------------------------------------------------------------
 			// B) Set product to “Draft” in Printify
-			//-------------------------------------------------------------------
-			// visible=false => product not published
-			// is_enabled=true => variants are “enabled” so you can see them
 			try {
 				const variantSettings = (printifyProduct.variants || []).map((v) => ({
 					...v,
@@ -649,7 +888,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 		}
 
 		//-------------------------------------------------------------------
-		// 6. LOOP + PROCESS EACH PRINTIFY PRODUCT (Design Only)
+		// 7. LOOP + PROCESS EACH PRINTIFY PRODUCT
 		//-------------------------------------------------------------------
 		const failedProducts = [];
 		const processedProducts = [];
@@ -658,7 +897,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			// Determine if product is in the POD list
 			const isPOD = productIdsWithPOD.includes(printifyProduct.id);
 
-			// If product is POD => fixed category, else auto-match
+			// If product is POD => fixed category, else auto-match by tags
 			let matchingCategory = null;
 			let matchingSubcategories = [];
 
@@ -666,7 +905,6 @@ exports.syncPrintifyProducts = async (req, res) => {
 				matchingCategory = { _id: POD_CATEGORY_ID };
 				matchingSubcategories = [{ _id: POD_SUBCATEGORY_ID }];
 			} else {
-				// Attempt to find a matching category by tags
 				matchingCategory = categories.find((cat) =>
 					printifyProduct.tags.some(
 						(tag) =>
@@ -681,7 +919,6 @@ exports.syncPrintifyProducts = async (req, res) => {
 				}
 			}
 
-			// If non-POD and no match => skip
 			if (!matchingCategory && !isPOD) {
 				failedProducts.push(printifyProduct.title);
 				console.warn(`❌ Skipped non-POD product: ${printifyProduct.title}`);
@@ -698,12 +935,11 @@ exports.syncPrintifyProducts = async (req, res) => {
 				strict: true,
 			});
 
-			// For toggling addVariables
 			const addVariables =
 				Array.isArray(printifyProduct.options) &&
 				printifyProduct.options.length > 0;
 
-			// Check for variants
+			// Check for enabled variants
 			const enabledVariants = (printifyProduct.variants || []).filter(
 				(v) => v.is_enabled
 			);
@@ -713,26 +949,19 @@ exports.syncPrintifyProducts = async (req, res) => {
 				continue;
 			}
 
-			// ---------------------------------------------------------
-			// Build an option map => { [valueId]: { type, title, colors? } }
-			// This ensures we can handle color/size/scent in ANY order
-			// ---------------------------------------------------------
-			const optionValueMap = {}; // key = value.id, val = { type, title, colors? }
+			// Build an optionValueMap => { valueId: { type, title, colors? } }
+			const optionValueMap = {};
 			(printifyProduct.options || []).forEach((option) => {
 				(option.values || []).forEach((val) => {
-					// e.g. val = { id, title, colors }
 					optionValueMap[val.id] = {
-						type: option.type, // "color", "size", "scent", ...
+						type: option.type,
 						title: val.title,
 						colors: val.colors || [],
 					};
 				});
 			});
 
-			// ---------------------------------------------------------
 			// Sort by size if a size option is present
-			// Example size ordering array. Adjust as needed.
-			// ---------------------------------------------------------
 			const sizeOrdering = [
 				"XS",
 				"S",
@@ -746,91 +975,70 @@ exports.syncPrintifyProducts = async (req, res) => {
 				"5XL",
 			];
 			enabledVariants.sort((a, b) => {
-				// Attempt to find size strings from the variant options
-				// Because variant.options is an array of value-IDs
-				let sizeA = "";
-				let sizeB = "";
-				for (let valId of a.options || []) {
-					if (optionValueMap[valId]?.type === "size") {
-						sizeA = optionValueMap[valId].title;
-						break;
+				const getSizeTitle = (v) => {
+					for (let valId of v.options || []) {
+						if (optionValueMap[valId]?.type === "size") {
+							return optionValueMap[valId].title;
+						}
 					}
-				}
-				for (let valId of b.options || []) {
-					if (optionValueMap[valId]?.type === "size") {
-						sizeB = optionValueMap[valId].title;
-						break;
-					}
-				}
-
+					return "";
+				};
+				const sizeA = getSizeTitle(a);
+				const sizeB = getSizeTitle(b);
 				const idxA = sizeOrdering.indexOf(sizeA);
 				const idxB = sizeOrdering.indexOf(sizeB);
-
-				// If either size not found in list => sort them to the end
 				if (idxA === -1 && idxB === -1) return 0;
 				if (idxA === -1) return 1;
 				if (idxB === -1) return -1;
-
 				return idxA - idxB;
 			});
 
-			// We'll use the FIRST variant’s SKU for the top-level product (slug, etc.)
+			// Top-level product's SKU is from the first variant
 			const firstVariantSKU = enabledVariants[0].sku || "NOSKU";
-
-			// Check if there's already a top-level product
 			const existingTopLevel = await Product.findOne({
 				productSKU: firstVariantSKU,
 			});
 
-			// -----------------------------------------
-			// Upload a handful of images for top-level
-			// -----------------------------------------
+			//-------------------------------------------------------------------
+			// Upload up to 5 images for the top-level
+			//-------------------------------------------------------------------
 			let validUploadedImages = [];
 			if (!existingTopLevel) {
-				// If top-level doesn’t exist yet, we upload
 				const relevantImagesForProduct = (printifyProduct.images || []).filter(
-					(img) => {
-						// Keep if any of its variant_ids matches an enabled variant
-						return img.variant_ids.some((vId) =>
+					(img) =>
+						img.variant_ids.some((vId) =>
 							enabledVariants.some((ev) => ev.id === vId)
-						);
-					}
+						)
 				);
 				validUploadedImages = await uploadImageToCloudinaryLimited(
 					relevantImagesForProduct,
 					5
 				);
 			} else {
-				// If product already exists, just reuse its images
 				validUploadedImages =
 					existingTopLevel.thumbnailImage?.[0]?.images || [];
 			}
 
-			// -----------------------------------------
-			// Build top-level product data (w/o attributes)
-			// -----------------------------------------
-			const baseVariantPrice = enabledVariants[0].price / 100;
-
+			//-------------------------------------------------------------------
+			// Build productData (Mongo fields)
+			//-------------------------------------------------------------------
+			const topLevelPrintifyPrice = enabledVariants[0].price / 100;
 			const productData = {
 				productName: printifyProduct.title,
 				description: printifyProduct.description || "",
-				price: (baseVariantPrice * 1.2).toFixed(2),
-				priceAfterDiscount: baseVariantPrice.toFixed(2),
-				MSRPPriceBasic: (baseVariantPrice * 0.75).toFixed(2),
+				price: topLevelPrintifyPrice.toFixed(2),
+				priceAfterDiscount: topLevelPrintifyPrice.toFixed(2),
+				MSRPPriceBasic: topLevelPrintifyPrice.toFixed(2),
 				quantity: 20,
 				slug: `${productSlug}-${firstVariantSKU}`,
 				slug_Arabic: `${productSlugArabic}-${firstVariantSKU}`,
 				category: matchingCategory?._id,
 				subcategory: matchingSubcategories.map((s) => s._id),
-				gender: "6635ab22898104005c96250a", // Example
+				gender: "6635ab22898104005c96250a", // example only
 				chosenSeason: "all",
-				thumbnailImage: [
-					{
-						images: validUploadedImages,
-					},
-				],
+				thumbnailImage: [{ images: validUploadedImages }],
 				isPrintifyProduct: true,
-				addVariables: addVariables, // If there’s at least 1 “options” in Printify
+				addVariables: addVariables,
 				printifyProductDetails: {
 					POD: isPOD,
 					id: printifyProduct.id,
@@ -863,49 +1071,42 @@ exports.syncPrintifyProducts = async (req, res) => {
 				productAttributes: [],
 			};
 
-			// -----------------------------------------
+			//-------------------------------------------------------------------
 			// Build productAttributes array
-			// -----------------------------------------
+			//-------------------------------------------------------------------
 			productData.productAttributes = await Promise.all(
 				enabledVariants.map(async (variant) => {
-					// For each variant, find color/size/scent (etc.)
 					let colorVal = "";
 					let sizeVal = "";
 					let scentVal = "";
 
-					// Each variant has an array of option IDs. We look them up in the map.
 					for (let valId of variant.options || []) {
 						const foundOption = optionValueMap[valId];
 						if (!foundOption) continue;
 						if (foundOption.type === "color") {
-							// If "colors" array is present, usually the first color is the name
-							// or it might just be foundOption.title if you prefer
 							colorVal = foundOption.colors?.[0] || foundOption.title || "";
 						} else if (foundOption.type === "size") {
 							sizeVal = foundOption.title;
 						} else if (foundOption.type === "scent") {
 							scentVal = foundOption.title;
 						}
-						// If you have more option types, handle them here
 					}
 
-					// Build PK: e.g. "S#Black#Sea Salt + Orchid"
 					const pkParts = [];
 					if (sizeVal) pkParts.push(sizeVal);
 					if (colorVal) pkParts.push(colorVal);
 					if (scentVal) pkParts.push(scentVal);
 					const PK = pkParts.length ? pkParts.join("#") : variant.sku;
 
-					// Upload or reuse variant images
 					let variantUploadedImages = [];
 					if (existingTopLevel) {
+						// Reuse existing productImages if we have them
 						const existingAttr = existingTopLevel.productAttributes?.find(
 							(a) => a.SubSKU === variant.sku
 						);
 						if (existingAttr) {
 							variantUploadedImages = existingAttr.productImages || [];
 						} else {
-							// Otherwise, upload new for this variant
 							const vImages = (printifyProduct.images || []).filter((img) =>
 								img.variant_ids.includes(variant.id)
 							);
@@ -915,7 +1116,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 							);
 						}
 					} else {
-						// top-level not exist => always upload
+						// no existing product => fresh upload
 						const vImages = (printifyProduct.images || []).filter((img) =>
 							img.variant_ids.includes(variant.id)
 						);
@@ -925,7 +1126,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						);
 					}
 
-					const rawPrice = variant.price / 100;
+					const priceFromPrintify = variant.price / 100;
 					return {
 						PK,
 						color: colorVal,
@@ -933,27 +1134,112 @@ exports.syncPrintifyProducts = async (req, res) => {
 						scent: scentVal,
 						SubSKU: variant.sku,
 						quantity: 20,
-						price: (rawPrice * 1.2).toFixed(2),
-						priceAfterDiscount: rawPrice.toFixed(2),
-						MSRP: (rawPrice * 0.75).toFixed(2),
-						WholeSalePrice: (rawPrice * 0.75).toFixed(2),
-						DropShippingPrice: (rawPrice * 0.85).toFixed(2),
+						price: priceFromPrintify.toFixed(2),
+						priceAfterDiscount: priceFromPrintify.toFixed(2),
+						MSRP: priceFromPrintify.toFixed(2),
+						WholeSalePrice: priceFromPrintify.toFixed(2),
+						DropShippingPrice: priceFromPrintify.toFixed(2),
 						productImages: variantUploadedImages,
 					};
 				})
 			);
 
-			// -----------------------------------------
-			// Now create/update top-level product
-			// (We pass the FIRST variant’s SKU so
-			//  we can do a proper lookup in handleProductSync)
-			// -----------------------------------------
+			//-------------------------------------------------------------------
+			// 8. If product has multiple colors => ephemeral per color
+			//    Otherwise => just ephemeral for a single variant.
+			//-------------------------------------------------------------------
+			const distinctColorVariants = getDistinctColorVariants(
+				enabledVariants,
+				optionValueMap
+			);
+
+			let variantIdToCloudImage = {};
+			try {
+				if (distinctColorVariants.length > 1) {
+					//------------------------------------------------
+					// MULTIPLE COLORS => ephemeral product per color
+					//------------------------------------------------
+					variantIdToCloudImage = await createTempDesignPreview(
+						printifyProduct,
+						// Typically you'd pick a single "representative" size
+						// for each color. For simplicity, we use distinctColorVariants
+						// as-is. (Optionally filter them if you want only the first size.)
+						distinctColorVariants,
+						DESIGN_TOKEN
+					);
+				} else {
+					//------------------------------------------------
+					// NO or SINGLE COLOR => ephemeral with just 1 variant
+					//------------------------------------------------
+					// e.g. we can just pick the first enabled variant
+					const singleVariant = enabledVariants[0];
+					variantIdToCloudImage = await createTempDesignPreview(
+						printifyProduct,
+						[singleVariant],
+						DESIGN_TOKEN
+					);
+				}
+			} catch (ephemeralErr) {
+				console.error(
+					"⚠️ Failed ephemeral product for example design:",
+					ephemeralErr.message
+				);
+			}
+
+			//-------------------------------------------------------------------
+			// 9. Attach ephemeral preview image(s) to each attribute
+			//-------------------------------------------------------------------
+			// If multiple colors => we match by color
+			// If single color => we have just 1 ephemeral variant => use that for all
+			const hasMultipleColors = distinctColorVariants.length > 1;
+
+			for (const attr of productData.productAttributes) {
+				if (hasMultipleColors) {
+					// find the ephemeral variant with matching color
+					const matchingColorVariant = distinctColorVariants.find((dv) => {
+						// get dv's color
+						let dvColorVal = "";
+						for (let valId of dv.options || []) {
+							if (optionValueMap[valId]?.type === "color") {
+								dvColorVal =
+									optionValueMap[valId].colors?.[0] ||
+									optionValueMap[valId].title;
+							}
+						}
+						return dvColorVal === attr.color;
+					});
+					if (
+						matchingColorVariant &&
+						variantIdToCloudImage[matchingColorVariant.id]
+					) {
+						attr.exampleDesignImage = {
+							url: variantIdToCloudImage[matchingColorVariant.id].url,
+							public_id:
+								variantIdToCloudImage[matchingColorVariant.id].public_id,
+						};
+					}
+				} else {
+					// single color or no color => just pick the ephemeral result
+					// from the single variant we used
+					const [onlyVariantId] = Object.keys(variantIdToCloudImage);
+					if (onlyVariantId && variantIdToCloudImage[onlyVariantId]) {
+						attr.exampleDesignImage = {
+							url: variantIdToCloudImage[onlyVariantId].url,
+							public_id: variantIdToCloudImage[onlyVariantId].public_id,
+						};
+					}
+				}
+			}
+
+			//-------------------------------------------------------------------
+			// 10. Finally, CREATE/UPDATE top-level product & set to draft
+			//-------------------------------------------------------------------
 			await handleProductSync(productData, firstVariantSKU, printifyProduct);
 			processedProducts.push(printifyProduct.id);
 		}
 
 		//-------------------------------------------------------------------
-		// 7. FINISH + REPORT
+		// 11. FINISH + REPORT
 		//-------------------------------------------------------------------
 		const recommendations = failedProducts.map((title) => ({
 			productTitle: title,

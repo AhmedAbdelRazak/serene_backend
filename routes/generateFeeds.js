@@ -142,6 +142,7 @@ function convertInchesToCm(inches) {
 		: "Not available";
 }
 
+// For non-POD products, we sometimes store color as a hex
 async function resolveColorName(hexCode) {
 	if (!hexCode) return "";
 	const color = await Colors.findOne({ hexa: hexCode.toLowerCase() });
@@ -180,24 +181,6 @@ function getProductLink(product, color, size, scent) {
 	return `https://serenejannat.com/single-product/${escapeXml(
 		product.slug
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
-}
-
-/**
- * parseVariantTitleForThreeAttrs:
- * If Printify gives you a variant title like "Red / XL / Cinnamon"
- * we parse them out as color, size, scent.
- */
-function parseVariantTitleForThreeAttrs(title) {
-	if (!title || typeof title !== "string") {
-		return { variantColor: "", variantSize: "", variantScent: "" };
-	}
-	const parts = title.split(" / ").map((p) => p.trim());
-
-	let variantColor = parts[0] || "";
-	let variantSize = parts[1] || "";
-	let variantScent = parts[2] || "";
-
-	return { variantColor, variantSize, variantScent };
 }
 
 // If price >= 100 and integer => treat as cents
@@ -263,35 +246,50 @@ function buildFacebookImageTags(imageArray) {
 }
 
 /**
- * Helper: attempt to get color/size/scent from productAttributes first.
- * If not found, fallback to parseVariantTitleForThreeAttrs().
+ * For Printify POD: build an option-value map so we can retrieve actual English
+ * color/size/scent from "printifyProductDetails.options" using the variant's "options" array.
+ *
+ * e.g. if variant.options = [14, 511], we look up 14 => { type: "size", title: "S" }
+ * and 511 => { type: "color", title: "Navy" }
  */
-function getVariantColorSizeScent(product, variant) {
-	let variantColor = "";
-	let variantSize = "";
-	let variantScent = "";
+function buildOptionValueMap(podDetails) {
+	const map = {};
+	// e.g. podDetails.options = [ {name: "Colors", type: "color", values: [...]}, {...} ]
+	(podDetails.options || []).forEach((option) => {
+		(option.values || []).forEach((val) => {
+			map[val.id] = {
+				type: option.type, // e.g. "color", "size", "scent"
+				title: val.title,
+			};
+		});
+	});
+	return map;
+}
 
-	if (product.productAttributes && product.productAttributes.length > 0) {
-		// Find the matching subSKU
-		const matchedAttr = product.productAttributes.find(
-			(a) => a.SubSKU === variant.sku
-		);
-		if (matchedAttr) {
-			variantColor = matchedAttr.color || "";
-			variantSize = matchedAttr.size || "";
-			variantScent = matchedAttr.scent || "";
+/**
+ * Get color/size/scent from the Printify "optionValueMap" if possible.
+ * If you want to do a fallback to productAttributes, you can—but in this
+ * version we rely purely on the Printify data for the naming.
+ */
+function getVariantNamesFromPrintifyMap(variant, optionValueMap) {
+	let colorVal = "";
+	let sizeVal = "";
+	let scentVal = "";
+
+	// variant.options => e.g. [14, 511]
+	for (const valId of variant.options || []) {
+		const info = optionValueMap[valId];
+		if (!info) continue; // skip unknown IDs
+		if (info.type === "color") {
+			colorVal = info.title;
+		} else if (info.type === "size") {
+			sizeVal = info.title;
+		} else if (info.type === "scent") {
+			scentVal = info.title;
 		}
+		// If you have other possible "type" values, handle them here
 	}
-
-	// If still none found, parse from variant.title
-	if (!variantColor && !variantSize && !variantScent) {
-		const parsed = parseVariantTitleForThreeAttrs(variant.title);
-		variantColor = parsed.variantColor;
-		variantSize = parsed.variantSize;
-		variantScent = parsed.variantScent;
-	}
-
-	return { variantColor, variantSize, variantScent };
+	return { colorVal, sizeVal, scentVal };
 }
 
 // ----------------------
@@ -302,7 +300,6 @@ router.get("/generate-feeds", async (req, res) => {
 	let facebookItems = [];
 
 	// Fetch products that are active or allowed for backorder or activated by the seller
-	// so we don't exclude the product that has activeProduct=false but activeProductBySeller=true, or activeBackorder=true
 	const products = await Product.find({
 		$or: [
 			{ activeProduct: true },
@@ -312,7 +309,6 @@ router.get("/generate-feeds", async (req, res) => {
 	}).populate("category");
 
 	for (let product of products) {
-		// Only if product has an active category
 		if (product.category && product.category.categoryStatus) {
 			const condition = "new";
 			const brand = "Serene Jannat";
@@ -327,12 +323,12 @@ router.get("/generate-feeds", async (req, res) => {
 				: "general";
 			const generalLabel = "general_campaign";
 
-			// Clean the description of HTML tags, then escape
+			// Clean out HTML in description, then escape
 			const cleanedDesc = escapeXml(
 				product.description.replace(/<[^>]+>/g, "")
 			);
 
-			// Helper for building g:color, g:size, color, size tags
+			// For building color/size tags
 			function buildGoogleColorTag(colorValue) {
 				if (!colorValue || colorValue.toLowerCase() === "unspecified")
 					return "";
@@ -357,19 +353,23 @@ router.get("/generate-feeds", async (req, res) => {
 			// -----------------------------------------
 			if (product.printifyProductDetails?.POD) {
 				const itemGroupId = escapeXml(product._id.toString());
-				const variants = product.printifyProductDetails.variants || [];
+				const podDetails = product.printifyProductDetails;
+				const variants = podDetails.variants || [];
 
-				if (variants.length > 0) {
+				// Build a map of valueId => { type, title }
+				const optionValueMap = buildOptionValueMap(podDetails);
+
+				if (variants.length > 1) {
 					// Multi-variant POD
 					for (let [index, variant] of variants.entries()) {
-						// NEW: get color/size/scent from productAttributes or fallback
-						const { variantColor, variantSize, variantScent } =
-							getVariantColorSizeScent(product, variant);
+						// 1) Get color/size/scent from the Printify map
+						const { colorVal, sizeVal, scentVal } =
+							getVariantNamesFromPrintifyMap(variant, optionValueMap);
 
 						const variantPrice = getFinalVariantPrice(variant);
 
-						// Attempt to find the local matched attribute so we can use its quantity
-						let matchedAttr;
+						// 2) Quantity check -> from productAttributes if available
+						let matchedAttr = null;
 						if (
 							product.productAttributes &&
 							product.productAttributes.length > 0
@@ -378,8 +378,6 @@ router.get("/generate-feeds", async (req, res) => {
 								(a) => a.SubSKU === variant.sku
 							);
 						}
-
-						// If we found a local attribute, use its quantity; otherwise fallback
 						let facebookInventory = 9999;
 						let googleAvailability = "in stock";
 						if (matchedAttr && matchedAttr.quantity != null) {
@@ -387,59 +385,53 @@ router.get("/generate-feeds", async (req, res) => {
 							googleAvailability =
 								matchedAttr.quantity > 0 ? "in stock" : "out_of_stock";
 						} else {
-							// fallback to variant.quantity or a default
+							// fallback to variant.quantity or default
 							facebookInventory = variant.quantity || 9999;
-							// we originally used "in stock" as a default
-							// can also do dynamic if variant.quantity is 0, but keep it simple
 						}
 						const facebookAvailability = googleAvailability;
 
-						// Attempt to find images for that variant
+						// 3) Build variant images
 						let variantImages = [];
-						if (
-							product.productAttributes &&
-							product.productAttributes.length > 0
-						) {
-							const matchedAttrImgs = product.productAttributes.find(
-								(a) => a.SubSKU === variant.sku
-							);
-							if (matchedAttrImgs && matchedAttrImgs.productImages?.length) {
-								variantImages = matchedAttrImgs.productImages.map((x) => x.url);
-							}
+						if (matchedAttr && matchedAttr.productImages?.length) {
+							variantImages = matchedAttr.productImages.map((x) => x.url);
 						}
 						if (!variantImages.length) {
 							variantImages = generateImageLinks(product);
 						}
 
+						// >>>> NEW: If the attribute has an exampleDesignImage, put it first
+						if (
+							matchedAttr &&
+							matchedAttr.exampleDesignImage &&
+							matchedAttr.exampleDesignImage.url
+						) {
+							variantImages.unshift(matchedAttr.exampleDesignImage.url);
+						}
+						// <<<< END NEW
+
 						const googleImageXML = buildGoogleImageTags(variantImages);
 						const facebookImageXML = buildFacebookImageTags(variantImages);
 
-						// Build final link with color, size, scent
+						// 4) Build final link with color, size, scent
 						const finalLink = getProductLink(
 							product,
-							variantColor,
-							variantSize,
-							variantScent
+							colorVal,
+							sizeVal,
+							scentVal
 						);
 
-						// Build a combined title for the feed item
+						// 5) Build feed item title
 						let attributeParts = ["Custom Design"];
-						if (variantColor) attributeParts.push(variantColor);
-						if (variantSize) attributeParts.push(variantSize);
-						if (variantScent) attributeParts.push(variantScent);
+						if (colorVal) attributeParts.push(colorVal);
+						if (sizeVal) attributeParts.push(sizeVal);
+						if (scentVal) attributeParts.push(scentVal);
 
 						const attributeStr = attributeParts.join(", ");
 						const podTitle = `${capitalizeWords(
 							product.productName
 						)} (${attributeStr})`;
 
-						// Conditionals for color/size tags
-						const googleColorTag = buildGoogleColorTag(variantColor);
-						const googleSizeTag = buildGoogleSizeTag(variantSize);
-						const facebookColorTag = buildFacebookColorTag(variantColor);
-						const facebookSizeTag = buildFacebookSizeTag(variantSize);
-
-						// ---- Google variant
+						// 6) Output for Google
 						const googleVariantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
@@ -456,8 +448,8 @@ router.get("/generate-feeds", async (req, res) => {
 									product.category.categoryName
 								)}]]></g:product_type>
                 <g:item_group_id>${itemGroupId}</g:item_group_id>
-                ${googleSizeTag}
-                ${googleColorTag}
+                ${buildGoogleSizeTag(sizeVal)}
+                ${buildGoogleColorTag(colorVal)}
                 <g:age_group>adult</g:age_group>
                 <g:gender>${defaultGender}</g:gender>
                 <g:identifier_exists>false</g:identifier_exists>
@@ -471,7 +463,7 @@ router.get("/generate-feeds", async (req, res) => {
             `;
 						googleItems.push(googleVariantItem);
 
-						// ---- Facebook variant
+						// 7) Output for Facebook
 						const facebookVariantItem = `
               <item>
                 <id>${escapeXml(product._id.toString())}-${index}</id>
@@ -486,43 +478,84 @@ router.get("/generate-feeds", async (req, res) => {
                 <brand>${escapeXml(brand)}</brand>
                 <condition>${escapeXml(condition)}</condition>
                 <item_group_id>${itemGroupId}</item_group_id>
-                ${facebookColorTag}
-                ${facebookSizeTag}
+                ${buildFacebookColorTag(colorVal)}
+                ${buildFacebookSizeTag(sizeVal)}
                 <google_product_category>${googleProductCategory}</google_product_category>
               </item>
             `;
 						facebookItems.push(facebookVariantItem);
 					}
-				} else {
+				} else if (variants.length === 1) {
 					// Single POD variant fallback
-					let rawFallbackPrice = parseFloat(
-						product.priceAfterDiscount || product.price || 0
-					);
-					if (Number.isInteger(rawFallbackPrice) && rawFallbackPrice >= 100) {
-						rawFallbackPrice /= 100;
+					const singleVar = variants[0];
+					const variantPrice = getFinalVariantPrice(singleVar);
+
+					// parse color/size/scent from Printify
+					const { colorVal, sizeVal, scentVal } =
+						getVariantNamesFromPrintifyMap(singleVar, optionValueMap);
+
+					// check quantity from productAttributes
+					let matchedAttr = null;
+					if (
+						product.productAttributes &&
+						product.productAttributes.length > 0
+					) {
+						matchedAttr = product.productAttributes.find(
+							(a) => a.SubSKU === singleVar.sku
+						);
 					}
-					const fallbackPrice = rawFallbackPrice.toFixed(2);
+					let facebookInventory = 9999;
+					let googleAvailability = "in stock";
+					if (matchedAttr && matchedAttr.quantity != null) {
+						facebookInventory = matchedAttr.quantity;
+						googleAvailability =
+							matchedAttr.quantity > 0 ? "in stock" : "out_of_stock";
+					} else {
+						facebookInventory = singleVar.quantity || 9999;
+					}
+					const facebookAvailability = googleAvailability;
 
-					const fallbackImages = generateImageLinks(product);
-					const googleImageXML = buildGoogleImageTags(fallbackImages);
-					const facebookImageXML = buildFacebookImageTags(fallbackImages);
+					// images
+					let variantImages = [];
+					if (matchedAttr && matchedAttr.productImages?.length) {
+						variantImages = matchedAttr.productImages.map((x) => x.url);
+					}
+					if (!variantImages.length) {
+						variantImages = generateImageLinks(product);
+					}
 
+					// >>>> NEW: If the attribute has an exampleDesignImage, put it first
+					if (
+						matchedAttr &&
+						matchedAttr.exampleDesignImage &&
+						matchedAttr.exampleDesignImage.url
+					) {
+						variantImages.unshift(matchedAttr.exampleDesignImage.url);
+					}
+					// <<<< END NEW
+
+					const googleImageXML = buildGoogleImageTags(variantImages);
+					const facebookImageXML = buildFacebookImageTags(variantImages);
+
+					// final link
+					const finalLink = getProductLink(
+						product,
+						colorVal,
+						sizeVal,
+						scentVal
+					);
+
+					let attributeParts = ["Custom Design"];
+					if (colorVal) attributeParts.push(colorVal);
+					if (sizeVal) attributeParts.push(sizeVal);
+					if (scentVal) attributeParts.push(scentVal);
+
+					const attributeStr = attributeParts.join(", ");
 					const podFallbackTitle = `${capitalizeWords(
 						product.productName
-					)} (Custom Design)`;
-					const finalLink = getProductLink(product);
-					const googleAvailability =
-						product.quantity > 0 ? "in stock" : "out_of_stock";
-					const facebookAvailability = googleAvailability;
-					const facebookInventory = product.quantity || 9999;
+					)} (${attributeStr})`;
 
-					// For single fallback, no color/size tags
-					const googleSizeTag = "";
-					const googleColorTag = "";
-					const facebookSizeTag = "";
-					const facebookColorTag = "";
-
-					// Google single POD
+					// Google single
 					const googleItem = `
             <item>
               <g:id>${escapeXml(product._id.toString())}</g:id>
@@ -531,15 +564,13 @@ router.get("/generate-feeds", async (req, res) => {
               <g:link>${escapeXml(finalLink)}</g:link>
               ${googleImageXML}
               <g:availability>${googleAvailability}</g:availability>
-              <g:price>${fallbackPrice} USD</g:price>
+              <g:price>${variantPrice} USD</g:price>
               <g:brand>${escapeXml(brand)}</g:brand>
               <g:condition>${escapeXml(condition)}</g:condition>
               <g:google_product_category>${googleProductCategory}</g:google_product_category>
               <g:product_type><![CDATA[${escapeXml(
 								product.category.categoryName
 							)}]]></g:product_type>
-              ${googleSizeTag}
-              ${googleColorTag}
               <g:age_group>adult</g:age_group>
               <g:gender>${defaultGender}</g:gender>
               <g:identifier_exists>false</g:identifier_exists>
@@ -553,7 +584,7 @@ router.get("/generate-feeds", async (req, res) => {
           `;
 					googleItems.push(googleItem);
 
-					// Facebook single POD
+					// Facebook single
 					const facebookItem = `
             <item>
               <id>${escapeXml(product._id.toString())}</id>
@@ -564,17 +595,19 @@ router.get("/generate-feeds", async (req, res) => {
               <availability>${facebookAvailability}</availability>
               <inventory>${facebookInventory}</inventory>
               <quantity_to_sell_on_facebook>${facebookInventory}</quantity_to_sell_on_facebook>
-              <price>${fallbackPrice} USD</price>
+              <price>${variantPrice} USD</price>
               <brand>${escapeXml(brand)}</brand>
               <condition>${escapeXml(condition)}</condition>
-              ${facebookColorTag}
-              ${facebookSizeTag}
               <google_product_category>${googleProductCategory}</google_product_category>
             </item>
           `;
 					facebookItems.push(facebookItem);
+				} else {
+					// No variants => just skip or treat as a single item
+					// (Keep your original fallback logic if needed)
 				}
 			}
+
 			// -----------------------------------
 			// Non-POD products (unchanged logic)
 			// -----------------------------------
@@ -597,9 +630,9 @@ router.get("/generate-feeds", async (req, res) => {
 						const googleImageXML = buildGoogleImageTags(variantImages);
 						const facebookImageXML = buildFacebookImageTags(variantImages);
 
-						const variantHexColor = variant.color || "";
+						// For non-POD, color might be hex => try to resolve
 						const resolvedVariantColor = await resolveColorName(
-							variantHexColor
+							variant.color || ""
 						);
 						const variantSize = variant.size || "";
 
@@ -625,8 +658,7 @@ router.get("/generate-feeds", async (req, res) => {
 							DEFAULT_HEIGHT
 						);
 
-						// For non-POD, we do NOT build color/size query params
-						// so just a normal link:
+						// Normal link for non-POD
 						const finalLink = getProductLink(product);
 
 						const variantTitle = `${capitalizeWords(
@@ -640,7 +672,7 @@ router.get("/generate-feeds", async (req, res) => {
 							buildFacebookColorTag(resolvedVariantColor);
 						const facebookSizeTag = buildFacebookSizeTag(variantSize);
 
-						// 1) Google variant
+						// Google variant
 						const googleVariantItem = `
               <item>
                 <g:id>${escapeXml(product._id.toString())}-${index}</g:id>
@@ -675,7 +707,7 @@ router.get("/generate-feeds", async (req, res) => {
             `;
 						googleItems.push(googleVariantItem);
 
-						// 2) Facebook variant
+						// Facebook variant
 						const facebookVariantItem = `
               <item>
                 <id>${escapeXml(product._id.toString())}-${index}</id>
@@ -704,6 +736,7 @@ router.get("/generate-feeds", async (req, res) => {
 					const width = convertInchesToCm(product.geodata?.width || 0);
 					const height = convertInchesToCm(product.geodata?.height || 0);
 
+					// Possibly resolve color if it’s a hex
 					const resolvedColor = await resolveColorName(product.color || "");
 					const size = product.size || "";
 					const finalLink = getProductLink(product);

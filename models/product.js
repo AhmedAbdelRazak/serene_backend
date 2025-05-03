@@ -248,6 +248,10 @@ const productSchema = new mongoose.Schema(
 					type: Number,
 					default: 0,
 				},
+				exampleDesignImage: {
+					url: String,
+					public_id: String,
+				},
 			},
 		],
 

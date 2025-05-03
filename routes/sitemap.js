@@ -5,12 +5,11 @@ const { createWriteStream } = require("fs");
 const { resolve } = require("path");
 require("dotenv").config();
 
-// Import the Product model
 const Product = require("../models/product");
 
-/**
- * Parse color/size from a typical Printify "variant.title" => "Light Blue / 2XL"
- */
+// ------------------------------
+// 1) Existing parse fallback
+// ------------------------------
 function parseSizeColorFromVariantTitle(title) {
 	if (!title || typeof title !== "string") {
 		return { variantColor: "Unspecified", variantSize: "Unspecified" };
@@ -22,30 +21,63 @@ function parseSizeColorFromVariantTitle(title) {
 	};
 }
 
-/**
- * Build a single link for a POD item with optional ?color= & ?size= in query
- */
+// ------------------------------
+// 2) Build “option -> value” map
+// ------------------------------
+function buildOptionValueMap(podDetails) {
+	const map = {};
+	(podDetails.options || []).forEach((option) => {
+		(option.values || []).forEach((val) => {
+			map[val.id] = {
+				type: option.type, // e.g. "color", "size", "scent"
+				title: val.title,
+			};
+		});
+	});
+	return map;
+}
+
+// ------------------------------
+// 3) Lookup color/size from map
+// ------------------------------
+function getColorSizeFromPrintifyMap(variant, optionValueMap) {
+	let colorVal = null;
+	let sizeVal = null;
+
+	for (const valId of variant.options || []) {
+		const foundInfo = optionValueMap[valId];
+		if (!foundInfo) continue;
+		if (foundInfo.type === "color" && !colorVal) {
+			colorVal = foundInfo.title;
+		} else if (foundInfo.type === "size" && !sizeVal) {
+			sizeVal = foundInfo.title;
+		}
+		// If you have "scent" or other types, add them as needed
+	}
+
+	return { colorVal, sizeVal };
+}
+
+// ------------------------------
+// 4) Other existing helpers
+// ------------------------------
 function buildPODLink(productId, color, size) {
 	let url = `/custom-gifts/${productId}`;
 	const params = [];
-	if (color && color !== "Unspecified")
+	if (color && color !== "Unspecified") {
 		params.push(`color=${encodeURIComponent(color)}`);
-	if (size && size !== "Unspecified")
+	}
+	if (size && size !== "Unspecified") {
 		params.push(`size=${encodeURIComponent(size)}`);
+	}
 	if (params.length) {
 		url += `?${params.join("&")}`;
 	}
 	return url;
 }
 
-/**
- * For multi-variant POD items, gather each variant's images from productAttributes.
- * If none found, fallback to main product images.
- */
 function gatherPODVariantImages(product, variantSKU) {
-	// Attempt to match productAttributes => subSKU
 	let matchedImages = [];
-
 	if (Array.isArray(product.productAttributes)) {
 		const foundAttr = product.productAttributes.find(
 			(attr) => attr.SubSKU === variantSKU
@@ -54,21 +86,14 @@ function gatherPODVariantImages(product, variantSKU) {
 			matchedImages = foundAttr.productImages.map((img) => img.url);
 		}
 	}
-
-	// If no matchedImages, fallback to gatherProductImages
 	if (!matchedImages.length) {
 		matchedImages = gatherProductImages(product);
 	}
 	return matchedImages;
 }
 
-/**
- * Helper function: gather all relevant images for a non-variant or fallback scenario
- */
 function gatherProductImages(product) {
 	const imagesSet = new Set();
-
-	// If productAttributes exist, gather all variant images
 	if (product.productAttributes && product.productAttributes.length > 0) {
 		for (const attr of product.productAttributes) {
 			if (attr.productImages && attr.productImages.length > 0) {
@@ -80,8 +105,6 @@ function gatherProductImages(product) {
 			}
 		}
 	}
-
-	// Also gather main thumbnail
 	if (
 		product.thumbnailImage &&
 		Array.isArray(product.thumbnailImage) &&
@@ -94,40 +117,32 @@ function gatherProductImages(product) {
 			}
 		}
 	}
-
-	const imagesArray = [];
-	for (const imgUrl of imagesSet) {
-		imagesArray.push(imgUrl);
-	}
-	return imagesArray;
+	return Array.from(imagesSet);
 }
 
-/**
- * For a non-POD product => single link: /single-product/:slug/:categorySlug/:id
- */
 function buildNonPODLink(product) {
 	return `/single-product/${product.slug}/${product.category.categorySlug}/${product._id}`;
 }
 
+// ------------------------------
+// 5) MAIN ROUTE
+// ------------------------------
 router.get("/generate-sitemap", async (req, res) => {
 	let links = [];
 
-	// Fetch data from MongoDB
 	const products = await Product.find({ activeProduct: true }).populate(
 		"category"
 	);
 	const currentDate = new Date().toISOString();
 
-	// ----------------
-	// Add static links
-	// ----------------
+	// Add your static links
 	const staticLinks = [
 		{ url: "/", lastmod: currentDate, changefreq: "weekly", priority: 1.0 },
 		{
 			url: "/our-products",
 			lastmod: currentDate,
 			changefreq: "weekly",
-			priority: 0.9,
+			priority: 0.8,
 		},
 		{
 			url: "/custom-gifts",
@@ -150,18 +165,24 @@ router.get("/generate-sitemap", async (req, res) => {
 		{
 			url: "/signup",
 			lastmod: currentDate,
-			changefreq: "monthly",
-			priority: 1.0,
+			changefreq: "yearly",
+			priority: 0.6,
+		},
+		{
+			url: "/sellingagent/signup",
+			lastmod: currentDate,
+			changefreq: "yearly",
+			priority: 0.5,
 		},
 	];
 	links.push(...staticLinks);
 
-	// -----------------------------------
-	// Generate product URLs (with POD logic)
-	// -----------------------------------
+	// ------------------------------
+	// Generate product URLs
+	// ------------------------------
 	for (let product of products) {
 		if (!product.category || !product.category.categoryStatus) {
-			continue; // skip inactive category
+			continue;
 		}
 
 		const lastModified = product.updatedAt
@@ -173,30 +194,36 @@ router.get("/generate-sitemap", async (req, res) => {
 			product.printifyProductDetails?.id;
 
 		if (isPOD) {
-			// Check if multiple variants or single
 			const variants = product.printifyProductDetails.variants || [];
+			// Build the Printify "option -> value" map
+			const optionValueMap = buildOptionValueMap(
+				product.printifyProductDetails
+			);
 
 			if (variants.length > 1) {
-				// MULTI-VARIANT => Create multiple links
+				// MULTI-VARIANT
 				variants.forEach((variant, index) => {
-					const { variantColor, variantSize } = parseSizeColorFromVariantTitle(
-						variant.title
+					// 1) Try to get color/size from Printify map
+					let { colorVal, sizeVal } = getColorSizeFromPrintifyMap(
+						variant,
+						optionValueMap
 					);
 
-					// Build link => /custom-gifts/:id?color=xx&size=yy
-					const productUrl = buildPODLink(
-						product._id,
-						variantColor,
-						variantSize
-					);
+					// 2) If nothing found in map, fallback to parse from variant.title
+					if (!colorVal && !sizeVal) {
+						const fallback = parseSizeColorFromVariantTitle(variant.title);
+						colorVal = fallback.variantColor;
+						sizeVal = fallback.variantSize;
+					}
 
-					// Gather images for this variant
+					// 3) Build link
+					const productUrl = buildPODLink(product._id, colorVal, sizeVal);
+
+					// 4) Gather images
 					const imagesArr = gatherPODVariantImages(product, variant.sku);
-
-					// Convert images to sitemap's "img" array
 					const sitemapImages = imagesArr.map((u) => ({
 						url: u,
-						title: product.productName, // or variant.title
+						title: product.productName,
 					}));
 
 					links.push({
@@ -209,12 +236,21 @@ router.get("/generate-sitemap", async (req, res) => {
 				});
 			} else if (variants.length === 1) {
 				// SINGLE-VARIANT POD
-				const productUrl = buildPODLink(product._id);
+				const singleVar = variants[0];
 
-				// Gather images from that single variant or fallback
-				const singleVarSKU = variants[0].sku;
-				const imagesArr = gatherPODVariantImages(product, singleVarSKU);
+				// Attempt to get color/size
+				let { colorVal, sizeVal } = getColorSizeFromPrintifyMap(
+					singleVar,
+					optionValueMap
+				);
+				if (!colorVal && !sizeVal) {
+					const fallback = parseSizeColorFromVariantTitle(singleVar.title);
+					colorVal = fallback.variantColor;
+					sizeVal = fallback.variantSize;
+				}
 
+				const productUrl = buildPODLink(product._id, colorVal, sizeVal);
+				const imagesArr = gatherPODVariantImages(product, singleVar.sku);
 				const sitemapImages = imagesArr.map((u) => ({
 					url: u,
 					title: product.productName,
@@ -228,7 +264,7 @@ router.get("/generate-sitemap", async (req, res) => {
 					img: sitemapImages,
 				});
 			} else {
-				// POD but no variants array => fallback
+				// POD but no variants => fallback
 				const productUrl = `/custom-gifts/${product._id}`;
 				const imagesArr = gatherProductImages(product);
 				const sitemapImages = imagesArr.map((u) => ({
@@ -245,7 +281,7 @@ router.get("/generate-sitemap", async (req, res) => {
 				});
 			}
 		} else {
-			// Non-POD => single standard link
+			// NON-POD
 			const productUrl = buildNonPODLink(product);
 			const imagesArr = gatherProductImages(product);
 			const sitemapImages = imagesArr.map((u) => ({
@@ -263,9 +299,9 @@ router.get("/generate-sitemap", async (req, res) => {
 		}
 	}
 
-	// -------------------------------------------------------
-	// Add category filter URLs
-	// -------------------------------------------------------
+	// ------------------------------
+	// Category filter URLs
+	// ------------------------------
 	const categoryUrls = new Set();
 	for (let product of products) {
 		if (product.category && product.category.categoryStatus) {
@@ -283,11 +319,11 @@ router.get("/generate-sitemap", async (req, res) => {
 		});
 	}
 
-	// -----------------------------
-	// Build the sitemap XML
-	// -----------------------------
+	// ------------------------------
+	// Build the actual sitemap
+	// ------------------------------
 	const sitemapStream = new SitemapStream({
-		hostname: "https://serenejannat.com", // your domain
+		hostname: "https://serenejannat.com",
 	});
 
 	for (let link of links) {
@@ -296,36 +332,34 @@ router.get("/generate-sitemap", async (req, res) => {
 			lastmod: link.lastmod,
 			changefreq: link.changefreq,
 			priority: link.priority,
-			img: link.img, // pass images for that URL
+			img: link.img,
 		});
 	}
 
 	sitemapStream.end();
 
-	const sitemapPromise = streamToPromise(sitemapStream);
+	try {
+		const sitemapBuffer = await streamToPromise(sitemapStream);
+		const xmlContent = sitemapBuffer.toString();
+		const writeStream = createWriteStream(
+			resolve(__dirname, "../../serene_frontend/public/sitemap.xml"),
+			{ flags: "w" }
+		);
+		writeStream.write(xmlContent, "utf-8");
+		writeStream.end();
 
-	sitemapPromise
-		.then((sitemap) => {
-			const xmlContent = sitemap.toString();
-			const writeStream = createWriteStream(
-				resolve(__dirname, "../../serene_frontend/public/sitemap.xml"),
-				{ flags: "w" }
-			);
-			writeStream.write(xmlContent, "utf-8");
-			writeStream.end();
-			writeStream.on("error", (err) => {
-				console.error("Error writing sitemap:", err);
-				res.status(500).send("Error writing sitemap.");
-			});
-			writeStream.on("finish", () => {
-				console.log("Sitemap has been generated successfully.");
-				res.send("Sitemap has been generated successfully.");
-			});
-		})
-		.catch((err) => {
-			console.error("Error generating sitemap:", err);
-			res.status(500).send("Error generating sitemap.");
+		writeStream.on("error", (err) => {
+			console.error("Error writing sitemap:", err);
+			return res.status(500).send("Error writing sitemap.");
 		});
+		writeStream.on("finish", () => {
+			console.log("Sitemap has been generated successfully.");
+			res.send("Sitemap has been generated successfully.");
+		});
+	} catch (err) {
+		console.error("Error generating sitemap:", err);
+		res.status(500).send("Error generating sitemap.");
+	}
 });
 
 module.exports = router;
