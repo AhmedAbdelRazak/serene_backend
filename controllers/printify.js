@@ -481,7 +481,7 @@ async function createTempDesignPreview(
 		911: { x: 0.5, y: 0.5, scale: 0.3, angle: 0 },
 
 		// fallback default
-		default: { x: 0.5, y: 0.5, scale: 0.75, angle: 0 },
+		default: { x: 0.5, y: 0.5, scale: 0.88, angle: 0 },
 	};
 
 	function getPlacementForBlueprint(blueprintId) {
@@ -492,8 +492,11 @@ async function createTempDesignPreview(
 	//------------------------------------------------------------------
 	// 1) Upload "YourDesignHere.png" to Printify
 	//------------------------------------------------------------------
+	// const yourDesignUrl =
+	// 	"https://res.cloudinary.com/infiniteapps/image/upload/v1746240199/serene_janat/example_designs/YourDesignHere.png";
+
 	const yourDesignUrl =
-		"https://res.cloudinary.com/infiniteapps/image/upload/v1746240199/serene_janat/example_designs/YourDesignHere.png";
+		"https://res.cloudinary.com/infiniteapps/image/upload/v1746381000/serene_janat/YourDesignHere2_zl9oqo.png";
 
 	let printifyImageId = "";
 	try {
