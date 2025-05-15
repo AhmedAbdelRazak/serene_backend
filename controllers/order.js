@@ -630,7 +630,15 @@ async function createOnTheFlyPOD(item, order, token) {
 			);
 		}
 
-		// 4) Build placeholders
+		// 4) Extract user-specified placement (x,y,scale,angle) if available
+		//    Or fallback to defaults
+		const {
+			x = 0.5,
+			y = 0.5,
+			scale = 1,
+			angle = 0,
+		} = item.customDesign?.placementParams || {};
+
 		const placeholders = [
 			{
 				position: "front",
@@ -638,10 +646,10 @@ async function createOnTheFlyPOD(item, order, token) {
 					{
 						id: uploadedId,
 						type: "image/png", // or image/jpeg if needed
-						x: 0.5,
-						y: 0.5,
-						scale: 1,
-						angle: 0,
+						x,
+						y,
+						scale,
+						angle,
 					},
 				],
 			},
@@ -863,13 +871,16 @@ const postOrderToPrintify = async (order) => {
 
 // ========================================================
 // =============== CREATE ORDER CONTROLLER ================
-// Flow:
+// Flow now updated so that payment happens FIRST:
 //  1) Check stock
 //  2) Generate invoice number
-//  3) Create local order doc (without payment details yet)
-//  4) postOrderToPrintify => if fails => remove local order => throw error
-//  5) If printify success => processSquarePayment => if that fails => same approach
-//  6) Add paymentDetails => update stock => send notifications => respond
+//  3) Create local order doc (no payment details yet)
+//  4) Process Square Payment => if fails => remove local order => throw error
+//  5) Save payment details => .save()
+//  6) postOrderToPrintify => if fails => (optional: do partial refund or remove doc, up to you)
+//  7) updateStock
+//  8) send notifications (email & SMS)
+//  9) respond
 exports.create = async (req, res) => {
 	try {
 		const { paymentToken, orderData } = req.body;
@@ -895,18 +906,7 @@ exports.create = async (req, res) => {
 		});
 		await order.save();
 
-		// 4) Attempt to create the order on Printify BEFORE charging
-		try {
-			await postOrderToPrintify(order);
-		} catch (err) {
-			// If Printify fails (including "No real variant found"), remove the local doc
-			await Order.findByIdAndDelete(order._id);
-			throw new Error(
-				`Failed to create POD order. Card not charged. Please try again later`
-			);
-		}
-
-		// 5) Process Square Payment
+		// 4) Process Square Payment FIRST
 		let paymentResult;
 		try {
 			paymentResult = await processSquarePayment(
@@ -916,16 +916,36 @@ exports.create = async (req, res) => {
 				orderData.customerDetails
 			);
 		} catch (err) {
-			// If Square fails, also remove the local order
+			// If Square fails, remove the local order
 			await Order.findByIdAndDelete(order._id);
 			throw new Error(
 				`Card payment failed. Order aborted. Details: ${err.message}`
 			);
 		}
 
-		// 6) Save payment details in local order
+		// 5) Save payment details now that we’re successful
 		order.paymentDetails = paymentResult;
 		await order.save();
+
+		// 6) Create / post order to Printify
+		try {
+			await postOrderToPrintify(order);
+		} catch (err) {
+			// At this point, payment is already done.
+			// You may want to handle partial refunds or keep the order “manual fulfillment”.
+			// For now, we’ll just log it. If you want to remove the order or refund, do so here.
+			console.error(
+				"Failed to create Printify order after payment succeeded:",
+				err.message
+			);
+			if (err.response) {
+				console.error("Printify error details:", err.response.data);
+			}
+			// Decide how you want to handle. We'll just throw:
+			throw new Error(
+				`Failed to create Printify order after payment. Please contact support.`
+			);
+		}
 
 		// 7) Update local stock
 		await updateStock(order);
