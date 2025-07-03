@@ -40,6 +40,7 @@
 		"socket.io": "^4.7.5",
 		"square": "^37.0.0",
 		"square-connect": "^6.20201216.0",
+		"stripe": "^18.3.0",
 		"twilio": "^5.0.4",
 		"uuid": "^9.0.1",
 		"web-streams-polyfill": "^4.0.0"
