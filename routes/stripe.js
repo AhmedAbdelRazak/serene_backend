@@ -5,7 +5,7 @@ const {
 	webhook,
 } = require("../controllers/stripeController");
 
-router.post("/checkout-session", createCheckoutSession);
+router.post("/stripe/checkout-session", createCheckoutSession);
 
 /* Stripe requires the raw body for webhook validation */
 router.post("/webhook", express.raw({ type: "application/json" }), webhook);
