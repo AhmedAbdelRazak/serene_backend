@@ -100,9 +100,12 @@ exports.createCheckoutSession = async (req, res) => {
 /* ────────────────────────────────────────────────────────────── */
 /*  B)  Web‑hook (raw body!)                                      */
 /* ────────────────────────────────────────────────────────────── */
+/* controllers/stripeController.js  (only the webhook part) */
+
 exports.webhook = async (req, res) => {
 	const sig = req.headers["stripe-signature"];
 	let event;
+
 	try {
 		event = stripe.webhooks.constructEvent(
 			req.body,
@@ -110,27 +113,75 @@ exports.webhook = async (req, res) => {
 			process.env.STRIPE_WEBHOOK_SECRET
 		);
 	} catch (err) {
-		console.error("✗ Webhook signature invalid:", err.message);
+		console.error("⚠️  Webhook signature failed:", err.message);
 		return res.status(400).send(`Webhook Error: ${err.message}`);
 	}
 
-	if (event.type === "checkout.session.completed") {
-		const session = event.data.object;
-		const orderId = session.metadata.order_id;
+	/* we only care about the payment being completed */
+	if (event.type !== "checkout.session.completed") {
+		return res.json({ received: true }); // fast‑path for all others
+	}
 
+	const session = event.data.object;
+	const orderId = session.metadata?.order_id;
+	const invoiceN = session.metadata?.invoice;
+
+	console.log(`▶︎  checkout.session.completed  order=${orderId}`);
+
+	try {
+		/* ------------------------------------------------------------------ 1 */
+		const order = await Order.findById(orderId);
+		if (!order) throw new Error("Order document not found");
+
+		/* ------------------------------------------------------------------ 2 */
+		let intent;
 		try {
-			const order = await Order.findById(orderId);
-			if (!order) throw new Error("Order not found");
-
-			const pi = await stripe.paymentIntents.retrieve(session.payment_intent, {
-				expand: ["charges", "latest_charge.balance_transaction"],
+			intent = await stripe.paymentIntents.retrieve(session.payment_intent, {
+				expand: ["charges", "payment_method"],
 			});
-
-			await finalisePaidOrder(order, pi);
-			console.log(`✓ order ${order.invoiceNumber} processed (webhook)`);
-		} catch (err) {
-			console.error("✗ webhook processing failed:", err);
+			console.log("   ✓ PaymentIntent retrieved:", intent.id);
+		} catch (piErr) {
+			console.error("   ✗ PI retrieval failed, falling back to session object");
+			intent = session; // minimal fallback (still has amount, currency…)
 		}
+
+		order.paymentStatus = "Paid";
+		order.status = "In Process";
+		order.paymentDetails = intent;
+
+		await order.save();
+		console.log("   ✓ Order marked Paid & saved", order._id);
+
+		/* ------------------------------------------------------------------ 3 */
+		try {
+			await postOrderToPrintify(order);
+			console.log("   ✓ Printify order(s) created");
+		} catch (printErr) {
+			console.error("   ✗ Printify failed – order left for manual fulfilment");
+			console.error("     ", printErr?.response?.data || printErr);
+			// DON’T throw – customer has already paid
+		}
+
+		/* ------------------------------------------------------------------ 4 */
+		try {
+			await updateStock(order);
+			console.log("   ✓ Local stock updated");
+		} catch (stockErr) {
+			console.error("   ✗ Stock update failed:", stockErr);
+		}
+
+		/* ------------------------------------------------------------------ 5 */
+		sendOrderConfirmationEmail(order).catch((e) =>
+			console.error("   ✗ Email error:", e)
+		);
+		sendOrderConfirmationSMS(order).catch((e) =>
+			console.error("   ✗ SMS error:", e)
+		);
+
+		console.log(`✔︎  Post‑payment pipeline finished  (invoice ${invoiceN})`);
+	} catch (fatal) {
+		console.error("🚨  webhook fatal:", fatal);
+		// optional: trigger ops alert / refund
 	}
 
 	res.json({ received: true });
