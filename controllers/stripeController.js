@@ -50,13 +50,37 @@ exports.createCheckoutSession = async (req, res) => {
 				Number(order.totalAmountAfterDiscount || order.totalAmount) * 100
 			);
 
+			// Build helpers first so the snippet stays readable
+			const shipping = {
+				name: order.customerDetails.name,
+				phone: order.customerDetails.phone,
+				address: {
+					line1: order.customerDetails.address,
+					city: order.customerDetails.city,
+					state: order.customerDetails.state,
+					postal_code: order.customerDetails.zipcode,
+					country: "US",
+				},
+			};
+
+			const metadata = {
+				order_id: order._id.toString(),
+				invoice: invoiceNumber,
+				total_qty: order.totalOrderQty.toString(),
+				shipping_option: order.chosenShippingOption.carrierName,
+				// ⚠️ 50 keys max / 500 chars per value – keep it short
+			};
+
 			const pi = await stripe.paymentIntents.create({
 				amount: cents,
 				currency: "usd",
 				payment_method: paymentMethodId,
 				confirmation_method: "manual",
 				confirm: true,
-				metadata: { order_id: order._id.toString(), invoice: invoiceNumber },
+				description: `Serene Jannat – Order ${invoiceNumber}`, // shown on receipts
+				shipping, // shows in Link UI + Dashboard
+				statement_descriptor_suffix: "SJ GIFTS", // ≤22 chars
+				metadata,
 				receipt_email: order.customerDetails.email,
 			});
 
