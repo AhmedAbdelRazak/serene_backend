@@ -52,6 +52,7 @@ const shopLogo = path.join(__dirname, "../shopLogo/logo.png");
 const checkStockAvailability = async (order) => {
 	// ─────────────  A) Simple (no‑variable) products  ─────────────
 	for (const item of order.productsNoVariable) {
+		console.log("      checking simple item ->", item.name);
 		if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
 			/* POD – check variant availability inside printifyProductDetails */
 			const cartColor = (item.chosenAttributes?.color || "").toLowerCase();
@@ -80,6 +81,7 @@ const checkStockAvailability = async (order) => {
 
 	// ─────────────  B) Variable products  ─────────────
 	for (const item of order.chosenProductQtyWithVariables) {
+		console.log("      checking variant item ->", item.name);
 		if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
 			const cartColor = (item.chosenAttributes?.color || "").toLowerCase();
 			const cartSize = (item.chosenAttributes?.size || "").toLowerCase();
@@ -212,6 +214,7 @@ async function uploadIfNeeded(imageUrl, token) {
 			payload,
 			{ headers: { Authorization: `Bearer ${token}` } }
 		);
+		console.log(`✓ Design uploaded to Printify – ID: ${resp.data.id}`);
 		return resp.data.id; // e.g. "623e0f87f•••"
 	} catch (error) {
 		console.error("Printify upload error:", error?.response?.data || error);
@@ -340,6 +343,10 @@ async function createOnTheFlyPOD(item, order, token) {
 			{ headers: { Authorization: `Bearer ${token}` } }
 		);
 
+		console.log(
+			`✓ POD product created on Printify – ID: ${newProductId}, Order ID: ${orderR.data.id}`
+		);
+
 		/* 7) persist POD info */
 		await Order.findByIdAndUpdate(order._id, {
 			$push: {
@@ -423,6 +430,10 @@ const postOrderToPrintify = async (order) => {
 			`https://api.printify.com/v1/shops/${item.printifyProductDetails.shop_id}/orders.json`,
 			printifyOrder,
 			{ headers }
+		);
+
+		console.log(
+			`Printify order created for item ${item.name} – ID: ${response.data.id}`
 		);
 
 		/* save to DB */
@@ -532,6 +543,7 @@ const sendOrderConfirmationEmail = async (order) => {
 
 		/* A) Customer */
 		await sgMail.send({ ...msgBase, to: recipient });
+		console.log(`✓ Order confirmation sent to ${recipient}`);
 
 		/* B) Internal team (bcc) */
 		const bccEmails = owners.filter((e) => e !== recipient);

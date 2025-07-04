@@ -1,15 +1,12 @@
 /* ---------------------------------------------------------------------------
-   controllers/stripeController.js           (single‑call full pipeline)
+   Stripe Controller – July‑2025  (hosted + direct, with webhook)
    --------------------------------------------------------------------------- */
 
 "use strict";
-
-/* ───────── External dependencies ───────── */
 const stripe = require("stripe")(
 	process.env.STRIPE_SECRET_KEY || process.env.STRIPE_TEST_SECRET_KEY
 );
 
-/* ───────── Internal shared helpers ─────── */
 const {
 	checkStockAvailability,
 	generateUniqueInvoiceNumber,
@@ -22,116 +19,184 @@ const {
 
 const { Order } = require("../models/order");
 
-/* ════════════════════════════════════════════════════════════════
-   POST  /api/stripe/checkout-session
-   One single controller – no webhook required
-   ════════════════════════════════════════════════════════════════ */
+/* ────────────────────────────────────────────────────────────── */
+/*  A)  Checkout entry point                                      */
+/* ────────────────────────────────────────────────────────────── */
 exports.createCheckoutSession = async (req, res) => {
 	console.log("▶︎  /api/stripe/checkout-session called");
 
 	try {
-		/* ------------------------------------------------------------------ 0 */
-		const { orderData, paymentMethodId } = req.body;
-
-		if (!orderData || !orderData.totalAmountAfterDiscount)
+		const { orderData, paymentMethodId } = req.body || {};
+		if (!orderData)
 			return res.status(400).json({ error: "Missing order data" });
 
-		if (!paymentMethodId)
-			return res.status(400).json({ error: "Missing paymentMethodId" });
-
-		/* ------------------------------------------------------------------ 1 */
+		/* 1) stock */
 		const stockIssue = await checkStockAvailability(orderData);
-		if (stockIssue) {
-			console.warn("✗ Stock issue:", stockIssue);
-			return res.status(400).json({ error: stockIssue });
-		}
+		if (stockIssue) return res.status(400).json({ error: stockIssue });
 
-		/* ------------------------------------------------------------------ 2 */
+		/* 2) stub order */
 		const invoiceNumber = await generateUniqueInvoiceNumber();
 		const order = await Order.create({
 			...orderData,
 			invoiceNumber,
 			status: "Awaiting Payment",
 			paymentStatus: "Pending",
-			createdVia: "Stripe‑Direct",
+			createdVia: paymentMethodId ? "Stripe‑Direct" : "Stripe‑Checkout",
 		});
-		console.log(`✓ Order stub saved  _id=${order._id}`);
 
-		/* ------------------------------------------------------------------ 3 */
-		const amountInCents = Math.round(
-			Number(orderData.totalAmountAfterDiscount) * 100
-		);
+		/* ───── DIRECT CHARGE ───── */
+		if (paymentMethodId) {
+			const cents = Math.round(
+				Number(order.totalAmountAfterDiscount || order.totalAmount) * 100
+			);
 
-		let paymentIntent;
-		try {
-			paymentIntent = await stripe.paymentIntents.create({
-				amount: amountInCents,
+			const pi = await stripe.paymentIntents.create({
+				amount: cents,
 				currency: "usd",
 				payment_method: paymentMethodId,
 				confirmation_method: "manual",
-				confirm: true, // synchronous confirm
-				metadata: {
-					order_id: order._id.toString(),
-					invoice: invoiceNumber,
-				},
+				confirm: true,
+				metadata: { order_id: order._id.toString(), invoice: invoiceNumber },
 				receipt_email: order.customerDetails.email,
 			});
-		} catch (err) {
-			console.error("✗ Stripe PI error:", err);
-			await Order.findByIdAndDelete(order._id); // rollback
-			return res.status(402).json({ error: err.message });
-		}
 
-		/* ---- 3‑D Secure required? ---------------------------------------- */
-		if (paymentIntent.status === "requires_action") {
+			if (pi.status === "requires_action")
+				return res.json({
+					requiresAction: true,
+					clientSecret: pi.client_secret,
+				});
+
+			if (pi.status !== "succeeded") {
+				await Order.findByIdAndDelete(order._id);
+				return res.status(402).json({ error: "Payment unsuccessful" });
+			}
+
+			await finalisePaidOrder(order, pi);
 			return res.json({
-				requiresAction: true,
-				clientSecret: paymentIntent.client_secret,
+				success: true,
+				order: convertBigIntToString(order.toObject()),
 			});
 		}
 
-		if (paymentIntent.status !== "succeeded") {
-			await Order.findByIdAndDelete(order._id);
-			return res
-				.status(402)
-				.json({ error: "Payment did not succeed. Please try again." });
-		}
+		/* ───── HOSTED CHECKOUT ───── */
+		const lineItems = buildLineItems(order);
+		const session = await stripe.checkout.sessions.create({
+			mode: "payment",
+			customer_email: order.customerDetails.email,
+			line_items: lineItems,
+			metadata: { order_id: order._id.toString(), invoice: invoiceNumber },
+			success_url:
+				process.env.CLIENT_URL + "/dashboard?session_id={CHECKOUT_SESSION_ID}",
+			cancel_url: process.env.CLIENT_URL + "/cart?canceled=1",
+		});
 
-		console.log("✓ PaymentIntent succeeded id:", paymentIntent.id);
-
-		/* ------------------------------------------------------------------ 4 */
-		order.paymentStatus = "Paid";
-		order.status = "In Process";
-		order.paymentDetails = paymentIntent; // full JSON blob
-		await order.save();
-		console.log("✓ Order updated to Paid");
-
-		/* ------------------------------------------------------------------ 5 */
-		try {
-			console.log("→  postOrderToPrintify");
-			await postOrderToPrintify(order);
-			console.log("✓ Printify fulfilment complete");
-
-			console.log("→  updateStock");
-			await updateStock(order);
-			console.log("✓ Stock updated");
-
-			sendOrderConfirmationEmail(order).catch((e) =>
-				console.error("Email error:", e)
-			);
-			sendOrderConfirmationSMS(order).catch((e) =>
-				console.error("SMS error:", e)
-			);
-		} catch (fulfilErr) {
-			console.error("✗ Fulfilment error AFTER payment:", fulfilErr);
-			/* Decide here if you want to trigger a refund automatically. */
-		}
-
-		/* ------------------------------------------------------------------ 6 */
-		const responseOrder = convertBigIntToString(order.toObject());
-		return res.json({ success: true, order: responseOrder });
+		return res.json({ url: session.url }); // React expects `url`
 	} catch (err) {
-		console.error("✗ Top‑level Stripe controller error:", err);
-		return res.status(500).json({ error: "Server error – please try again." });
+		console.error("✗ createCheckoutSession error:", err);
+		return res.status(500).json({ error: "Server error" });
 	}
 };
+
+/* ────────────────────────────────────────────────────────────── */
+/*  B)  Web‑hook (raw body!)                                      */
+/* ────────────────────────────────────────────────────────────── */
+exports.webhook = async (req, res) => {
+	const sig = req.headers["stripe-signature"];
+	let event;
+	try {
+		event = stripe.webhooks.constructEvent(
+			req.body,
+			sig,
+			process.env.STRIPE_WEBHOOK_SECRET
+		);
+	} catch (err) {
+		console.error("✗ Webhook signature invalid:", err.message);
+		return res.status(400).send(`Webhook Error: ${err.message}`);
+	}
+
+	if (event.type === "checkout.session.completed") {
+		const session = event.data.object;
+		const orderId = session.metadata.order_id;
+
+		try {
+			const order = await Order.findById(orderId);
+			if (!order) throw new Error("Order not found");
+
+			const pi = await stripe.paymentIntents.retrieve(session.payment_intent, {
+				expand: ["charges", "latest_charge.balance_transaction"],
+			});
+
+			await finalisePaidOrder(order, pi);
+			console.log(`✓ order ${order.invoiceNumber} processed (webhook)`);
+		} catch (err) {
+			console.error("✗ webhook processing failed:", err);
+		}
+	}
+
+	res.json({ received: true });
+};
+
+/* ────────────────────────────────────────────────────────────── */
+/*  C)  Helpers                                                  */
+/* ────────────────────────────────────────────────────────────── */
+function buildLineItems(order) {
+	const arr = [];
+
+	order.productsNoVariable.forEach((p) =>
+		arr.push({
+			quantity: p.ordered_quantity,
+			price_data: {
+				currency: "usd",
+				unit_amount: Math.round(p.price * 100),
+				product_data: { name: p.name },
+			},
+		})
+	);
+
+	order.chosenProductQtyWithVariables.forEach((p) =>
+		arr.push({
+			quantity: p.ordered_quantity,
+			price_data: {
+				currency: "usd",
+				unit_amount: Math.round(p.price * 100),
+				product_data: {
+					name: `${p.name} – ${p.chosenAttributes.color}/${p.chosenAttributes.size}`,
+				},
+			},
+		})
+	);
+
+	arr.push({
+		quantity: 1,
+		price_data: {
+			currency: "usd",
+			unit_amount: Math.round(order.chosenShippingOption.shippingPrice * 100),
+			product_data: {
+				name: `Shipping – ${order.chosenShippingOption.carrierName}`,
+			},
+		},
+	});
+
+	return arr;
+}
+
+async function finalisePaidOrder(orderDoc, paymentIntent) {
+	/* guard‑clause: avoid double‑processing */
+	if (orderDoc.paymentStatus === "Paid") return;
+
+	orderDoc.paymentStatus = "Paid";
+	orderDoc.status = "In Process";
+	orderDoc.paymentDetails = paymentIntent;
+	await orderDoc.save();
+
+	console.log("   → postOrderToPrintify()");
+	await postOrderToPrintify(orderDoc);
+
+	console.log("   → updateStock()");
+	await updateStock(orderDoc);
+
+	sendOrderConfirmationEmail(orderDoc).catch((e) =>
+		console.error("e‑mail err:", e)
+	);
+	sendOrderConfirmationSMS(orderDoc).catch((e) => console.error("SMS err:", e));
+}

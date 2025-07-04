@@ -4,6 +4,7 @@ const morgan = require("morgan");
 const cors = require("cors");
 const { readdirSync } = require("fs");
 require("dotenv").config();
+
 const http = require("http");
 const socketIo = require("socket.io");
 const cron = require("node-cron");
@@ -11,6 +12,14 @@ const axios = require("axios");
 
 // app
 const app = express();
+
+const stripeController = require("./controllers/stripeController");
+app.post(
+	"/api/stripe/webhook",
+	express.raw({ type: "application/json" }), // <‑‑ no json/body‑parser here
+	stripeController.webhook
+);
+
 const server = http.createServer(app);
 
 // db
