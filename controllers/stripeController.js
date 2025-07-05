@@ -166,7 +166,6 @@ exports.createCheckoutSession = async (req, res) => {
 				customer_email: order.customerDetails.email,
 				line_items: lineItems,
 				/* visible in Checkout UI */
-				shipping_address_collection: { allowed_countries: ["US", "CA"] },
 				phone_number_collection: { enabled: true },
 				/* goes into the PaymentIntent */
 				payment_intent_data: {
