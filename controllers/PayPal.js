@@ -1,17 +1,16 @@
 /* ---------------------------------------------------------------------------
-   PayPal Controller – July‑2025
+   PayPal Controller – July 2025
    Mirrors Stripe logic: stub‑order first, delete on failure, finalise on success
    --------------------------------------------------------------------------- */
 
 "use strict";
 
-/* ─────────────────────────────  1. Deps & config  ───────────────────────── */
+/* ───────────── 1. Deps & config ───────────── */
 const paypal = require("@paypal/checkout-server-sdk");
 const axios = require("axios");
 const Joi = require("joi");
 const { v4: uuidv4 } = require("uuid");
 
-/* choose environment */
 const IS_PROD = /prod/i.test(process.env.NODE_ENV);
 const clientId = IS_PROD
 	? process.env.PAYPAL_CLIENT_ID_LIVE
@@ -20,14 +19,13 @@ const clientSecret = IS_PROD
 	? process.env.PAYPAL_SECRET_KEY_LIVE
 	: process.env.PAYPAL_SECRET_KEY_SANDBOX;
 
-function ppEnvironment() {
-	return IS_PROD
+const ppClient = new paypal.core.PayPalHttpClient(
+	IS_PROD
 		? new paypal.core.LiveEnvironment(clientId, clientSecret)
-		: new paypal.core.SandboxEnvironment(clientId, clientSecret);
-}
-const ppClient = new paypal.core.PayPalHttpClient(ppEnvironment());
+		: new paypal.core.SandboxEnvironment(clientId, clientSecret)
+);
 
-/* ─────────────────────  2. Local helpers & existing utils  ─────────────── */
+/* ───────────── 2. App helpers ───────────── */
 const {
 	checkStockAvailability,
 	generateUniqueInvoiceNumber,
@@ -37,9 +35,9 @@ const {
 	sendOrderConfirmationSMS,
 	convertBigIntToString,
 } = require("./HelperFunctions");
-const { Order } = require("../models/order");
+const { Order } = require("../models/order"); // ⚠︎ make sure schema has paypalOrderId:String
 
-/* ─────────────────────  3. Input validation (Joi)  ─────────────────────── */
+/* ───────────── 3. Joi schema ───────────── */
 const orderSchema = Joi.object({
 	customerDetails: Joi.object({
 		name: Joi.string().min(2).max(60).required(),
@@ -51,38 +49,39 @@ const orderSchema = Joi.object({
 		city: Joi.string().min(2).required(),
 		state: Joi.string().min(2).required(),
 		zipcode: Joi.string().min(3).required(),
+		userId: Joi.string().optional(), // allowed but not required
 	}).required(),
+
 	productsNoVariable: Joi.array().items(Joi.object()).required(),
 	chosenProductQtyWithVariables: Joi.array().items(Joi.object()).required(),
+
 	chosenShippingOption: Joi.object({
 		carrierName: Joi.string().required(),
 		shippingPrice: Joi.number().positive().required(),
-	}).required(),
+	})
+		.unknown(true)
+		.required(), // accept extra keys
+
 	totalAmount: Joi.number().positive().required(),
 	totalAmountAfterDiscount: Joi.number().positive().allow(null),
 	totalOrderQty: Joi.number().integer().positive().required(),
 }).unknown(true);
 
-/* ─────────────────────────────  4. Minor utils  ─────────────────────────── */
-const normalisePhone = (raw) =>
-	raw.startsWith("+") ? raw : `+1${raw.replace(/\D/g, "")}`.slice(0, 12);
-
-const buildPurchaseUnit = (order, invoiceNumber) => ({
+/* ───────────── 4. Minor utils ───────────── */
+const buildPurchaseUnit = (order, invoice) => ({
 	reference_id: order._id.toString(),
-	invoice_id: invoiceNumber,
-	description: `Serene Jannat – Order ${invoiceNumber}`,
+	invoice_id: invoice,
+	description: `Serene Jannat – Order ${invoice}`,
 	amount: {
 		currency_code: "USD",
 		value: (order.totalAmountAfterDiscount || order.totalAmount).toFixed(2),
 	},
 });
 
-/* ╔═════════════════════════════════════════════════════════════════════════╗
-   ║  5.  GENERATE CLIENT TOKEN  (for JS‑SDK / Fastlane)                     ║
-   ╚═════════════════════════════════════════════════════════════════════════╝ */
+/* ═════════════ 5. Generate client token ═════════════ */
 exports.generateClientToken = async (_req, res) => {
 	try {
-		const tokenResp = await axios.post(
+		const { data } = await axios.post(
 			`${
 				IS_PROD
 					? "https://api-m.paypal.com"
@@ -91,18 +90,16 @@ exports.generateClientToken = async (_req, res) => {
 			{},
 			{ auth: { username: clientId, password: clientSecret } }
 		);
-		res.json({ clientToken: tokenResp.data.client_token });
+		res.json({ clientToken: data.client_token });
 	} catch (err) {
 		console.error("PayPal client‑token error:", err?.response?.data || err);
 		res.status(500).json({ error: "Failed to generate client token" });
 	}
 };
 
-/* ╔═════════════════════════════════════════════════════════════════════════╗
-   ║  6.  CREATE ORDER  (stub + PayPal Order)                                ║
-   ╚═════════════════════════════════════════════════════════════════════════╝ */
+/* ═════════════ 6. Create order (stub + PP order) ═════════════ */
 exports.createOrder = async (req, res) => {
-	console.log("▶︎  POST /paypal/create-order");
+	console.log("▶︎ POST /paypal/create-order");
 
 	const { orderData } = req.body || {};
 	const { error } = orderSchema.validate(orderData || {}, {
@@ -110,26 +107,24 @@ exports.createOrder = async (req, res) => {
 	});
 	if (error) return res.status(400).json({ error: error.details });
 
-	/* stock */
 	const stockIssue = await checkStockAvailability(orderData);
 	if (stockIssue) return res.status(400).json({ error: stockIssue });
 
-	const invoiceNumber = await generateUniqueInvoiceNumber();
+	const invoice = await generateUniqueInvoiceNumber();
 	let order = await Order.create({
 		...orderData,
-		invoiceNumber,
+		invoiceNumber: invoice,
 		status: "Awaiting Payment",
 		paymentStatus: "Pending",
 		createdVia: "PayPal‑Checkout",
 	});
 
-	/* Build PayPal Order */
-	const ppRequest = new paypal.orders.OrdersCreateRequest();
-	ppRequest.headers["PayPal-Request-Id"] = `order-${order._id}-${uuidv4()}`; // idempotency
-	ppRequest.prefer("return=representation");
-	ppRequest.requestBody({
+	const ppReq = new paypal.orders.OrdersCreateRequest();
+	ppReq.headers["PayPal-Request-Id"] = `order-${order._id}-${uuidv4()}`;
+	ppReq.prefer("return=representation");
+	ppReq.requestBody({
 		intent: "CAPTURE",
-		purchase_units: [buildPurchaseUnit(order, invoiceNumber)],
+		purchase_units: [buildPurchaseUnit(order, invoice)],
 		application_context: {
 			brand_name: "Serene Jannat",
 			user_action: "PAY_NOW",
@@ -138,61 +133,49 @@ exports.createOrder = async (req, res) => {
 	});
 
 	try {
-		const ppResp = await ppClient.execute(ppRequest);
-		const { id: paypalOrderId } = ppResp.result;
-
-		/* save PayPal ID on stub for lookup during capture / web‑hook */
-		await Order.findByIdAndUpdate(order._id, { paypalOrderId });
-
-		return res.json({ paypalOrderId });
+		const { result } = await ppClient.execute(ppReq);
+		await Order.findByIdAndUpdate(order._id, { paypalOrderId: result.id });
+		res.json({ paypalOrderId: result.id });
 	} catch (err) {
 		console.error("PayPal create‑order error:", err?.statusCode, err?.message);
-		await Order.findByIdAndDelete(order._id); // cleanup
-		return res.status(500).json({ error: "Failed to create PayPal order" });
+		await Order.findByIdAndDelete(order._id);
+		res.status(500).json({ error: "Failed to create PayPal order" });
 	}
 };
 
-/* ╔═════════════════════════════════════════════════════════════════════════╗
-   ║  7.  CAPTURE ORDER  (called after payer approves PayPal pop‑up)         ║
-   ╚═════════════════════════════════════════════════════════════════════════╝ */
+/* ═════════════ 7. Capture order (after approval) ═════════════ */
 exports.captureOrder = async (req, res) => {
-	console.log("▶︎  POST /paypal/capture-order");
+	console.log("▶︎ POST /paypal/capture-order");
 	const { paypalOrderId } = req.body || {};
 	if (!paypalOrderId)
 		return res.status(400).json({ error: "Missing order ID" });
 
-	/* find stub order */
 	let order = await Order.findOne({ paypalOrderId });
 	if (!order) return res.status(404).json({ error: "Local order not found" });
 
-	const captureRequest = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
-	captureRequest.requestBody({}); // empty body as per API spec
+	const captureReq = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
+	captureReq.requestBody({});
 
 	try {
-		const captureResp = await ppClient.execute(captureRequest);
-		const status = captureResp.result.status;
-		if (status !== "COMPLETED")
-			throw new Error(`Capture not completed (status ${status})`);
+		const { result } = await ppClient.execute(captureReq);
+		if (result.status !== "COMPLETED")
+			throw new Error(`Capture not completed (status ${result.status})`);
 
-		await finalisePaidOrder(order, captureResp.result);
+		const clean = JSON.parse(JSON.stringify(result)); // ← clone
+
+		await finalisePaidOrder(order, clean);
 		order = await Order.findById(order._id);
-		return res.json({
-			success: true,
-			order: convertBigIntToString(order.toObject()),
-		});
+		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
 	} catch (err) {
 		console.error("PayPal capture error:", err?.statusCode, err?.message);
 		await Order.findByIdAndDelete(order._id);
-		return res.status(402).json({ error: "Payment not completed" });
+		res.status(402).json({ error: "Payment not completed" });
 	}
 };
 
-/* ╔═════════════════════════════════════════════════════════════════════════╗
-   ║  8.  CARD‑ONLY PAYMENT (Advanced Credit/Debit Card, no redirect)        ║
-   ╚═════════════════════════════════════════════════════════════════════════╝ */
+/* ═════════════ 8. Card‑only (Advanced Credit & Debit) ═════════════ */
 exports.cardPay = async (req, res) => {
-	console.log("▶︎  POST /paypal/card-pay");
-
+	console.log("▶︎ POST /paypal/card-pay");
 	const { orderData, paymentSource } = req.body || {};
 	if (!paymentSource)
 		return res.status(400).json({ error: "Missing card token" });
@@ -202,103 +185,93 @@ exports.cardPay = async (req, res) => {
 	});
 	if (error) return res.status(400).json({ error: error.details });
 
-	/* stock check */
 	const stockIssue = await checkStockAvailability(orderData);
 	if (stockIssue) return res.status(400).json({ error: stockIssue });
 
-	const invoiceNumber = await generateUniqueInvoiceNumber();
+	const invoice = await generateUniqueInvoiceNumber();
 	let order = await Order.create({
 		...orderData,
-		invoiceNumber,
+		invoiceNumber: invoice,
 		status: "Awaiting Payment",
 		paymentStatus: "Pending",
 		createdVia: "PayPal‑Card",
 	});
 
-	/* build OrdersCreate with payment_source.card */
-	const ppRequest = new paypal.orders.OrdersCreateRequest();
-	ppRequest.headers["PayPal-Request-Id"] = `card-${order._id}-${uuidv4()}`;
-	ppRequest.requestBody({
+	/* create + capture in one shot */
+	const ppReq = new paypal.orders.OrdersCreateRequest();
+	ppReq.headers["PayPal-Request-Id"] = `card-${order._id}-${uuidv4()}`;
+	ppReq.requestBody({
 		intent: "CAPTURE",
-		purchase_units: [buildPurchaseUnit(order, invoiceNumber)],
+		purchase_units: [buildPurchaseUnit(order, invoice)],
 		payment_source: { card: paymentSource },
 	});
 
 	try {
-		const createResp = await ppClient.execute(ppRequest);
-		const orderId = createResp.result.id;
-
-		const captureReq = new paypal.orders.OrdersCaptureRequest(orderId);
+		const { result: created } = await ppClient.execute(ppReq);
+		const captureReq = new paypal.orders.OrdersCaptureRequest(created.id);
 		captureReq.requestBody({});
-		const captureResp = await ppClient.execute(captureReq);
+		const { result: captured } = await ppClient.execute(captureReq);
 
-		const status = captureResp.result.status;
-		if (status !== "COMPLETED")
-			throw new Error(`Capture not completed (status ${status})`);
+		if (captured.status !== "COMPLETED")
+			throw new Error(`Capture not completed (status ${captured.status})`);
 
-		await finalisePaidOrder(order, captureResp.result);
+		const clean = JSON.parse(JSON.stringify(captured));
+		await finalisePaidOrder(order, clean);
 		order = await Order.findById(order._id);
-		return res.json({
-			success: true,
-			order: convertBigIntToString(order.toObject()),
-		});
+		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
 	} catch (err) {
 		console.error("PayPal card‑pay error:", err?.statusCode, err?.message);
 		await Order.findByIdAndDelete(order._id);
-		return res.status(402).json({ error: "Card payment failed" });
+		res.status(402).json({ error: "Card payment failed" });
 	}
 };
 
-/* ╔═════════════════════════════════════════════════════════════════════════╗
-   ║  9.  WEB‑HOOK  (handles async capture & denial)                         ║
-   ╚═════════════════════════════════════════════════════════════════════════╝ */
+/* ═════════════ 9. Web‑hook (async events) ═════════════ */
 exports.webhook = async (req, res) => {
 	const event = req.body;
-	const eventType = event.event_type;
+	const type = event.event_type;
 
-	/* secure your webhook by validating the signature — omitted for brevity */
-
-	if (eventType === "PAYMENT.CAPTURE.COMPLETED") {
-		const capture = event.resource;
+	if (type === "PAYMENT.CAPTURE.COMPLETED") {
+		const capture = JSON.parse(JSON.stringify(event.resource));
 		const orderId = capture.supplementary_data?.related_ids?.order_id;
-		const localOrder = await Order.findOne({ paypalOrderId: orderId });
-		if (localOrder) await finalisePaidOrder(localOrder, capture);
-		return res.status(200).json({ received: true });
+		const localOrd = await Order.findOne({ paypalOrderId: orderId });
+		if (localOrd) await finalisePaidOrder(localOrd, capture);
+		return res.json({ received: true });
 	}
 
 	if (
-		eventType === "PAYMENT.CAPTURE.DENIED" ||
-		eventType === "PAYMENT.CAPTURE.REFUNDED" ||
-		eventType === "CHECKOUT.ORDER.CANCELLED"
+		[
+			"PAYMENT.CAPTURE.DENIED",
+			"PAYMENT.CAPTURE.REFUNDED",
+			"CHECKOUT.ORDER.CANCELLED",
+		].includes(type)
 	) {
 		const orderId =
 			event.resource?.supplementary_data?.related_ids?.order_id ||
 			event.resource?.id;
 		await Order.findOneAndDelete({ paypalOrderId: orderId });
-		return res.status(200).json({ received: true });
+		return res.json({ received: true });
 	}
 
-	res.status(200).json({ received: true });
+	res.json({ received: true });
 };
 
-/* ╔═════════════════════════════════════════════════════════════════════════╗
-   ║ 10.  Shared fulfilment helper                                          ║
-   ╚═════════════════════════════════════════════════════════════════════════╝ */
-async function finalisePaidOrder(orderDoc, paymentDetails) {
+/* ═════════════ 10. Fulfilment helper ═════════════ */
+async function finalisePaidOrder(orderDoc, paymentJSON) {
 	if (orderDoc.paymentStatus === "Paid") return; // idempotent
 
 	orderDoc.paymentStatus = "Paid";
 	orderDoc.status = "In Process";
-	orderDoc.paymentDetails = paymentDetails;
+	orderDoc.paymentDetails = paymentJSON;
 	await orderDoc.save();
 
 	await postOrderToPrintify(orderDoc).catch((e) =>
-		console.error("Printify err:", e)
+		console.error("Printify:", e)
 	);
-	await updateStock(orderDoc).catch((e) => console.error("Stock upd err:", e));
+	await updateStock(orderDoc).catch((e) => console.error("Stock:", e));
 
 	sendOrderConfirmationEmail(orderDoc).catch((e) =>
-		console.error("email err:", e)
+		console.error("E‑mail:", e)
 	);
-	sendOrderConfirmationSMS(orderDoc).catch((e) => console.error("sms err:", e));
+	sendOrderConfirmationSMS(orderDoc).catch((e) => console.error("SMS:", e));
 }
