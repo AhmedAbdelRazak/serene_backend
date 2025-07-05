@@ -1,11 +1,16 @@
 /* ---------------------------------------------------------------------------
-   Stripe Controller – July‑2025  (hosted + direct, with webhook)
+   Stripe Controller – July‑2025  (Square‑style flow, but with Stripe)
    --------------------------------------------------------------------------- */
 
 "use strict";
+
+/* ─────────────────────────────  1. Deps & config  ───────────────────────── */
 const stripe = require("stripe")(
-	process.env.STRIPE_SECRET_KEY || process.env.STRIPE_TEST_SECRET_KEY
+	process.env.STRIPE_SECRET_KEY || process.env.STRIPE_TEST_SECRET_KEY,
+	{ apiVersion: "2023-10-16" }
 );
+const Joi = require("joi");
+const { v4: uuidv4 } = require("uuid");
 
 const {
 	checkStockAvailability,
@@ -16,73 +21,108 @@ const {
 	sendOrderConfirmationSMS,
 	convertBigIntToString,
 } = require("./HelperFunctions");
-
 const { Order } = require("../models/order");
 
-/* ────────────────────────────────────────────────────────────── */
-/*  A)  Checkout entry point                                      */
-/* ────────────────────────────────────────────────────────────── */
+/* ─────────────────────  2. Joi schema for basic safety  ─────────────────── */
+const orderSchema = Joi.object({
+	customerDetails: Joi.object({
+		name: Joi.string().min(2).max(60).required(),
+		email: Joi.string().email().required(),
+		phone: Joi.string()
+			.pattern(/^\+?\d{10,15}$/)
+			.required(),
+		address: Joi.string().min(5).required(),
+		city: Joi.string().min(2).required(),
+		state: Joi.string().min(2).required(),
+		zipcode: Joi.string().min(3).required(),
+	}).required(),
+	productsNoVariable: Joi.array().items(Joi.object()).required(),
+	chosenProductQtyWithVariables: Joi.array().items(Joi.object()).required(),
+	chosenShippingOption: Joi.object({
+		carrierName: Joi.string().required(),
+		shippingPrice: Joi.number().positive().required(),
+	}).required(),
+	totalAmount: Joi.number().positive().required(),
+	totalAmountAfterDiscount: Joi.number().positive().allow(null),
+	totalOrderQty: Joi.number().integer().positive().required(),
+}).unknown(true);
+
+/* ────────────────────────────  3. Small helpers  ────────────────────────── */
+const normalisePhone = (raw) =>
+	raw.startsWith("+") ? raw : `+1${raw.replace(/\D/g, "")}`.slice(0, 12);
+
+const safeDescriptor = (str) =>
+	str.replace(/[^A-Za-z0-9*+.\- ]/g, "").slice(0, 22) || "SERENEJAN";
+
+const buildShippingObject = (order) => ({
+	name: order.customerDetails.name,
+	phone: normalisePhone(order.customerDetails.phone),
+	address: {
+		line1: order.customerDetails.address,
+		city: order.customerDetails.city,
+		state: order.customerDetails.state,
+		postal_code: order.customerDetails.zipcode,
+		country: "US",
+	},
+});
+
+/* ╔═════════════════════════════════════════════════════════════════════════╗
+   ║  4.  CREATE CHECKOUT / DIRECT CHARGE                                    ║
+   ╚═════════════════════════════════════════════════════════════════════════╝ */
 exports.createCheckoutSession = async (req, res) => {
-	console.log("▶︎  /api/stripe/checkout-session called");
+	console.log("▶︎  /api/stripe/checkout-session");
 
-	try {
-		const { orderData, paymentMethodId } = req.body || {};
-		if (!orderData)
-			return res.status(400).json({ error: "Missing order data" });
+	/* A) extract & validate */
+	const { orderData, paymentMethodId } = req.body || {};
+	const { error } = orderSchema.validate(orderData || {}, {
+		abortEarly: false,
+	});
+	if (error) return res.status(400).json({ error: error.details });
 
-		/* 1) stock */
-		const stockIssue = await checkStockAvailability(orderData);
-		if (stockIssue) return res.status(400).json({ error: stockIssue });
+	/* B) stock */
+	const stockIssue = await checkStockAvailability(orderData);
+	if (stockIssue) return res.status(400).json({ error: stockIssue });
 
-		/* 2) stub order */
-		const invoiceNumber = await generateUniqueInvoiceNumber();
-		const order = await Order.create({
-			...orderData,
-			invoiceNumber,
-			status: "Awaiting Payment",
-			paymentStatus: "Pending",
-			createdVia: paymentMethodId ? "Stripe‑Direct" : "Stripe‑Checkout",
-		});
+	/* C) invoice & stub order (status = Awaiting Payment) */
+	const invoiceNumber = await generateUniqueInvoiceNumber();
+	const descriptor = safeDescriptor("SJ GIFTS");
+	const idempotencyKey = `order-${uuidv4()}`;
 
-		/* ───── DIRECT CHARGE ───── */
-		if (paymentMethodId) {
-			const cents = Math.round(
+	let order = await Order.create({
+		...orderData,
+		invoiceNumber,
+		status: "Awaiting Payment",
+		paymentStatus: "Pending",
+		createdVia: paymentMethodId ? "Stripe‑Direct" : "Stripe‑Checkout",
+	});
+
+	const shipping = buildShippingObject(order);
+	const metadata = { order_id: order._id.toString(), invoice: invoiceNumber };
+
+	/* =======================================================================
+     1) DIRECT CHARGE   (Stripe Link → PaymentIntent.confirm())
+     ======================================================================= */
+	if (paymentMethodId) {
+		try {
+			const amountCents = Math.round(
 				Number(order.totalAmountAfterDiscount || order.totalAmount) * 100
 			);
 
-			// Build helpers first so the snippet stays readable
-			const shipping = {
-				name: order.customerDetails.name,
-				phone: order.customerDetails.phone,
-				address: {
-					line1: order.customerDetails.address,
-					city: order.customerDetails.city,
-					state: order.customerDetails.state,
-					postal_code: order.customerDetails.zipcode,
-					country: "US",
+			const pi = await stripe.paymentIntents.create(
+				{
+					amount: amountCents,
+					currency: "usd",
+					payment_method: paymentMethodId,
+					confirmation_method: "manual",
+					confirm: true,
+					description: `Serene Jannat – Order ${invoiceNumber}`,
+					shipping,
+					statement_descriptor_suffix: descriptor,
+					metadata,
+					receipt_email: order.customerDetails.email,
 				},
-			};
-
-			const metadata = {
-				order_id: order._id.toString(),
-				invoice: invoiceNumber,
-				total_qty: order.totalOrderQty.toString(),
-				shipping_option: order.chosenShippingOption.carrierName,
-				// ⚠️ 50 keys max / 500 chars per value – keep it short
-			};
-
-			const pi = await stripe.paymentIntents.create({
-				amount: cents,
-				currency: "usd",
-				payment_method: paymentMethodId,
-				confirmation_method: "manual",
-				confirm: true,
-				description: `Serene Jannat – Order ${invoiceNumber}`, // shown on receipts
-				shipping, // shows in Link UI + Dashboard
-				statement_descriptor_suffix: "SJ GIFTS", // ≤22 chars
-				metadata,
-				receipt_email: order.customerDetails.email,
-			});
+				{ idempotencyKey }
+			);
 
 			if (pi.status === "requires_action")
 				return res.json({
@@ -90,46 +130,77 @@ exports.createCheckoutSession = async (req, res) => {
 					clientSecret: pi.client_secret,
 				});
 
-			if (pi.status !== "succeeded") {
-				await Order.findByIdAndDelete(order._id);
-				return res.status(402).json({ error: "Payment unsuccessful" });
-			}
+			if (pi.status !== "succeeded") throw new Error(pi.status);
 
-			await finalisePaidOrder(order, pi);
+			/* retrieve expanded PI for card brand / last‑4 */
+			const fullPI = await stripe.paymentIntents.retrieve(pi.id, {
+				expand: ["payment_method", "charges.data.payment_method_details"],
+			});
+
+			await finalisePaidOrder(order, fullPI); // step 5‑→8
+			order = await Order.findById(order._id); // refetch with updates
 			return res.json({
 				success: true,
 				order: convertBigIntToString(order.toObject()),
 			});
+		} catch (err) {
+			/* payment failed → delete stub */
+			await Order.findByIdAndDelete(order._id);
+			const msg =
+				err?.raw?.message ||
+				err.message ||
+				"Card declined. Please use a different payment method.";
+			return res.status(402).json({ error: msg });
 		}
+	}
 
-		/* ───── HOSTED CHECKOUT ───── */
+	/* =======================================================================
+     2) HOSTED CHECKOUT   (Stripe Checkout + Link / cards)
+     ======================================================================= */
+	try {
 		const lineItems = buildLineItems(order);
-		const session = await stripe.checkout.sessions.create({
-			mode: "payment",
-			customer_email: order.customerDetails.email,
-			line_items: lineItems,
-			metadata: { order_id: order._id.toString(), invoice: invoiceNumber },
-			success_url:
-				process.env.CLIENT_URL + "/dashboard?session_id={CHECKOUT_SESSION_ID}",
-			cancel_url: process.env.CLIENT_URL + "/cart?canceled=1",
-		});
 
-		return res.json({ url: session.url }); // React expects `url`
+		const session = await stripe.checkout.sessions.create(
+			{
+				mode: "payment",
+				customer_email: order.customerDetails.email,
+				line_items: lineItems,
+				/* visible in Checkout UI */
+				shipping_address_collection: { allowed_countries: ["US", "CA"] },
+				phone_number_collection: { enabled: true },
+				/* goes into the PaymentIntent */
+				payment_intent_data: {
+					description: `Serene Jannat – Order ${invoiceNumber}`,
+					shipping,
+					statement_descriptor_suffix: descriptor,
+					metadata,
+				},
+				/* also copy onto the Session itself so we can retrieve */
+				metadata,
+				success_url: `${process.env.CLIENT_URL}/dashboard?session_id={CHECKOUT_SESSION_ID}`,
+				cancel_url: `${process.env.CLIENT_URL}/cart?canceled=1`,
+			},
+			{ idempotencyKey }
+		);
+
+		return res.json({ url: session.url });
 	} catch (err) {
-		console.error("✗ createCheckoutSession error:", err);
-		return res.status(500).json({ error: "Server error" });
+		/* if Checkout could not be started → delete stub */
+		await Order.findByIdAndDelete(order._id);
+		const msg =
+			err?.raw?.message ||
+			err.message ||
+			"Unable to start Stripe Checkout. Please try again.";
+		return res.status(500).json({ error: msg });
 	}
 };
 
-/* ────────────────────────────────────────────────────────────── */
-/*  B)  Web‑hook (raw body!)                                      */
-/* ────────────────────────────────────────────────────────────── */
-/* controllers/stripeController.js  (only the webhook part) */
-
+/* ╔═════════════════════════════════════════════════════════════════════════╗
+   ║  5.  WEB‑HOOK                                                          ║
+   ╚═════════════════════════════════════════════════════════════════════════╝ */
 exports.webhook = async (req, res) => {
 	const sig = req.headers["stripe-signature"];
 	let event;
-
 	try {
 		event = stripe.webhooks.constructEvent(
 			req.body,
@@ -141,79 +212,65 @@ exports.webhook = async (req, res) => {
 		return res.status(400).send(`Webhook Error: ${err.message}`);
 	}
 
-	/* we only care about the payment being completed */
-	if (event.type !== "checkout.session.completed") {
-		return res.json({ received: true }); // fast‑path for all others
+	const { type } = event;
+
+	/* ─── PAYMENT SUCCEEDED ─────────────────────────────────────────────── */
+	if (type === "checkout.session.completed") {
+		const session = event.data.object;
+		const orderId = session.metadata?.order_id;
+		const invoiceN = session.metadata?.invoice;
+
+		console.log(`▶︎  checkout.session.completed  order=${orderId}`);
+
+		try {
+			const order = await Order.findById(orderId);
+			if (!order) throw new Error("Order stub not found");
+
+			const intent = await stripe.paymentIntents.retrieve(
+				session.payment_intent,
+				{
+					expand: ["charges", "payment_method"],
+				}
+			);
+
+			await finalisePaidOrder(order, intent);
+			console.log(`✔︎  Order ${orderId} finalised (invoice ${invoiceN})`);
+		} catch (e) {
+			console.error("🚨  Finalise error:", e);
+		}
+
+		return res.json({ received: true });
 	}
 
-	const session = event.data.object;
-	const orderId = session.metadata?.order_id;
-	const invoiceN = session.metadata?.invoice;
-
-	console.log(`▶︎  checkout.session.completed  order=${orderId}`);
-
-	try {
-		/* ------------------------------------------------------------------ 1 */
-		const order = await Order.findById(orderId);
-		if (!order) throw new Error("Order document not found");
-
-		/* ------------------------------------------------------------------ 2 */
-		let intent;
-		try {
-			intent = await stripe.paymentIntents.retrieve(session.payment_intent, {
-				expand: ["charges", "payment_method"],
-			});
-			console.log("   ✓ PaymentIntent retrieved:", intent.id);
-		} catch (piErr) {
-			console.error("   ✗ PI retrieval failed, falling back to session object");
-			intent = session; // minimal fallback (still has amount, currency…)
+	/* ─── PAYMENT FAILED ────────────────────────────────────────────────── */
+	if (type === "payment_intent.payment_failed") {
+		const intent = event.data.object;
+		const orderId = intent.metadata?.order_id;
+		if (orderId) {
+			await Order.findByIdAndDelete(orderId);
+			console.log(`ℹ︎  Stub order ${orderId} removed due to failed payment`);
 		}
-
-		order.paymentStatus = "Paid";
-		order.status = "In Process";
-		order.paymentDetails = intent;
-
-		await order.save();
-		console.log("   ✓ Order marked Paid & saved", order._id);
-
-		/* ------------------------------------------------------------------ 3 */
-		try {
-			await postOrderToPrintify(order);
-			console.log("   ✓ Printify order(s) created");
-		} catch (printErr) {
-			console.error("   ✗ Printify failed – order left for manual fulfilment");
-			console.error("     ", printErr?.response?.data || printErr);
-			// DON’T throw – customer has already paid
-		}
-
-		/* ------------------------------------------------------------------ 4 */
-		try {
-			await updateStock(order);
-			console.log("   ✓ Local stock updated");
-		} catch (stockErr) {
-			console.error("   ✗ Stock update failed:", stockErr);
-		}
-
-		/* ------------------------------------------------------------------ 5 */
-		sendOrderConfirmationEmail(order).catch((e) =>
-			console.error("   ✗ Email error:", e)
-		);
-		sendOrderConfirmationSMS(order).catch((e) =>
-			console.error("   ✗ SMS error:", e)
-		);
-
-		console.log(`✔︎  Post‑payment pipeline finished  (invoice ${invoiceN})`);
-	} catch (fatal) {
-		console.error("🚨  webhook fatal:", fatal);
-		// optional: trigger ops alert / refund
+		return res.json({ received: true });
 	}
 
+	/* ─── CHECKOUT SESSION EXPIRED ──────────────────────────────────────── */
+	if (type === "checkout.session.expired") {
+		const session = event.data.object;
+		const orderId = session.metadata?.order_id;
+		if (orderId) {
+			await Order.findByIdAndDelete(orderId);
+			console.log(`ℹ︎  Stub order ${orderId} removed (Checkout expired)`);
+		}
+		return res.json({ received: true });
+	}
+
+	/* default fast‑path */
 	res.json({ received: true });
 };
 
-/* ────────────────────────────────────────────────────────────── */
-/*  C)  Helpers                                                  */
-/* ────────────────────────────────────────────────────────────── */
+/* ╔═════════════════════════════════════════════════════════════════════════╗
+   ║  6.  Helper functions                                                  ║
+   ╚═════════════════════════════════════════════════════════════════════════╝ */
 function buildLineItems(order) {
 	const arr = [];
 
@@ -256,7 +313,7 @@ function buildLineItems(order) {
 }
 
 async function finalisePaidOrder(orderDoc, paymentIntent) {
-	/* guard‑clause: avoid double‑processing */
+	/* avoid double‑processing */
 	if (orderDoc.paymentStatus === "Paid") return;
 
 	orderDoc.paymentStatus = "Paid";
