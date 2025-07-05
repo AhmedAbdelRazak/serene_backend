@@ -60,6 +60,7 @@ const OrderSchema = new mongoose.Schema(
 			type: Array,
 			default: [],
 		},
+		paypalOrderId: { type: String, index: true },
 		returnAmount: Number,
 		refundMethod: String,
 		paymentStatus: String,
