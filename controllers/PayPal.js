@@ -201,36 +201,52 @@ exports.createOrder = async (req, res) => {
 exports.captureOrder = async (req, res) => {
 	try {
 		const { paypalOrderId, orderData, provisionalInvoice } = req.body || {};
-		if (!paypalOrderId || !orderData)
-			return res.status(400).json({ error: "Missing order data" });
+		if (!paypalOrderId || !orderData) {
+			return res.status(400).json({ error: "Missing order data or orderId" });
+		}
 
+		/* 1. Capture funds from PayPal */
 		const capReq = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
 		capReq.requestBody({});
 		const { result } = await ppClient.execute(capReq);
-		if (!["COMPLETED", "PENDING"].includes(result.status))
-			throw new Error(`Unexpected capture status ${result.status}`);
 
+		if (result.status !== "COMPLETED") {
+			/* Anything other than COMPLETED is a payment‑flow problem, not our bug   */
+			return res.status(402).json({
+				// 402 = Payment Required – makes sense here
+				error: "Payment not completed",
+				paypalStatus: result.status,
+				details: result,
+			});
+		}
+
+		/* 2. Persist the order */
 		const invoice = provisionalInvoice || (await generateUniqueInvoiceNumber());
-
-		let order = await Order.create({
+		const order = await Order.create({
 			...orderData,
 			invoiceNumber: invoice,
-			paypalOrderId: paypalOrderId,
+			paypalOrderId,
 			status: "In Process",
 			paymentStatus: "Paid",
 			paymentDetails: safeClone(result),
-			createdVia: "PayPal‑Checkout",
+			createdVia: "PayPal‑Wallet",
 		});
 
+		/* 3. Respond first – then do fulfilment asynchronously */
 		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
-
-		// run fulfilment tasks *after* responding – failures here won’t surface to shopper
 		postPaymentFulfilment(order).catch((err) =>
 			console.error("Post‑payment fulfilment error:", err)
 		);
 	} catch (e) {
+		/* PayPal SDK errors always have .statusCode and .message */
+		if (e?.statusCode) {
+			return res.status(402).json({
+				error: e.message || "Payment error",
+				details: e,
+			});
+		}
 		console.error(e);
-		res.status(500).json({ error: "Server error after payment capture" });
+		res.status(500).json({ error: "Unexpected server error" });
 	}
 };
 
@@ -244,3 +260,109 @@ async function postPaymentFulfilment(orderDoc) {
 	sendOrderConfirmationEmail(orderDoc).catch((e) => console.error("Email:", e));
 	sendOrderConfirmationSMS(orderDoc).catch((e) => console.error("SMS  :", e));
 }
+
+/* ═════════════ 7‑bis  Card‑only flow – one call for the whole payment ═════════════ */
+exports.cardPay = async (req, res) => {
+	try {
+		const { orderData, card } = req.body || {};
+
+		/* --- Step 0: validate --------------------------------------------------- */
+		const { error } = orderSchema.validate(orderData || {}, {
+			abortEarly: false,
+		});
+		if (error) return res.status(400).json({ error: error.details });
+
+		const cardSchema = Joi.object({
+			number: Joi.string().creditCard().required(),
+			expiry: Joi.string()
+				.pattern(/^\d{4}-\d{2}$/)
+				.required(), // "YYYY-MM"
+			security_code: Joi.string()
+				.pattern(/^\d{3,4}$/)
+				.required(),
+			name: Joi.string().min(2).required(),
+			billing_address: Joi.object({
+				address_line_1: Joi.string().required(),
+				admin_area_2: Joi.string().required(), // city
+				admin_area_1: Joi.string().required(), // state
+				postal_code: Joi.string().required(),
+				country_code: Joi.string().length(2).required(),
+			}).required(),
+		});
+		const { error: cardErr } = cardSchema.validate(card || {}, {
+			abortEarly: false,
+		});
+		if (cardErr) return res.status(400).json({ error: cardErr.details });
+
+		const stockIssue = await checkStockAvailability(orderData);
+		if (stockIssue) return res.status(400).json({ error: stockIssue });
+
+		/* --- Step 1: create the PayPal order ----------------------------------- */
+		const invoice = await generateUniqueInvoiceNumber();
+		const createReq = new paypal.orders.OrdersCreateRequest();
+		createReq.headers["PayPal-Request-Id"] = `card-${uuid()}`;
+		createReq.prefer("return=representation");
+		createReq.requestBody({
+			intent: "CAPTURE",
+			purchase_units: [buildPU(orderData, invoice)],
+			application_context: {
+				brand_name: "Serene Jannat",
+				user_action: "PAY_NOW",
+			},
+		});
+
+		const { result: createRes } = await ppClient.execute(createReq);
+
+		/* --- Step 2: confirm the payment source (card details) ----------------- */
+		const confirmReq = new paypal.orders.OrdersConfirmPaymentSourceRequest(
+			createRes.id
+		);
+		confirmReq.requestBody({ payment_source: { card } });
+		const { result: confirmRes } = await ppClient.execute(confirmReq);
+
+		if (!["APPROVED", "COMPLETED"].includes(confirmRes.status)) {
+			// If payer_action_required you should surface the redirect/link to the client
+			return res.status(402).json({
+				error: "Card confirmation failed",
+				paypalStatus: confirmRes.status,
+				details: confirmRes,
+			});
+		}
+
+		/* --- Step 3: capture ---------------------------------------------------- */
+		const capReq = new paypal.orders.OrdersCaptureRequest(createRes.id);
+		capReq.requestBody({});
+		const { result: captureRes } = await ppClient.execute(capReq);
+
+		if (captureRes.status !== "COMPLETED") {
+			return res.status(402).json({
+				error: "Payment not completed",
+				paypalStatus: captureRes.status,
+				details: captureRes,
+			});
+		}
+
+		/* --- Step 4: store order & fulfil -------------------------------------- */
+		const order = await Order.create({
+			...orderData,
+			invoiceNumber: invoice,
+			paypalOrderId: createRes.id,
+			status: "In Process",
+			paymentStatus: "Paid",
+			paymentDetails: safeClone(captureRes),
+			createdVia: "PayPal‑Card",
+		});
+
+		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
+
+		postPaymentFulfilment(order).catch((err) =>
+			console.error("Post‑payment fulfilment error:", err)
+		);
+	} catch (e) {
+		if (e?.statusCode) {
+			return res.status(402).json({ error: e.message, details: e });
+		}
+		console.error(e);
+		res.status(500).json({ error: "Server error during card payment" });
+	}
+};
