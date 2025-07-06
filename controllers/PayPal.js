@@ -1,6 +1,6 @@
 /* ---------------------------------------------------------------------------
-   PayPal Controller – final July 2025 build
-   --------------------------------------------------------------------------- */
+   PayPal Controller – July 2025 • no stub‑order • card & wallet
+--------------------------------------------------------------------------- */
 
 "use strict";
 
@@ -69,13 +69,24 @@ const orderSchema = Joi.object({
 /* ───────────── 4 Utilities ───────────── */
 const safeClone = (o) => JSON.parse(JSON.stringify(o));
 
-const buildPU = (order, invoice) => ({
-	reference_id: order._id.toString(),
+/** Purchase‑unit helper */
+const buildPU = (data, invoice) => ({
+	reference_id: `tmp-${invoice}`,
 	invoice_id: invoice,
 	description: `Serene Jannat – Order ${invoice}`,
 	amount: {
 		currency_code: "USD",
-		value: (order.totalAmountAfterDiscount || order.totalAmount).toFixed(2),
+		value: Number(data.totalAmountAfterDiscount ?? data.totalAmount).toFixed(2),
+	},
+	shipping: {
+		name: { full_name: data.customerDetails.name },
+		address: {
+			address_line_1: data.customerDetails.address,
+			admin_area_2: data.customerDetails.city,
+			admin_area_1: data.customerDetails.state,
+			postal_code: data.customerDetails.zipcode,
+			country_code: "US",
+		},
 	},
 });
 
@@ -92,13 +103,40 @@ exports.generateClientToken = async (_req, res) => {
 			{ auth: { username: clientId, password: clientSecret } }
 		);
 		res.json({ clientToken: data.client_token });
-	} catch (err) {
-		console.error(err.stack || err);
+	} catch (e) {
+		console.error(e);
 		res.status(500).json({ error: "Failed to generate client token" });
 	}
 };
 
-/* ═════════════ 6 Create order ═════════════ */
+/* ═════════════ 9 Webhook (optional) ═════════════ */
+exports.webhook = async (req, res) => {
+	try {
+		const { event_type: type, resource } = req.body;
+
+		if (type === "PAYMENT.CAPTURE.COMPLETED") {
+			const orderId = resource.supplementary_data?.related_ids?.order_id;
+			const order = await Order.findOne({ paypalOrderId: orderId });
+
+			if (order && order.paymentStatus !== "Paid") {
+				order.paymentStatus = "Paid";
+				order.status = "In Process";
+				order.paymentDetails = resource;
+				await order.save();
+				await postPaymentFulfilment(order);
+			}
+		}
+
+		/* You can branch for REFUNDED / DENIED etc. later if you wish */
+
+		res.json({ received: true });
+	} catch (e) {
+		console.error("Webhook error:", e);
+		res.status(500).json({ error: "Webhook failed" });
+	}
+};
+
+/* ═════════════ 6 Create PayPal order (wallet & card) ═════════════ */
 exports.createOrder = async (req, res) => {
 	try {
 		const { orderData } = req.body || {};
@@ -111,182 +149,86 @@ exports.createOrder = async (req, res) => {
 		if (stockIssue) return res.status(400).json({ error: stockIssue });
 
 		const invoice = await generateUniqueInvoiceNumber();
-		let order = await Order.create({
-			...orderData,
-			invoiceNumber: invoice,
-			status: "Awaiting Payment",
-			paymentStatus: "Pending",
-			createdVia: "PayPal‑Checkout",
-		});
 
+		/* Build request */
 		const ppReq = new paypal.orders.OrdersCreateRequest();
-		ppReq.headers["PayPal-Request-Id"] = `ord-${order._id}-${uuid()}`;
+		ppReq.headers["PayPal-Request-Id"] = `ord-${uuid()}`;
 		ppReq.prefer("return=representation");
 		ppReq.requestBody({
 			intent: "CAPTURE",
-			purchase_units: [buildPU(order, invoice)],
+			purchase_units: [buildPU(orderData, invoice)],
+			payer: {
+				// pre‑fill billing form
+				email_address: orderData.customerDetails.email,
+				name: {
+					given_name: orderData.customerDetails.name.split(" ")[0],
+					surname:
+						orderData.customerDetails.name.split(" ").slice(1).join(" ") ||
+						"Customer",
+				},
+				address: {
+					address_line_1: orderData.customerDetails.address,
+					admin_area_2: orderData.customerDetails.city,
+					admin_area_1: orderData.customerDetails.state,
+					postal_code: orderData.customerDetails.zipcode,
+					country_code: "US",
+				},
+			},
 			application_context: {
 				brand_name: "Serene Jannat",
 				user_action: "PAY_NOW",
-				shipping_preference: "NO_SHIPPING",
+				shipping_preference: "SET_PROVIDED_ADDRESS",
 			},
 		});
 
 		const { result } = await ppClient.execute(ppReq);
-		await Order.findByIdAndUpdate(order._id, { paypalOrderId: result.id });
-		res.json({ paypalOrderId: result.id });
-	} catch (err) {
-		console.error(err.stack || err);
-		// best‑effort clean‑up
-		if (err && err.order && err.order._id)
-			await Order.findByIdAndDelete(err.order._id);
+		res.json({ paypalOrderId: result.id, provisionalInvoice: invoice });
+	} catch (e) {
+		console.error(e);
 		res.status(500).json({ error: "Failed to create PayPal order" });
 	}
 };
 
-/* ═════════════ 7 Capture order ═════════════ */
+/* ═════════════ 7 Capture – create Order doc after payment ═════════════ */
 exports.captureOrder = async (req, res) => {
 	try {
-		const { paypalOrderId } = req.body || {};
-		if (!paypalOrderId)
-			return res.status(400).json({ error: "Missing order ID" });
-
-		let order = await Order.findOne({ paypalOrderId });
-		if (!order) return res.status(404).json({ error: "Local order not found" });
+		const { paypalOrderId, orderData, provisionalInvoice } = req.body || {};
+		if (!paypalOrderId || !orderData)
+			return res.status(400).json({ error: "Missing order data" });
 
 		const capReq = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
 		capReq.requestBody({});
 		const { result } = await ppClient.execute(capReq);
-
 		if (result.status !== "COMPLETED")
 			throw new Error(`Capture not completed (status ${result.status})`);
 
-		await finalisePaidOrder(order, safeClone(result));
-		order = await Order.findById(order._id);
+		const invoice = provisionalInvoice || (await generateUniqueInvoiceNumber());
 
-		/* build safe response */
-		let out;
-		try {
-			out = convertBigIntToString(order.toObject());
-		} catch (_) {
-			// if convertBigInt fails for any reason
-			out = safeClone(order.toJSON());
-		}
-		res.json({ success: true, order: out });
-	} catch (err) {
-		console.error(err.stack || err);
-		if (err && err.order && err.order._id)
-			await Order.findByIdAndDelete(err.order._id);
+		let order = await Order.create({
+			...orderData,
+			invoiceNumber: invoice,
+			paypalOrderId: paypalOrderId,
+			status: "In Process",
+			paymentStatus: "Paid",
+			paymentDetails: safeClone(result),
+			createdVia: "PayPal‑Checkout",
+		});
+
+		await postPaymentFulfilment(order);
+		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
+	} catch (e) {
+		console.error(e);
 		res.status(402).json({ error: "Payment not completed" });
 	}
 };
 
-/* ═════════════ 8 Card‑only flow ═════════════ */
-exports.cardPay = async (req, res) => {
-	try {
-		const { orderData, paymentSource } = req.body || {};
-		if (!paymentSource)
-			return res.status(400).json({ error: "Missing card token" });
-
-		const { error } = orderSchema.validate(orderData || {}, {
-			abortEarly: false,
-		});
-		if (error) return res.status(400).json({ error: error.details });
-
-		const stockIssue = await checkStockAvailability(orderData);
-		if (stockIssue) return res.status(400).json({ error: stockIssue });
-
-		const invoice = await generateUniqueInvoiceNumber();
-		let order = await Order.create({
-			...orderData,
-			invoiceNumber: invoice,
-			status: "Awaiting Payment",
-			paymentStatus: "Pending",
-			createdVia: "PayPal‑Card",
-		});
-
-		const ppReq = new paypal.orders.OrdersCreateRequest();
-		ppReq.headers["PayPal-Request-Id"] = `card-${order._id}-${uuid()}`;
-		ppReq.requestBody({
-			intent: "CAPTURE",
-			purchase_units: [buildPU(order, invoice)],
-			payment_source: { card: paymentSource },
-		});
-
-		const { result: created } = await ppClient.execute(ppReq);
-		const capReq = new paypal.orders.OrdersCaptureRequest(created.id);
-		capReq.requestBody({});
-		const { result: captured } = await ppClient.execute(capReq);
-
-		if (captured.status !== "COMPLETED")
-			throw new Error(`Capture not completed (status ${captured.status})`);
-
-		await finalisePaidOrder(order, safeClone(captured));
-		order = await Order.findById(order._id);
-
-		let out;
-		try {
-			out = convertBigIntToString(order.toObject());
-		} catch {
-			out = safeClone(order.toJSON());
-		}
-
-		res.json({ success: true, order: out });
-	} catch (err) {
-		console.error(err.stack || err);
-		if (err && err.order && err.order._id)
-			await Order.findByIdAndDelete(err.order._id);
-		res.status(402).json({ error: "Card payment failed" });
-	}
-};
-
-/* ═════════════ 9 Webhook ═════════════ */
-exports.webhook = async (req, res) => {
-	try {
-		const { event_type: type, resource } = req.body;
-
-		if (type === "PAYMENT.CAPTURE.COMPLETED") {
-			const capture = safeClone(resource);
-			const orderId = capture.supplementary_data?.related_ids?.order_id;
-			const local = await Order.findOne({ paypalOrderId: orderId });
-			if (local) await finalisePaidOrder(local, capture);
-			return res.json({ received: true });
-		}
-
-		if (
-			[
-				"PAYMENT.CAPTURE.DENIED",
-				"PAYMENT.CAPTURE.REFUNDED",
-				"CHECKOUT.ORDER.CANCELLED",
-			].includes(type)
-		) {
-			const orderId =
-				resource?.supplementary_data?.related_ids?.order_id || resource?.id;
-			await Order.findOneAndDelete({ paypalOrderId: orderId });
-			return res.json({ received: true });
-		}
-
-		res.json({ received: true });
-	} catch (err) {
-		console.error(err.stack || err);
-		res.status(500).json({ error: "Webhook handling failed" });
-	}
-};
-
-/* ═════════════ 10 Fulfilment helper ═════════════ */
-async function finalisePaidOrder(orderDoc, paymentJSON) {
-	if (orderDoc.paymentStatus === "Paid") return;
-
-	orderDoc.paymentStatus = "Paid";
-	orderDoc.status = "In Process";
-	orderDoc.paymentDetails = paymentJSON;
-	await orderDoc.save();
-
+/* ═════════════ 8 Helper after payment ═════════════ */
+async function postPaymentFulfilment(orderDoc) {
 	await postOrderToPrintify(orderDoc).catch((e) =>
 		console.error("Printify:", e)
 	);
-	await updateStock(orderDoc).catch((e) => console.error("Stock:", e));
+	await updateStock(orderDoc).catch((e) => console.error("Stock    :", e));
 
 	sendOrderConfirmationEmail(orderDoc).catch((e) => console.error("Email:", e));
-	sendOrderConfirmationSMS(orderDoc).catch((e) => console.error("SMS:", e));
+	sendOrderConfirmationSMS(orderDoc).catch((e) => console.error("SMS  :", e));
 }
