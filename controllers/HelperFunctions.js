@@ -612,17 +612,29 @@ const sendOrderConfirmationSMS = async (order) => {
    ║  5. UTILS                                                               ║
    ╚══════════════════════════════════════════════════════════════════════════╝ */
 
-const convertBigIntToString = (obj) => {
-	if (typeof obj !== "object" || obj === null) return obj;
-	for (const key in obj) {
-		if (typeof obj[key] === "bigint") {
-			obj[key] = obj[key].toString();
-		} else if (typeof obj[key] === "object") {
-			obj[key] = convertBigIntToString(obj[key]);
-		}
+function convertBigIntToString(value, seen = new WeakMap()) {
+	/* primitives ---------------------------------------------------------- */
+	if (value === null || typeof value !== "object") {
+		return typeof value === "bigint" ? value.toString() : value;
 	}
-	return obj;
-};
+
+	/* circular refs ------------------------------------------------------- */
+	if (seen.has(value)) return seen.get(value);
+	/* arrays -------------------------------------------------------------- */
+	if (Array.isArray(value)) {
+		const out = [];
+		seen.set(value, out);
+		for (const item of value) out.push(convertBigIntToString(item, seen));
+		return out;
+	}
+	/* plain objects & docs ------------------------------------------------ */
+	const out = {};
+	seen.set(value, out);
+	for (const [k, v] of Object.entries(value)) {
+		out[k] = convertBigIntToString(v, seen);
+	}
+	return out;
+}
 
 /* ╔══════════════════════════════════════════════════════════════════════════╗
    ║  6. EXPORTS                                                             ║
