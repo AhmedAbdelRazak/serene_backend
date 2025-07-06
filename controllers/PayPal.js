@@ -11,6 +11,7 @@ const Joi = require("joi");
 const { v4: uuid } = require("uuid");
 
 const IS_PROD = /prod/i.test(process.env.NODE_ENV);
+console.log(IS_PROD ? "Production mode" : "Sandbox mode");
 const clientId = IS_PROD
 	? process.env.PAYPAL_CLIENT_ID_LIVE
 	: process.env.PAYPAL_CLIENT_ID_SANDBOX;
