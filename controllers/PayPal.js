@@ -207,8 +207,8 @@ exports.captureOrder = async (req, res) => {
 		const capReq = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
 		capReq.requestBody({});
 		const { result } = await ppClient.execute(capReq);
-		if (result.status !== "COMPLETED")
-			throw new Error(`Capture not completed (status ${result.status})`);
+		if (!["COMPLETED", "PENDING"].includes(result.status))
+			throw new Error(`Unexpected capture status ${result.status}`);
 
 		const invoice = provisionalInvoice || (await generateUniqueInvoiceNumber());
 
@@ -222,11 +222,15 @@ exports.captureOrder = async (req, res) => {
 			createdVia: "PayPal‑Checkout",
 		});
 
-		await postPaymentFulfilment(order);
 		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
+
+		// run fulfilment tasks *after* responding – failures here won’t surface to shopper
+		postPaymentFulfilment(order).catch((err) =>
+			console.error("Post‑payment fulfilment error:", err)
+		);
 	} catch (e) {
 		console.error(e);
-		res.status(402).json({ error: "Payment not completed" });
+		res.status(500).json({ error: "Server error after payment capture" });
 	}
 };
 
