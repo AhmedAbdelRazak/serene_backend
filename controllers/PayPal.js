@@ -11,19 +11,26 @@ const Joi = require("joi");
 const { v4: uuid } = require("uuid");
 
 const IS_PROD = /prod/i.test(process.env.NODE_ENV);
-console.log(IS_PROD ? "Production mode" : "Sandbox mode");
+
+// pick the correct pair *explicitly*
 const clientId = IS_PROD
 	? process.env.PAYPAL_CLIENT_ID_LIVE
 	: process.env.PAYPAL_CLIENT_ID_SANDBOX;
-const clientSecret = IS_PROD
+const secretKey = IS_PROD
 	? process.env.PAYPAL_SECRET_KEY_LIVE
 	: process.env.PAYPAL_SECRET_KEY_SANDBOX;
 
-const ppClient = new paypal.core.PayPalHttpClient(
-	IS_PROD
-		? new paypal.core.LiveEnvironment(clientId, clientSecret)
-		: new paypal.core.SandboxEnvironment(clientId, clientSecret)
-);
+if (!clientId || !secretKey) {
+	throw new Error(
+		`PayPal credentials missing for ${IS_PROD ? "LIVE" : "SANDBOX"} environment`
+	);
+}
+
+const env = IS_PROD
+	? new paypal.core.LiveEnvironment(clientId, secretKey)
+	: new paypal.core.SandboxEnvironment(clientId, secretKey);
+
+const ppClient = new paypal.core.PayPalHttpClient(env);
 
 /* ───────────── 2 App helpers ───────────── */
 const {
@@ -101,7 +108,7 @@ exports.generateClientToken = async (_req, res) => {
 					: "https://api-m.sandbox.paypal.com"
 			}/v1/identity/generate-token`,
 			{},
-			{ auth: { username: clientId, password: clientSecret } }
+			{ auth: { username: clientId, password: secretKey } }
 		);
 		res.json({ clientToken: data.client_token });
 	} catch (e) {
