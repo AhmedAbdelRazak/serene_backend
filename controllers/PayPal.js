@@ -159,45 +159,67 @@ exports.createOrder = async (req, res) => {
 /* ───────────────────────── 7 Capture (wallet flow) ────────────────────── */
 exports.captureOrder = async (req, res) => {
 	const { paypalOrderId, orderData, provisionalInvoice } = req.body || {};
-	if (!paypalOrderId || !orderData)
+	if (!paypalOrderId || !orderData) {
 		return res.status(400).json({ error: "Missing order data or orderId" });
+	}
 
-	try {
-		/* 1) Capture funds */
+	/* helper that actually calls PayPal */
+	const tryCapture = async () => {
 		const capReq = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
 		capReq.requestBody({});
-		const { result } = await ppClient.execute(capReq);
+		return ppClient.execute(capReq); // may throw HttpError
+	};
 
-		const capture = result?.purchase_units?.[0]?.payments?.captures?.[0] || {};
+	/* ── 1 : retry up‑to 3 × on 5xx / INTERNAL_SERVICE_ERROR ─────────── */
+	let result, lastErr;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		try {
+			({ result } = await tryCapture());
+			break; // success → exit loop
+		} catch (err) {
+			lastErr = err;
 
-		if (capture.status !== "COMPLETED") {
-			await cleanProvisional(provisionalInvoice);
-			return res.status(402).json({ error: "CARD_DECLINED", details: capture });
+			/* only retry on 5xx or INTERNAL_SERVICE_ERROR */
+			const is5xx = err?.statusCode && err.statusCode >= 500;
+			const issue =
+				err?.message?.includes("INTERNAL_SERVICE_ERROR") ||
+				err?.message?.includes("INTERNAL_SERVER_ERROR");
+
+			if (!is5xx && !issue) break; // do not retry 4xx etc.
+
+			/* PayPal suggests waiting 0.5‑1 s before retrying */
+			await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
 		}
-
-		/* 2) Update stock, save order */
-		await updateStock(orderData);
-		const order = await Order.create({
-			...orderData,
-			invoiceNumber: provisionalInvoice,
-			paypalOrderId: paypalOrderId,
-			status: "In Process",
-			paymentStatus: "Paid",
-			paymentDetails: safeClone(result),
-			createdVia: "PayPal‑Wallet",
-		});
-
-		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
-
-		postPaymentFulfilment(order).catch(console.error);
-	} catch (e) {
-		console.error("Capture error:", e);
-		await cleanProvisional(provisionalInvoice);
-		if (e?.statusCode) {
-			return res.status(402).json({ error: e.message, details: e });
-		}
-		res.status(500).json({ error: "Unexpected server error" });
 	}
+
+	if (!result) {
+		console.error("Capture error after retries:", lastErr);
+		await cleanProvisional(provisionalInvoice);
+		return res
+			.status(503)
+			.json({ error: "PayPal is temporarily unavailable. Please try again." });
+	}
+
+	const capture = result?.purchase_units?.[0]?.payments?.captures?.[0] || {};
+	if (capture.status !== "COMPLETED") {
+		await cleanProvisional(provisionalInvoice);
+		return res.status(402).json({ error: "CARD_DECLINED", details: capture });
+	}
+
+	/* ── 2 : stock, DB, fulfilment ───────────────────────────────────── */
+	await updateStock(orderData);
+	const order = await Order.create({
+		...orderData,
+		invoiceNumber: provisionalInvoice,
+		paypalOrderId: paypalOrderId,
+		status: "In Process",
+		paymentStatus: "Paid",
+		paymentDetails: safeClone(result),
+		createdVia: "PayPal‑Wallet",
+	});
+
+	res.json({ success: true, order: convertBigIntToString(order.toObject()) });
+	postPaymentFulfilment(order).catch(console.error);
 };
 
 /* ───────────────────────── 8 Card‑only single call flow ──────────────── */
