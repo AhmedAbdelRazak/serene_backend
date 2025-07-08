@@ -8,6 +8,11 @@
 const paypal = require("@paypal/checkout-server-sdk");
 const axios = require("axios");
 const Joi = require("joi");
+const axiosRetryPkg = require("axios-retry");
+const axiosRetry =
+	axiosRetryPkg.default || // v5 ESM build
+	axiosRetryPkg.axiosRetry || // v5 named export
+	axiosRetryPkg; // v4 classic
 const { v4: uuid } = require("uuid");
 
 const IS_PROD = /prod/i.test(process.env.NODE_ENV);
@@ -86,22 +91,54 @@ const buildPU = (data, invoice) => ({
 	},
 });
 
+/* one in‑memory cache – good enough for a single Node instance */
+let cachedClientToken = null;
+let cachedClientTokenExp = 0; // epoch ms
+
+/* attach retry helper only once */
+const ax = axios.create({ timeout: 12_000 }); // 12 s hard timeout
+axiosRetry(ax, {
+	retries: 3,
+	retryDelay: (c) => 400 * 2 ** c, // 0.4 s, 0.8 s, 1.6 s
+	retryCondition: (err) =>
+		err.code === "ECONNRESET" ||
+		err.code === "ETIMEDOUT" ||
+		axiosRetry.isNetworkError(err),
+});
+
 /* ───────────────────────── 5 Client‑token ─────────────────────────────── */
 exports.generateClientToken = async (_req, res) => {
 	try {
-		const { data } = await axios.post(
+		/* ➊ serve from cache ( PayPal tokens last 9 h in practice ) */
+		if (cachedClientToken && Date.now() < cachedClientTokenExp) {
+			return res.json({ clientToken: cachedClientToken, cached: true });
+		}
+
+		/* ➋ fetch a fresh one – with automatic retry on connection resets */
+		const { data } = await ax.post(
 			`${
 				IS_PROD
 					? "https://api-m.paypal.com"
 					: "https://api-m.sandbox.paypal.com"
 			}/v1/identity/generate-token`,
-			{},
-			{ auth: { username: clientId, password: secretKey } }
+			{}, // empty JSON body
+			{
+				auth: { username: clientId, password: secretKey },
+				headers: { "Content-Type": "application/json" },
+			}
 		);
-		res.json({ clientToken: data.client_token });
+
+		/* ➌ cache & return */
+		cachedClientToken = data.client_token;
+		cachedClientTokenExp = Date.now() + 1000 * 60 * 60 * 8; // 8 h
+		res.json({ clientToken: cachedClientToken });
 	} catch (e) {
-		console.error(e);
-		res.status(500).json({ error: "Failed to generate client token" });
+		console.error("PayPal client‑token error:", e);
+		res
+			.status(503) // Service Unavailable
+			.json({
+				error: "PayPal is temporarily unreachable. Please try again shortly.",
+			});
 	}
 };
 
