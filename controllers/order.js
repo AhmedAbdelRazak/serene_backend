@@ -2053,6 +2053,7 @@ exports.orderSearch = async (req, res) => {
 					"paymentDetails.payment.cardDetails.receiptNumber": { $regex: regex },
 				},
 				{ "paymentDetails.payment.cardDetails.receiptUrl": { $regex: regex } },
+				{ "paymentDetails.payment.cardDetails.card.last4": { $regex: regex } },
 			],
 		});
 
