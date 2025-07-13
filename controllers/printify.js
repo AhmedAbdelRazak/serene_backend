@@ -326,125 +326,188 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 	}
 };
 
-exports.printifyOrders = async (req, res) => {
-	try {
-		// 1. Grab orders, excluding any whose status is
-		//    "delivered", "cancelled", "shipped", or "ready to ship" (case-insensitive),
-		//    plus "fulfilled" if it happens to be stored locally.
-		const ordersToCheck = await Order.find({
-			status: {
-				$nin: [
-					/^delivered$/i,
-					/^cancelled$/i,
-					/^shipped$/i,
-					/^ready to ship$/i,
-					/^fulfilled$/i, // just in case
-				],
-			},
-			"printifyOrderDetails.0.ephemeralOrder.id": { $exists: true },
-		});
+const PER_PAGE = 100; // Printify page size limit
 
-		// 2. Build a map of ephemeralOrder.id => local Order doc
-		const orderMap = new Map();
-		ordersToCheck.forEach((order) => {
-			const printifyId = order.printifyOrderDetails?.[0]?.ephemeralOrder?.id;
-			if (printifyId) {
-				orderMap.set(printifyId, order);
-			}
-		});
+/* ───────────────────────────────────────────────────────────────
+   Helper data & utilities
+──────────────────────────────────────────────────────────────── */
 
-		// Helper function: map Printify status => local status
-		function mapPrintifyStatusToLocalStatus(printifyStatus) {
-			if (!printifyStatus) return "";
-			const ps = printifyStatus.toLowerCase();
+const CANCELLABLE_P_STATUSES = new Set([
+	"pending",
+	"onhold",
+	"paymentnotreceived",
+	"notsubmitted",
+	"draft",
+]);
 
-			switch (ps) {
-				case "in_transit":
-					return "Shipped";
-				case "fulfilled":
-					return "Delivered";
-				case "canceled":
-					return "Cancelled";
-				case "in_production":
-				case "pre_transit":
-					return "Ready to Ship";
-				default:
-					// For other statuses, e.g. "unsubmitted", "payment_not_received", etc.,
-					// just use the raw Printify status (or map them as you like).
-					return printifyStatus;
-			}
-		}
+// Printify statuses that mean “shipped / finished”
+const COMPLETED_P_STATUSES = new Set(["delivered", "fulfilled", "intransit"]);
 
-		// 3. Fetch shops/orders using DESIGN_PRINTIFY_TOKEN only
-		const token = process.env.DESIGN_PRINTIFY_TOKEN;
-		if (!token) {
-			return res.status(500).json({ error: "DESIGN_PRINTIFY_TOKEN missing." });
-		}
+const normaliseStatus = (str = "") => str.toLowerCase().replace(/[\s_-]/g, "");
 
-		// Fetch shops
-		const shopResponse = await axios.get(
-			"https://api.printify.com/v1/shops.json",
-			{
-				headers: { Authorization: `Bearer ${token}` },
-			}
-		);
-		const shops = shopResponse.data || [];
-		let totalOrdersSynced = 0;
+const mapPrintifyStatusToLocalStatus = (status = "") => {
+	switch (normaliseStatus(status)) {
+		case "intransit":
+		case "fulfilled":
+			return "Shipped";
+		case "delivered":
+			return "Delivered";
+		case "canceled":
+			return "Cancelled";
+		case "inproduction":
+		case "pretransit":
+			return "Ready to Ship";
+		default:
+			return status;
+	}
+};
 
-		// For each shop, get orders and update local DB
-		for (const shop of shops) {
-			const shopId = shop.id;
-			const ordersResponse = await axios.get(
-				`https://api.printify.com/v1/shops/${shopId}/orders.json`,
-				{ headers: { Authorization: `Bearer ${token}` } }
+async function deleteEphemeralProducts({ shopId, localOrder, authHeaders }) {
+	const prodIds =
+		localOrder.printifyOrderDetails
+			?.map((d) => d.ephemeralProductId)
+			.filter(Boolean) || [];
+
+	let removed = 0;
+	for (const prodId of prodIds) {
+		try {
+			await axios.delete(
+				`https://api.printify.com/v1/shops/${shopId}/products/${prodId}.json`,
+				authHeaders
 			);
-			const printifyOrders = ordersResponse.data?.data || [];
-
-			for (const printifyOrder of printifyOrders) {
-				// Attempt to find a matching local order
-				const existingOrder = orderMap.get(printifyOrder.id);
-				if (!existingOrder) continue;
-
-				const updatedFields = {};
-
-				// Map the Printify status to your local status
-				const mappedLocalStatus = mapPrintifyStatusToLocalStatus(
-					printifyOrder.status
+			removed++;
+		} catch (e) {
+			if (e.response?.status === 404) {
+				removed++; // already deleted – count as success
+			} else {
+				// keep running but surface the error in server logs
+				console.warn(
+					`[Printify] Unable to delete product ${prodId}:`,
+					e.response?.data || e.message
 				);
+			}
+		}
+	}
+	return removed;
+}
 
-				// If your local order's status differs, update it
-				if (existingOrder.status !== mappedLocalStatus) {
-					updatedFields.status = mappedLocalStatus;
-				}
+/* ───────────────────────────────────────────────────────────────
+   Main controller
+──────────────────────────────────────────────────────────────── */
 
-				// If the tracking number differs, update it
-				const printifyTracking = printifyOrder?.printify_connect?.url || null;
-				if (existingOrder.trackingNumber !== printifyTracking) {
-					updatedFields.trackingNumber = printifyTracking;
-				}
+exports.printifyOrders = async (req, res) => {
+	/* 0. Validate API token */
+	const token = process.env.DESIGN_PRINTIFY_TOKEN;
+	if (!token) {
+		return res.status(500).json({ error: "DESIGN_PRINTIFY_TOKEN missing." });
+	}
+	const authHeaders = { headers: { Authorization: `Bearer ${token}` } };
 
-				// Update only if we have changes
-				if (Object.keys(updatedFields).length > 0) {
-					await Order.updateOne(
-						{ _id: existingOrder._id },
-						{ $set: updatedFields }
-					);
-					totalOrdersSynced++;
+	/* 1. Load every local order that references Printify */
+	const allOrders = await Order.find({
+		"printifyOrderDetails.0.ephemeralOrder.id": { $exists: true },
+	});
+	const byPrintifyId = new Map();
+	allOrders.forEach((o) => {
+		const id = o.printifyOrderDetails?.[0]?.ephemeralOrder?.id;
+		if (id) byPrintifyId.set(id, o);
+	});
+
+	/* 2. Counters */
+	let ordersSynced = 0;
+	let ordersCancelledAtPrintify = 0;
+	let productsDeleted = 0;
+
+	try {
+		/* 3. Iterate over every shop owned by the token */
+		const { data: shops = [] } = await axios.get(
+			"https://api.printify.com/v1/shops.json",
+			authHeaders
+		);
+
+		for (const { id: shopId } of shops) {
+			/* Paginate through all orders in the shop */
+			let page = 1;
+			while (true) {
+				const { data: { data: pOrders = [] } = {} } = await axios.get(
+					`https://api.printify.com/v1/shops/${shopId}/orders.json?page=${page}&per_page=${PER_PAGE}`,
+					authHeaders
+				);
+				if (!pOrders.length) break; // no more pages
+				page++;
+
+				for (const pOrder of pOrders) {
+					const localOrder = byPrintifyId.get(pOrder.id);
+					if (!localOrder) continue; // no local match
+
+					const normLocal = normaliseStatus(localOrder.status);
+					const normPrint = normaliseStatus(pOrder.status);
+
+					/* A) Local order is Cancelled ➜ attempt cancel + delete products */
+					if (normLocal === "cancelled") {
+						if (
+							normPrint !== "canceled" &&
+							CANCELLABLE_P_STATUSES.has(normPrint)
+						) {
+							try {
+								await axios.post(
+									`https://api.printify.com/v1/shops/${shopId}/orders/${pOrder.id}/cancel.json`,
+									{},
+									authHeaders
+								);
+								ordersCancelledAtPrintify++;
+							} catch (e) {
+								console.warn(
+									`[Printify] Cannot cancel ${pOrder.id}:`,
+									e.response?.data || e.message
+								);
+							}
+						}
+						productsDeleted += await deleteEphemeralProducts({
+							shopId,
+							localOrder,
+							authHeaders,
+						});
+						continue; // done with this order
+					}
+
+					/* B) Normal status + tracking synchronisation */
+					const updates = {};
+					const mappedStatus = mapPrintifyStatusToLocalStatus(pOrder.status);
+					if (localOrder.status !== mappedStatus) updates.status = mappedStatus;
+					const pTracking = pOrder?.printify_connect?.url || null;
+					if (localOrder.trackingNumber !== pTracking)
+						updates.trackingNumber = pTracking;
+
+					if (Object.keys(updates).length) {
+						await Order.updateOne({ _id: localOrder._id }, { $set: updates });
+						ordersSynced++;
+					}
+
+					/* C) If Printify marks order completed (delivered/shipped) ➜ delete products */
+					if (COMPLETED_P_STATUSES.has(normPrint)) {
+						productsDeleted += await deleteEphemeralProducts({
+							shopId,
+							localOrder,
+							authHeaders,
+						});
+					}
 				}
 			}
 		}
 
-		res.json({
+		/* 4. Final concise report */
+		return res.json({
 			success: true,
-			message: "Orders synced with Printify (DESIGN token only).",
-			ordersSynced: totalOrdersSynced,
+			message: "Printify sync completed.",
+			ordersSynced,
+			ordersCancelledAtPrintify,
+			productsDeleted,
 		});
 	} catch (err) {
-		console.error("Error syncing Printify orders:", err.message);
-		if (err.response) {
-			console.error("Printify API Response:", err.response.data);
-		}
-		res.status(500).json({ error: "Error syncing Printify orders" });
+		console.error("Error during Printify sync:", err.message);
+		if (err.response) console.error("Printify API:", err.response.data);
+		return res.status(500).json({ error: "Error syncing Printify orders" });
 	}
 };
 

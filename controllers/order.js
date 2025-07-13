@@ -2025,39 +2025,69 @@ exports.updateSingleOrder = async (req, res) => {
 	}
 };
 
+// controllers/order.js  (or wherever you keep this handler)
+
 exports.orderSearch = async (req, res) => {
 	try {
-		const query = req.params.orderquery;
+		const { orderquery: query } = req.params;
 
 		if (!query) {
 			return res.status(400).json({ message: "No search query provided." });
 		}
 
-		// Create a regex for case-insensitive search
+		// Case‑insensitive regex
 		const regex = new RegExp(query, "i");
 
-		// Find orders that match the search query
-		const orders = await Order.find({
-			$or: [
-				{ "customerDetails.name": { $regex: regex } },
-				{ "customerDetails.email": { $regex: regex } },
-				{ "customerDetails.phone": { $regex: regex } },
-				{ "customerDetails.address": { $regex: regex } },
-				{ "customerDetails.state": { $regex: regex } },
-				{ "customerDetails.zipcode": { $regex: regex } },
-				{ trackingNumber: { $regex: regex } },
-				{ invoiceNumber: { $regex: regex } },
-				{ "paymentDetails.payment.id": { $regex: regex } },
-				{ "paymentDetails.payment.status": { $regex: regex } },
-				{
-					"paymentDetails.payment.cardDetails.receiptNumber": { $regex: regex },
-				},
-				{ "paymentDetails.payment.cardDetails.receiptUrl": { $regex: regex } },
-				{ "paymentDetails.payment.cardDetails.card.last4": { $regex: regex } },
-			],
-		});
+		/* 
+		 |------------------------------------------------------------
+		 |  Build ONE $or array with every field we want to expose
+		 |  to search.  Payment‑related keys cover both card and
+		 |  PayPal flows.  Feel free to trim fields you don’t need.
+		 |------------------------------------------------------------
+		*/
+		const searchConditions = [
+			// ─── Customer details ───────────────────────────────────
+			{ "customerDetails.name": regex },
+			{ "customerDetails.email": regex },
+			{ "customerDetails.phone": regex },
+			{ "customerDetails.address": regex },
+			{ "customerDetails.city": regex },
+			{ "customerDetails.state": regex },
+			{ "customerDetails.zipcode": regex },
 
-		if (orders.length === 0) {
+			// ─── Order meta ─────────────────────────────────────────
+			{ trackingNumber: regex },
+			{ invoiceNumber: regex },
+			{ status: regex }, // <-- NEW (search by order status)
+
+			// ─── PayPal flow ───────────────────────────────────────
+			{ paypalOrderId: regex }, // <-- NEW (search by PayPal order id)
+
+			// ─── Common (Stripe, Square, etc.) payment objects ─────
+			{ "paymentDetails.payment.id": regex },
+			{ "paymentDetails.payment.status": regex },
+			{ "paymentDetails.payment.receiptNumber": regex },
+			{ "paymentDetails.payment.receiptUrl": regex },
+
+			// Card details held in `payment.cardDetails`
+			{ "paymentDetails.payment.cardDetails.receiptNumber": regex },
+			{ "paymentDetails.payment.cardDetails.receiptUrl": regex },
+			{ "paymentDetails.payment.cardDetails.card.last4": regex },
+			{ "paymentDetails.payment.cardDetails.card.brand": regex },
+			{ "paymentDetails.payment.cardDetails.card.type": regex },
+			{ "paymentDetails.payment.cardDetails.card.expMonth": regex },
+			{ "paymentDetails.payment.cardDetails.card.expYear": regex },
+
+			// Square‐style `payment_source` object
+			{ "paymentDetails.payment_source.card.last_digits": regex },
+			{ "paymentDetails.payment_source.card.type": regex },
+			{ "paymentDetails.payment_source.card.brand": regex },
+			{ "paymentDetails.payment_source.card.expiry": regex },
+		];
+
+		const orders = await Order.find({ $or: searchConditions });
+
+		if (!orders.length) {
 			return res
 				.status(404)
 				.json({ message: "No orders found matching the query." });

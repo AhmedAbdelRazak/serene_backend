@@ -55,7 +55,7 @@ app.set("io", io);
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
 
 // Schedule task to run every 90 minutes
-cron.schedule("*/90 * * * *", async () => {
+cron.schedule("*/59 * * * *", async () => {
 	try {
 		console.log("Running scheduled task to fetch Printify orders");
 		const response = await axios.get(

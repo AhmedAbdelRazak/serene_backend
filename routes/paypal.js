@@ -1,23 +1,30 @@
 /*********************************************************************
- *  routes/paypal.js
+ *  Exposes all PayPal endpoints used by the React checkout
  *********************************************************************/
+
 const express = require("express");
 const ctrl = require("../controllers/PayPal");
 
 const router = express.Router();
 
-/*  Client‑side SDK needs this first */
+/* ───────────────────────────── 1. Client token ────────────────────────── */
+/*  JS‑SDK loads first → browser asks for a client‑token so Card Fields
+    can initialise and obtain 3‑D Secure liability‑shift.                  */
 router.post("/paypal/client-token", ctrl.generateClientToken);
 
-/*  Wallet & hosted‑fields card flow (two‑step: create → capture)      */
+/* ───────────────────────────── 2. Two‑step checkout ───────────────────── */
+/*  a) create‑order      – called from PayPalButtons/CardFields `createOrder`
+    b) capture‑order     – called from `onApprove` after user authorises    */
 router.post("/paypal/create-order", ctrl.createOrder);
 router.post("/paypal/capture-order", ctrl.captureOrder);
 
-/*  Card‑only “single call” flow if you prefer it on some pages        */
-router.post("/paypal/card-pay", ctrl.cardPay);
-
-/*  (Optional) Webhook endpoint – remember to add the route URL in the
-    PayPal dashboard and verify the signature in production.          */
-router.post("/paypal/webhook", express.json({ type: "*/*" }), ctrl.webhook);
+/* ───────────────────────────── 3. Webhook (optional) ──────────────────── */
+/*  Add the URL you expose below to PayPal Dashboard → Webhooks.
+    If you plan to verify the signature you must capture the *raw* body.   */
+router.post(
+	"/paypal/webhook",
+	express.json({ type: "*/*" }), // use raw‑body middleware if verifying
+	ctrl.webhook
+);
 
 module.exports = router;

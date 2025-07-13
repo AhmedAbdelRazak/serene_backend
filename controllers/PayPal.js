@@ -1,18 +1,18 @@
 /*********************************************************************
- *  controllers/PayPal.js ‑ Jul‑2025 • card + wallet • safe capture
+ *  controllers/PayPal.js  •  Jul‑2025
+ *  Wallet + Card Fields (3‑D Secure)  —  Seller‑Protection compliant
  *********************************************************************/
 
 "use strict";
 
-/* ───────────────────────── 1 Deps & environment ───────────────────────── */
+/* ───────────────────────── 1. Deps & environment ───────────────────────── */
 const paypal = require("@paypal/checkout-server-sdk");
 const axios = require("axios");
 const Joi = require("joi");
-const axiosRetryPkg = require("axios-retry");
+const axiosRetryRaw = require("axios-retry"); // works v3‑v5
 const axiosRetry =
-	axiosRetryPkg.default || // v5 ESM build
-	axiosRetryPkg.axiosRetry || // v5 named export
-	axiosRetryPkg; // v4 classic
+	axiosRetryRaw.default || axiosRetryRaw.axiosRetry || axiosRetryRaw;
+
 const { v4: uuid } = require("uuid");
 
 const IS_PROD = /prod/i.test(process.env.NODE_ENV);
@@ -29,7 +29,7 @@ const env = IS_PROD
 	: new paypal.core.SandboxEnvironment(clientId, secretKey);
 const ppClient = new paypal.core.PayPalHttpClient(env);
 
-/* ───────────────────────── 2 Internal helpers / models ─────────────────── */
+/* ───────────────────────── 2. Internal helpers / models ─────────────────── */
 const {
 	checkStockAvailability,
 	generateUniqueInvoiceNumber,
@@ -41,7 +41,7 @@ const {
 } = require("./HelperFunctions");
 const { Order } = require("../models/order");
 
-/* ───────────────────────── 3 Validation schema ─────────────────────────── */
+/* ───────────────────────── 3. Validation schema ─────────────────────────── */
 const orderSchema = Joi.object({
 	customerDetails: Joi.object({
 		name: Joi.string().min(2).required(),
@@ -55,26 +55,29 @@ const orderSchema = Joi.object({
 		zipcode: Joi.string().required(),
 		userId: Joi.string().optional(),
 	}).required(),
+
 	productsNoVariable: Joi.array().items(Joi.object()).required(),
 	chosenProductQtyWithVariables: Joi.array().items(Joi.object()).required(),
+
 	chosenShippingOption: Joi.object({
 		carrierName: Joi.string().required(),
 		shippingPrice: Joi.number().positive().required(),
 	})
 		.unknown(true)
 		.required(),
+
 	totalAmount: Joi.number().positive().required(),
 	totalAmountAfterDiscount: Joi.number().positive().allow(null),
 	totalOrderQty: Joi.number().integer().positive().required(),
 }).unknown(true);
 
-/* ───────────────────────── 4 Utility fns ──────────────────────────────── */
+/* ───────────────────────── 4. Utility fns ──────────────────────────────── */
 const safeClone = (o) => JSON.parse(JSON.stringify(o));
 
 const buildPU = (data, invoice) => ({
 	reference_id: `tmp-${invoice}`,
 	invoice_id: invoice,
-	description: `Serene Jannat – Order ${invoice}`,
+	description: `Serene Jannat – Order ${invoice}`,
 	amount: {
 		currency_code: "USD",
 		value: Number(data.totalAmountAfterDiscount ?? data.totalAmount).toFixed(2),
@@ -103,49 +106,52 @@ axiosRetry(ax, {
 	retryCondition: (err) =>
 		err.code === "ECONNRESET" ||
 		err.code === "ETIMEDOUT" ||
-		axiosRetry.isNetworkError(err),
+		axiosRetry.isNetworkError?.(err),
 });
 
-/* ───────────────────────── 5 Client‑token ─────────────────────────────── */
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║ 5.  Client‑token  (JS SDK needs this for Card Fields + 3‑DS)    ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
 exports.generateClientToken = async (_req, res) => {
 	try {
-		/* ➊ serve from cache ( PayPal tokens last 9 h in practice ) */
+		/* ➊ serve from cache */
 		if (cachedClientToken && Date.now() < cachedClientTokenExp) {
 			return res.json({ clientToken: cachedClientToken, cached: true });
 		}
 
-		/* ➋ fetch a fresh one – with automatic retry on connection resets */
+		/* ➋ fetch a fresh one */
 		const { data } = await ax.post(
 			`${
 				IS_PROD
 					? "https://api-m.paypal.com"
 					: "https://api-m.sandbox.paypal.com"
 			}/v1/identity/generate-token`,
-			{}, // empty JSON body
+			{},
 			{
 				auth: { username: clientId, password: secretKey },
 				headers: { "Content-Type": "application/json" },
 			}
 		);
 
-		/* ➌ cache & return */
+		/* ➌ cache & return (PayPal tokens last ±9 h) */
 		cachedClientToken = data.client_token;
 		cachedClientTokenExp = Date.now() + 1000 * 60 * 60 * 8; // 8 h
 		res.json({ clientToken: cachedClientToken });
 	} catch (e) {
 		console.error("PayPal client‑token error:", e);
-		res
-			.status(503) // Service Unavailable
-			.json({
-				error: "PayPal is temporarily unreachable. Please try again shortly.",
-			});
+		res.status(503).json({
+			error: "PayPal is temporarily unreachable. Please try again shortly.",
+		});
 	}
 };
 
-/* ───────────────────────── 6 Create order (wallet & card) ─────────────── */
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║ 6.  Create Order  (wallet & Card Fields)                        ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
 exports.createOrder = async (req, res) => {
 	try {
-		const { orderData } = req.body || {};
+		const { orderData, cmid /* PayPal‑Client‑Metadata‑Id */ } = req.body || {};
+
 		const { error } = orderSchema.validate(orderData || {}, {
 			abortEarly: false,
 		});
@@ -158,7 +164,9 @@ exports.createOrder = async (req, res) => {
 
 		const ppReq = new paypal.orders.OrdersCreateRequest();
 		ppReq.headers["PayPal-Request-Id"] = `ord-${uuid()}`;
+		if (cmid) ppReq.headers["PayPal-Client-Metadata-Id"] = cmid;
 		ppReq.prefer("return=representation");
+
 		ppReq.requestBody({
 			intent: "CAPTURE",
 			purchase_units: [buildPU(orderData, invoice)],
@@ -169,6 +177,10 @@ exports.createOrder = async (req, res) => {
 					surname:
 						orderData.customerDetails.name.split(" ").slice(1).join(" ") ||
 						"Customer",
+				},
+				phone: {
+					phone_type: "MOBILE",
+					phone_number: { national_number: orderData.customerDetails.phone },
 				},
 				address: {
 					address_line_1: orderData.customerDetails.address,
@@ -193,169 +205,76 @@ exports.createOrder = async (req, res) => {
 	}
 };
 
-/* ───────────────────────── 7 Capture (wallet flow) ────────────────────── */
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║ 7.  Capture Order  (wallet & Card Fields onApprove)             ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
 exports.captureOrder = async (req, res) => {
-	const { paypalOrderId, orderData, provisionalInvoice } = req.body || {};
+	const { paypalOrderId, orderData, cmid, provisionalInvoice } = req.body || {};
 	if (!paypalOrderId || !orderData) {
 		return res.status(400).json({ error: "Missing order data or orderId" });
 	}
 
 	/* helper that actually calls PayPal */
-	const tryCapture = async () => {
+	const captureCall = async () => {
 		const capReq = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
+		if (cmid) capReq.headers["PayPal-Client-Metadata-Id"] = cmid;
 		capReq.requestBody({});
-		return ppClient.execute(capReq); // may throw HttpError
+		return ppClient.execute(capReq);
 	};
 
-	/* ── 1 : retry up‑to 3 × on 5xx / INTERNAL_SERVICE_ERROR ─────────── */
-	let result, lastErr;
-	for (let attempt = 0; attempt < 3; attempt++) {
-		try {
-			({ result } = await tryCapture());
-			break; // success → exit loop
-		} catch (err) {
-			lastErr = err;
-
-			/* only retry on 5xx or INTERNAL_SERVICE_ERROR */
-			const is5xx = err?.statusCode && err.statusCode >= 500;
-			const issue =
-				err?.message?.includes("INTERNAL_SERVICE_ERROR") ||
-				err?.message?.includes("INTERNAL_SERVER_ERROR");
-
-			if (!is5xx && !issue) break; // do not retry 4xx etc.
-
-			/* PayPal suggests waiting 0.5‑1 s before retrying */
-			await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+	let result;
+	try {
+		({ result } = await captureCall());
+	} catch (err) {
+		/* If already captured, fall back to GET */
+		if (err?.statusCode === 422 && /ORDER_ALREADY_CAPTURED/.test(err.message)) {
+			const getReq = new paypal.orders.OrdersGetRequest(paypalOrderId);
+			if (cmid) getReq.headers["PayPal-Client-Metadata-Id"] = cmid;
+			({ result } = await ppClient.execute(getReq));
+		} else {
+			console.error("Capture error:", err);
+			await cleanProvisional(provisionalInvoice);
+			return res
+				.status(503)
+				.json({
+					error: "PayPal is temporarily unavailable. Please try again.",
+				});
 		}
-	}
-
-	if (!result) {
-		console.error("Capture error after retries:", lastErr);
-		await cleanProvisional(provisionalInvoice);
-		return res
-			.status(503)
-			.json({ error: "PayPal is temporarily unavailable. Please try again." });
 	}
 
 	const capture = result?.purchase_units?.[0]?.payments?.captures?.[0] || {};
 	if (capture.status !== "COMPLETED") {
 		await cleanProvisional(provisionalInvoice);
-		return res.status(402).json({ error: "CARD_DECLINED", details: capture });
+		return res
+			.status(402)
+			.json({ error: "PAYMENT_DECLINED", details: capture });
 	}
 
-	/* ── 2 : stock, DB, fulfilment ───────────────────────────────────── */
+	/* ── Stock, DB, fulfilment ─────────────────────────────────────── */
 	await updateStock(orderData);
+
 	const order = await Order.create({
 		...orderData,
 		invoiceNumber: provisionalInvoice,
-		paypalOrderId: paypalOrderId,
+		paypalOrderId,
 		status: "In Process",
 		paymentStatus: "Paid",
 		paymentDetails: safeClone(result),
-		createdVia: "PayPal‑Wallet",
+		sellerProtection: capture.seller_protection?.status ?? "UNKNOWN",
+		createdVia:
+			capture?.payment_source?._type === "CARD"
+				? "PayPal‑Card"
+				: "PayPal‑Wallet",
 	});
 
 	res.json({ success: true, order: convertBigIntToString(order.toObject()) });
+
 	postPaymentFulfilment(order).catch(console.error);
 };
 
-/* ───────────────────────── 8 Card‑only single call flow ──────────────── */
-exports.cardPay = async (req, res) => {
-	try {
-		const { orderData, card } = req.body || {};
-
-		const { error } = orderSchema.validate(orderData || {}, {
-			abortEarly: false,
-		});
-		if (error) return res.status(400).json({ error: error.details });
-
-		const cardSchema = Joi.object({
-			number: Joi.string().creditCard().required(),
-			expiry: Joi.string()
-				.pattern(/^\d{4}-\d{2}$/)
-				.required(), // YYYY‑MM
-			security_code: Joi.string()
-				.pattern(/^\d{3,4}$/)
-				.required(),
-			name: Joi.string().min(2).required(),
-			billing_address: Joi.object({
-				address_line_1: Joi.string().required(),
-				admin_area_2: Joi.string().required(),
-				admin_area_1: Joi.string().required(),
-				postal_code: Joi.string().required(),
-				country_code: Joi.string().length(2).required(),
-			}).required(),
-		});
-		const { error: cErr } = cardSchema.validate(card || {}, {
-			abortEarly: false,
-		});
-		if (cErr) return res.status(400).json({ error: cErr.details });
-
-		const stockErr = await checkStockAvailability(orderData);
-		if (stockErr) return res.status(400).json({ error: stockErr });
-
-		const invoice = await generateUniqueInvoiceNumber();
-
-		/* -- 1  create order ------------------------------------------- */
-		const createReq = new paypal.orders.OrdersCreateRequest();
-		createReq.headers["PayPal-Request-Id"] = `card-${uuid()}`;
-		createReq.prefer("return=representation");
-		createReq.requestBody({
-			intent: "CAPTURE",
-			purchase_units: [buildPU(orderData, invoice)],
-			application_context: {
-				brand_name: "Serene Jannat",
-				user_action: "PAY_NOW",
-			},
-		});
-		const { result: createRes } = await ppClient.execute(createReq);
-
-		/* -- 2  confirm payment‑source (card details) ------------------ */
-		const confirmReq = new paypal.orders.OrdersConfirmPaymentSourceRequest(
-			createRes.id
-		);
-		confirmReq.requestBody({ payment_source: { card } });
-		const { result: confirmRes } = await ppClient.execute(confirmReq);
-
-		if (!["APPROVED", "COMPLETED"].includes(confirmRes.status)) {
-			return res
-				.status(402)
-				.json({ error: "CARD_DECLINED", details: confirmRes });
-		}
-
-		/* -- 3  capture ------------------------------------------------ */
-		const capReq = new paypal.orders.OrdersCaptureRequest(createRes.id);
-		capReq.requestBody({});
-		const { result: capRes } = await ppClient.execute(capReq);
-
-		const capture = capRes?.purchase_units?.[0]?.payments?.captures?.[0] || {};
-		if (capture.status !== "COMPLETED") {
-			return res.status(402).json({ error: "CARD_DECLINED", details: capture });
-		}
-
-		/* -- 4  save order & fulfil ------------------------------------ */
-		await updateStock(orderData);
-		const order = await Order.create({
-			...orderData,
-			invoiceNumber: invoice,
-			paypalOrderId: createRes.id,
-			status: "In Process",
-			paymentStatus: "Paid",
-			paymentDetails: safeClone(capRes),
-			createdVia: "PayPal‑Card",
-		});
-
-		res.json({ success: true, order: convertBigIntToString(order.toObject()) });
-		postPaymentFulfilment(order).catch(console.error);
-	} catch (e) {
-		console.error("cardPay error:", e);
-		if (e?.statusCode)
-			return res.status(402).json({ error: e.message, details: e });
-		res.status(500).json({ error: "Server error during card payment" });
-	}
-};
-
-/* ───────────────────────── 9 Webhook (optional) ───────────────────────── */
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║ 8.  Webhook (optional)                                          ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
 exports.webhook = async (req, res) => {
 	try {
 		const { event_type: type, resource } = req.body;
@@ -365,9 +284,12 @@ exports.webhook = async (req, res) => {
 			if (order && order.paymentStatus !== "Paid") {
 				order.paymentStatus = "Paid";
 				order.status = "In Process";
-				order.paymentDetails = resource;
+				order.paymentDetails = safeClone(resource);
+				order.sellerProtection =
+					resource.seller_protection?.status ?? "UNKNOWN";
 				await order.save();
-				await postPaymentFulfilment(order);
+
+				postPaymentFulfilment(order).catch(console.error);
 			}
 		}
 		res.json({ received: true });
@@ -377,7 +299,9 @@ exports.webhook = async (req, res) => {
 	}
 };
 
-/* ───────────────────────── 10 Post‑payment bundle ─────────────────────── */
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║ 9.  Post‑payment bundle (fulfil, notify)                        ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
 async function postPaymentFulfilment(order) {
 	try {
 		await postOrderToPrintify(order);
@@ -388,8 +312,15 @@ async function postPaymentFulfilment(order) {
 	}
 }
 
-/* ───────────────────────── 11 Cleanup helper ──────────────────────────── */
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║ 10. Cleanup helper                                              ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
 async function cleanProvisional(invoice) {
 	if (!invoice) return;
 	await Order.deleteOne({ invoiceNumber: invoice }).catch(console.error);
 }
+
+/* =================================================================== */
+/*  🛈  /cardPay endpoint removed intentionally:                        */
+/*      Card Fields in the browser tokenises PAN + enforces 3‑DS.      */
+/* =================================================================== */
