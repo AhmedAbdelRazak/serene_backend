@@ -80,6 +80,21 @@ const websiteBasicSetupSchema = new mongoose.Schema(
 			type: String,
 			trim: true,
 		},
+
+		aiAgentToRespond: {
+			type: Boolean,
+			default: false,
+		},
+
+		deactivateOrderCreation: {
+			type: Boolean,
+			default: false,
+		},
+
+		deactivateChatResponse: {
+			type: Boolean,
+			default: false,
+		},
 	},
 	{ timestamps: true }
 );

@@ -1,9 +1,9 @@
 const express = require("express");
 const mongoose = require("mongoose");
+require("dotenv").config();
 const morgan = require("morgan");
 const cors = require("cors");
 const { readdirSync } = require("fs");
-require("dotenv").config();
 
 const http = require("http");
 const socketIo = require("socket.io");
@@ -50,6 +50,7 @@ const io = socketIo(server, {
 
 // Pass the io instance to the app
 app.set("io", io);
+global.io = io;
 
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));

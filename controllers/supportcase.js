@@ -6,6 +6,7 @@ const twilio = require("twilio");
 const SupportCase = require("../models/supportcase");
 const StoreManagement = require("../models/storeManagement");
 const User = require("../models/user");
+const axios = require("axios");
 // Example email template function (Adjust as needed)
 const { newSupportCaseEmail } = require("./assets");
 
@@ -159,6 +160,37 @@ exports.updateSupportCase = async (req, res) => {
 			req.io.emit("receiveMessage", updatedCase);
 		}
 
+		/* ------------------------------------------------------------------
+       4) ── AI‑agent auto‑trigger
+       ------------------------------------------------------------------
+       Conditions:
+         • this update contains a conversation push           (already checked)
+         • the message is from the CLIENT, not from admin/AI
+    ------------------------------------------------------------------ */
+		if (conversation) {
+			const { customerEmail } = conversation.messageBy || {};
+
+			// Ignore agent/self messages (agent uses support@serenejannat.com)
+			if (
+				customerEmail &&
+				customerEmail !== "support@serenejannat.com" &&
+				customerEmail !== "admin@serenejannat.com"
+			) {
+				try {
+					console.log(
+						"[AI‑trigger] Calling AI for case",
+						updatedCase._id.toString()
+					);
+					await axios.post(
+						`${process.env.SERVER_URL}/api/aiagent/respond/${updatedCase._id}`,
+						{ newClientMessage: conversation.message }
+					);
+				} catch (aiErr) {
+					console.error("[AI‑trigger] Error calling AI:", aiErr.message);
+				}
+			}
+		}
+
 		// Return the updated case if it's not closed
 		return res.status(200).json(updatedCase);
 	} catch (error) {
@@ -247,6 +279,14 @@ exports.createNewSupportCase = async (req, res) => {
 
 		// 1) Save to DB
 		await newCase.save();
+
+		setTimeout(() => {
+			axios
+				.post(`${process.env.SERVER_URL}/api/aiagent/respond/${newCase._id}`, {
+					newClientMessage: "__WELCOME__",
+				})
+				.catch((e) => console.error("[AI‑welcome] failed:", e.message));
+		}, 30_000);
 
 		// 2) Populate storeId to get 'belongsTo'
 		const populatedCase = await SupportCase.findById(newCase._id).populate({

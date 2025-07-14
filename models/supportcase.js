@@ -108,6 +108,11 @@ const supportCaseSchema = new Schema({
 		type: String,
 		required: true,
 	},
+
+	aiToRespond: {
+		type: Boolean,
+		default: true,
+	},
 });
 
 const SupportCase = mongoose.model("SupportCase", supportCaseSchema);
