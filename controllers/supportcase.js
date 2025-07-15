@@ -286,7 +286,7 @@ exports.createNewSupportCase = async (req, res) => {
 					newClientMessage: "__WELCOME__",
 				})
 				.catch((e) => console.error("[AI‑welcome] failed:", e.message));
-		}, 30_000);
+		}, 15_000);
 
 		// 2) Populate storeId to get 'belongsTo'
 		const populatedCase = await SupportCase.findById(newCase._id).populate({
