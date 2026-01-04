@@ -1,3 +1,5 @@
+/** @format */
+
 const express = require("express");
 const mongoose = require("mongoose");
 require("dotenv").config();
@@ -9,6 +11,9 @@ const http = require("http");
 const socketIo = require("socket.io");
 const cron = require("node-cron");
 const axios = require("axios");
+
+// You can override this in .env if needed, otherwise localhost:8101
+const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:8101";
 
 // app
 const app = express();
@@ -55,16 +60,34 @@ global.io = io;
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
 
-// Schedule task to run every 90 minutes
+// ========== CRON JOBS ==========
+
+// Existing Printify sync (every ~59 minutes)
 cron.schedule("*/59 * * * *", async () => {
 	try {
 		console.log("Running scheduled task to fetch Printify orders");
-		const response = await axios.get(
-			"http://localhost:8101/api/get-printify-orders"
-		);
+		await axios.get(`${API_BASE_URL}/api/get-printify-orders`);
 		console.log("Orders Updated From Printify");
 	} catch (error) {
-		console.error("Error during scheduled task:");
+		console.error(
+			"Error during scheduled Printify task:",
+			error.message || error
+		);
+	}
+});
+
+// AI marketing campaign audits (every 3 hours)
+// Fires at minute 0 of every 3rd hour (00:00, 03:00, 06:00, ...)
+cron.schedule("0 */3 * * *", async () => {
+	try {
+		console.log("Running scheduled AI marketing campaign audits");
+		await axios.get(`${API_BASE_URL}/api/ai/campaigns/run-due-audits`);
+		console.log("AI marketing audits completed");
+	} catch (error) {
+		console.error(
+			"Error during scheduled AI marketing audit task:",
+			error.message || error
+		);
 	}
 });
 
@@ -102,7 +125,6 @@ io.on("connection", (socket) => {
 	 * Handle user typing events
 	 */
 	socket.on("typing", ({ caseId, user }) => {
-		// Include caseId in the payload so that only the correct chat updates
 		io.to(caseId).emit("typing", { caseId, user });
 	});
 
@@ -112,18 +134,8 @@ io.on("connection", (socket) => {
 
 	/**
 	 * Send message - broadcast to the specific room
-	 *
-	 * NOTE: In your controllers, once the DB is updated, you do:
-	 *   req.io.emit("receiveMessage", updatedCase);
-	 * or
-	 *   req.io.to(caseId).emit("receiveMessage", updatedCase);
-	 *
-	 * That’s fine, as long as the client code expects an entire updatedCase object.
 	 */
 	socket.on("sendMessage", (messageData) => {
-		// Typically you do NOT update the DB here if you're using your REST endpoint to do it.
-		// But if you prefer a pure-socket approach, you’d do it here.
-		// For now, just re-broadcast so others see it in real-time:
 		const { caseId } = messageData;
 		console.log(
 			"sendMessage received on server -> broadcast to room",
@@ -137,7 +149,6 @@ io.on("connection", (socket) => {
 	 */
 	socket.on("newChat", (data) => {
 		console.log("New chat data:", data);
-		// If you want to broadcast to all connected admin/agents:
 		io.emit("newChat", data);
 	});
 

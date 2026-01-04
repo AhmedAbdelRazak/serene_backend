@@ -194,92 +194,20 @@ router.get("/generate-sitemap", async (req, res) => {
 			product.printifyProductDetails?.id;
 
 		if (isPOD) {
-			const variants = product.printifyProductDetails.variants || [];
-			// Build the Printify "option -> value" map
-			const optionValueMap = buildOptionValueMap(
-				product.printifyProductDetails
-			);
+			const productUrl = `/custom-gifts/${product._id}`;
+			const imagesArr = gatherProductImages(product);
+			const sitemapImages = imagesArr.map((u) => ({
+				url: u,
+				title: product.productName,
+			}));
 
-			if (variants.length > 1) {
-				// MULTI-VARIANT
-				variants.forEach((variant, index) => {
-					// 1) Try to get color/size from Printify map
-					let { colorVal, sizeVal } = getColorSizeFromPrintifyMap(
-						variant,
-						optionValueMap
-					);
-
-					// 2) If nothing found in map, fallback to parse from variant.title
-					if (!colorVal && !sizeVal) {
-						const fallback = parseSizeColorFromVariantTitle(variant.title);
-						colorVal = fallback.variantColor;
-						sizeVal = fallback.variantSize;
-					}
-
-					// 3) Build link
-					const productUrl = buildPODLink(product._id, colorVal, sizeVal);
-
-					// 4) Gather images
-					const imagesArr = gatherPODVariantImages(product, variant.sku);
-					const sitemapImages = imagesArr.map((u) => ({
-						url: u,
-						title: product.productName,
-					}));
-
-					links.push({
-						url: productUrl,
-						lastmod: lastModified,
-						changefreq: "weekly",
-						priority: 0.8,
-						img: sitemapImages,
-					});
-				});
-			} else if (variants.length === 1) {
-				// SINGLE-VARIANT POD
-				const singleVar = variants[0];
-
-				// Attempt to get color/size
-				let { colorVal, sizeVal } = getColorSizeFromPrintifyMap(
-					singleVar,
-					optionValueMap
-				);
-				if (!colorVal && !sizeVal) {
-					const fallback = parseSizeColorFromVariantTitle(singleVar.title);
-					colorVal = fallback.variantColor;
-					sizeVal = fallback.variantSize;
-				}
-
-				const productUrl = buildPODLink(product._id, colorVal, sizeVal);
-				const imagesArr = gatherPODVariantImages(product, singleVar.sku);
-				const sitemapImages = imagesArr.map((u) => ({
-					url: u,
-					title: product.productName,
-				}));
-
-				links.push({
-					url: productUrl,
-					lastmod: lastModified,
-					changefreq: "weekly",
-					priority: 0.8,
-					img: sitemapImages,
-				});
-			} else {
-				// POD but no variants => fallback
-				const productUrl = `/custom-gifts/${product._id}`;
-				const imagesArr = gatherProductImages(product);
-				const sitemapImages = imagesArr.map((u) => ({
-					url: u,
-					title: product.productName,
-				}));
-
-				links.push({
-					url: productUrl,
-					lastmod: lastModified,
-					changefreq: "weekly",
-					priority: 0.8,
-					img: sitemapImages,
-				});
-			}
+			links.push({
+				url: productUrl,
+				lastmod: lastModified,
+				changefreq: "weekly",
+				priority: 0.8,
+				img: sitemapImages,
+			});
 		} else {
 			// NON-POD
 			const productUrl = buildNonPODLink(product);

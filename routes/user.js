@@ -35,7 +35,7 @@ router.put(
 	requireSignin,
 	isAuth,
 	isAdmin,
-	updateUserByAdmin,
+	updateUserByAdmin
 );
 
 router.param("userId", userById);
