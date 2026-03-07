@@ -22,7 +22,7 @@ const stripeController = require("./controllers/stripeController");
 app.post(
 	"/api/stripe/webhook",
 	express.raw({ type: "application/json" }), // <‑‑ no json/body‑parser here
-	stripeController.webhook
+	stripeController.webhook,
 );
 
 const server = http.createServer(app);
@@ -71,7 +71,7 @@ cron.schedule("*/59 * * * *", async () => {
 	} catch (error) {
 		console.error(
 			"Error during scheduled Printify task:",
-			error.message || error
+			error.message || error,
 		);
 	}
 });
@@ -86,7 +86,7 @@ cron.schedule("0 */3 * * *", async () => {
 	} catch (error) {
 		console.error(
 			"Error during scheduled AI marketing audit task:",
-			error.message || error
+			error.message || error,
 		);
 	}
 });
@@ -139,7 +139,7 @@ io.on("connection", (socket) => {
 		const { caseId } = messageData;
 		console.log(
 			"sendMessage received on server -> broadcast to room",
-			messageData
+			messageData,
 		);
 		io.to(caseId).emit("receiveMessage", messageData);
 	});

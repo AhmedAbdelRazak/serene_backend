@@ -252,6 +252,17 @@ const productSchema = new mongoose.Schema(
 					url: String,
 					public_id: String,
 				},
+				defaultDesigns: [
+					{
+						occassion: String,
+						defaultDesignImages: [
+							{
+								url: String,
+								public_id: String,
+							},
+						],
+					},
+				],
 			},
 		],
 
@@ -323,7 +334,7 @@ const productSchema = new mongoose.Schema(
 			default: "67ef147140130b857c44ba75",
 		},
 	},
-	{ timestamps: true }
+	{ timestamps: true },
 );
 
 module.exports = mongoose.model("Product", productSchema);

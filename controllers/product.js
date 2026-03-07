@@ -6,6 +6,8 @@ const User = require("../models/user");
 const Category = require("../models/category"); // Adjust paths as necessary
 const Subcategory = require("../models/subcategory"); // Adjust paths as necessary
 const Gender = require("../models/gender"); // Adjust paths as necessary
+const Colors = require("../models/colors");
+const StoreManagement = require("../models/storeManagement");
 const querystring = require("querystring");
 const mongoose = require("mongoose");
 const ObjectId = mongoose.Types.ObjectId;
@@ -1087,6 +1089,12 @@ exports.getDistinctCategoriesActiveProducts = (req, res, next) => {
 
 exports.filteredProducts = async (req, res, next) => {
 	const { page, records, filters } = req.params;
+	const shouldDebugFilteredProducts = process.env.DEBUG_PRODUCTS_FILTER === "true";
+	const debugFilteredProducts = (...args) => {
+		if (shouldDebugFilteredProducts) {
+			console.log(...args);
+		}
+	};
 	let {
 		color,
 		priceMin,
@@ -1096,82 +1104,283 @@ exports.filteredProducts = async (req, res, next) => {
 		gender,
 		searchTerm,
 		offers,
+		store,
 	} = querystring.parse(filters);
+	debugFilteredProducts(offers, "offersoffersoffers");
 
-	console.log(offers, "offersoffersoffers");
-
-	// Decode the color parameter
-	color = querystring.unescape(color);
-
-	let query = { activeProduct: true };
-
-	if (offers === "jannatoffers") {
-		console.log("Jannat Offers Was Triggered");
-		query.$or = [
-			{
-				$expr: { $lt: ["$priceAfterDiscount", "$price"] },
-			},
-			{
-				$expr: {
-					$lt: [
-						"$productAttributes.priceAfterDiscount",
-						"$productAttributes.price",
-					],
-				},
-			},
-		];
-	} else {
-		// Filter by color
-		if (color) {
-			console.log(`Filtering by color: ${color}`);
-			query.$or = [{ color: color }, { "productAttributes.color": color }];
+	const decodeFilterValue = (value) => querystring.unescape(`${value || ""}`).trim();
+	const escapeRegex = (value = "") =>
+		`${value}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const normalizeToArray = (value) => {
+		if (Array.isArray(value)) {
+			return value.flatMap((entry) => `${entry || ""}`.split(","));
 		}
+		if (value === undefined || value === null) return [];
+		return `${value}`.split(",");
+	};
+	const normalizeFilterArray = (value) =>
+		normalizeToArray(value)
+			.map((entry) => decodeFilterValue(entry))
+			.filter(Boolean);
 
-		// Filter by price range
-		if (priceMin && priceMax) {
-			console.log(`Filtering by price range: ${priceMin} - ${priceMax}`);
-			query.priceAfterDiscount = {
-				$gte: Number(priceMin),
-				$lte: Number(priceMax),
-			};
-		} else if (priceMin) {
-			console.log(`Filtering by minimum price: ${priceMin}`);
-			query.priceAfterDiscount = { $gte: Number(priceMin) };
-		} else if (priceMax) {
-			console.log(`Filtering by maximum price: ${priceMax}`);
-			query.priceAfterDiscount = { $lte: Number(priceMax) };
+	const selectedColors = normalizeFilterArray(color).filter(
+		(value) => value.toLowerCase() !== "unknown"
+	);
+	const selectedSizes = normalizeFilterArray(size);
+	const selectedCategoryValues = normalizeFilterArray(category);
+	const directCategoryIds = selectedCategoryValues
+		.filter((value) => mongoose.Types.ObjectId.isValid(value))
+		.map((value) => new mongoose.Types.ObjectId(value));
+	const nonObjectIdCategoryValues = selectedCategoryValues.filter(
+		(value) => !mongoose.Types.ObjectId.isValid(value)
+	);
+	let selectedCategories = [...directCategoryIds];
+
+	// Resolve category filters passed as slug/name (legacy URLs and external links).
+	if (nonObjectIdCategoryValues.length > 0) {
+		try {
+			const slugCandidates = nonObjectIdCategoryValues
+				.map((value) => value.toLowerCase())
+				.filter(Boolean);
+			const nameCandidates = nonObjectIdCategoryValues
+				.map((value) => value.replace(/[-_]+/g, " ").trim())
+				.filter(Boolean);
+			const regexCandidates = Array.from(
+				new Set([...slugCandidates, ...nameCandidates])
+			).map((value) => new RegExp(`^${escapeRegex(value)}$`, "i"));
+
+			const categoryMatch = [];
+			if (slugCandidates.length > 0) {
+				categoryMatch.push({ categorySlug: { $in: slugCandidates } });
+			}
+			if (nameCandidates.length > 0) {
+				categoryMatch.push({ categoryName: { $in: nameCandidates } });
+			}
+			if (regexCandidates.length > 0) {
+				regexCandidates.forEach((regex) => {
+					categoryMatch.push({ categorySlug: regex });
+					categoryMatch.push({ categoryName: regex });
+				});
+			}
+
+			if (categoryMatch.length > 0) {
+				const matchedCategories = await Category.find({ $or: categoryMatch })
+					.select("_id")
+					.lean();
+				const resolvedCategoryIds = matchedCategories
+					.map((entry) => `${entry?._id || ""}`)
+					.filter((id) => mongoose.Types.ObjectId.isValid(id));
+				if (resolvedCategoryIds.length > 0) {
+					selectedCategories = [
+						...selectedCategories,
+						...resolvedCategoryIds.map(
+							(id) => new mongoose.Types.ObjectId(id)
+						),
+					];
+				}
+			}
+		} catch (categoryLookupError) {
+			console.error(
+				"Category lookup failed:",
+				categoryLookupError.message || categoryLookupError
+			);
 		}
+	}
 
-		// Filter by category
-		if (category) {
-			console.log(`Filtering by category: ${category}`);
-			query.category = new mongoose.Types.ObjectId(category);
+	// Keep category IDs unique before building Mongo match conditions.
+	selectedCategories = Array.from(
+		new Set(selectedCategories.map((value) => `${value}`))
+	).map((value) => new mongoose.Types.ObjectId(value));
+	const normalizedStoreInput = decodeFilterValue(store);
+	const normalizedGenderInput = decodeFilterValue(gender);
+	const validGenderId = mongoose.Types.ObjectId.isValid(normalizedGenderInput)
+		? new mongoose.Types.ObjectId(normalizedGenderInput)
+		: null;
+	searchTerm = decodeFilterValue(searchTerm);
+	const parsedMinPrice = Number(priceMin);
+	const parsedMaxPrice = Number(priceMax);
+	const hasMinPriceFilter = Number.isFinite(parsedMinPrice) && parsedMinPrice > 0;
+	const hasMaxPriceFilter = Number.isFinite(parsedMaxPrice) && parsedMaxPrice > 0;
+	const safeMinPrice = hasMinPriceFilter ? parsedMinPrice : null;
+	const safeMaxPrice = hasMaxPriceFilter ? parsedMaxPrice : null;
+
+	const colorCandidatesSet = new Set();
+	selectedColors.forEach((value) => {
+		colorCandidatesSet.add(value);
+		colorCandidatesSet.add(value.toLowerCase());
+		colorCandidatesSet.add(value.toUpperCase());
+	});
+	if (selectedColors.length > 0) {
+		try {
+			const normalizedColorLowers = selectedColors.map((value) =>
+				value.toLowerCase()
+			);
+			const mappedColors = await Colors.find({
+				$or: [
+					{ color: { $in: normalizedColorLowers } },
+					{ hexa: { $in: normalizedColorLowers } },
+				],
+			})
+				.select("color hexa")
+				.lean();
+			mappedColors.forEach((entry) => {
+				if (entry?.color) colorCandidatesSet.add(entry.color);
+				if (entry?.hexa) colorCandidatesSet.add(entry.hexa);
+			});
+		} catch (colorMappingError) {
+			console.error(
+				"Color mapping lookup failed:",
+				colorMappingError.message || colorMappingError
+			);
+		}
+	}
+	const colorCandidates = Array.from(colorCandidatesSet).filter(Boolean);
+
+	let storeIdCandidates = [];
+	if (normalizedStoreInput) {
+		if (mongoose.Types.ObjectId.isValid(normalizedStoreInput)) {
+			storeIdCandidates = [new mongoose.Types.ObjectId(normalizedStoreInput)];
 		} else {
-			console.log(`No category filter applied`);
+			const normalizedStoreName = normalizedStoreInput
+				.replace(/[-_]+/g, " ")
+				.trim();
+			try {
+				const matchedStores = await StoreManagement.find({
+					addStoreName: {
+						$regex: `^${escapeRegex(normalizedStoreName)}$`,
+						$options: "i",
+					},
+				})
+					.select("_id")
+					.lean();
+				storeIdCandidates = matchedStores.map((entry) => entry._id);
+			} catch (storeLookupError) {
+				console.error(
+					"Store lookup failed:",
+					storeLookupError.message || storeLookupError
+				);
+			}
+		}
+	}
+
+		const conditionByKey = {};
+
+		if (offers === "jannatoffers") {
+			console.log("Jannat Offers Was Triggered");
+			conditionByKey.offers = {
+				$or: [
+					{
+						$expr: { $lt: ["$priceAfterDiscount", "$price"] },
+					},
+					{
+						$expr: {
+							$lt: [
+								"$productAttributes.priceAfterDiscount",
+								"$productAttributes.price",
+							],
+						},
+					},
+				],
+			};
 		}
 
-		// Filter by size
-		if (size) {
-			console.log(`Filtering by size: ${size}`);
-			query.$or = [{ size: size }, { "productAttributes.size": size }];
+		if (colorCandidates.length > 0) {
+			debugFilteredProducts(
+				`Filtering by color candidates: ${colorCandidates.join(", ")}`
+			);
+			conditionByKey.color = {
+				$or: [
+					{ color: { $in: colorCandidates } },
+					{ "productAttributes.color": { $in: colorCandidates } },
+				],
+			};
 		}
 
-		// Filter by gender
-		if (gender) {
-			console.log(`Filtering by gender: ${gender}`);
-			if (mongoose.Types.ObjectId.isValid(gender)) {
-				query.gender = new mongoose.Types.ObjectId(gender);
+		if (selectedSizes.length > 0) {
+			debugFilteredProducts(
+				`Filtering by size candidates: ${selectedSizes.join(", ")}`
+			);
+			conditionByKey.size = {
+				$or: [
+					{ size: { $in: selectedSizes } },
+					{ "productAttributes.size": { $in: selectedSizes } },
+				],
+			};
+		}
+
+		if (hasMinPriceFilter || hasMaxPriceFilter) {
+			const priceCondition = {};
+			if (hasMinPriceFilter) priceCondition.$gte = safeMinPrice;
+			if (hasMaxPriceFilter) priceCondition.$lte = safeMaxPrice;
+			debugFilteredProducts(
+				`Filtering by price condition: ${JSON.stringify(priceCondition)}`
+			);
+			conditionByKey.price = {
+				$or: [
+					{ priceAfterDiscount: priceCondition },
+					{ price: priceCondition },
+					{ "productAttributes.priceAfterDiscount": priceCondition },
+					{ "productAttributes.price": priceCondition },
+				],
+			};
+		} else if (Number.isFinite(parsedMinPrice) || Number.isFinite(parsedMaxPrice)) {
+			debugFilteredProducts(
+				`Skipping invalid price filter values: min=${priceMin}, max=${priceMax}`
+			);
+		}
+
+		if (selectedCategories.length > 0) {
+			debugFilteredProducts(
+				`Filtering by category IDs: ${selectedCategories
+					.map((value) => value.toString())
+					.join(", ")}`
+			);
+			conditionByKey.category = { category: { $in: selectedCategories } };
+		} else if (selectedCategoryValues.length > 0) {
+			debugFilteredProducts(
+				`Skipping invalid category filter values: ${selectedCategoryValues.join(", ")}`
+			);
+		} else {
+			debugFilteredProducts(`No category filter applied`);
+		}
+
+		if (normalizedGenderInput && validGenderId) {
+			debugFilteredProducts(`Filtering by gender: ${normalizedGenderInput}`);
+			conditionByKey.gender = { gender: validGenderId };
+		} else if (normalizedGenderInput && !validGenderId) {
+			debugFilteredProducts(
+				`Skipping invalid gender filter value: ${normalizedGenderInput}`
+			);
+		}
+
+		if (normalizedStoreInput) {
+			if (storeIdCandidates.length > 0) {
+				debugFilteredProducts(`Filtering by store: ${normalizedStoreInput}`);
+				conditionByKey.store = { store: { $in: storeIdCandidates } };
 			} else {
-				return res.status(400).json({ error: "Invalid gender ID" });
+				debugFilteredProducts(
+					`No matching store found for: ${normalizedStoreInput}`
+				);
+				conditionByKey.store = { _id: { $in: [] } };
 			}
 		}
 
-		// Search term
 		if (searchTerm) {
-			console.log(`Filtering by search term: ${searchTerm}`);
-			query.$text = { $search: searchTerm };
+			debugFilteredProducts(`Filtering by search term: ${searchTerm}`);
+			conditionByKey.search = { $text: { $search: searchTerm } };
 		}
-	}
+
+		const buildMatchQuery = (excludedKeys = []) => {
+			const andFilters = Object.entries(conditionByKey)
+				.filter(([key]) => !excludedKeys.includes(key))
+				.map(([, condition]) => condition);
+			if (!andFilters.length) {
+				return { activeProduct: true };
+			}
+			return { activeProduct: true, $and: andFilters };
+		};
+
+		const mainQuery = buildMatchQuery();
 
 	// Pagination
 	const pageNumber = parseInt(page, 10) || 1;
@@ -1179,17 +1388,10 @@ exports.filteredProducts = async (req, res, next) => {
 	const skip = (pageNumber - 1) * recordsPerPage;
 
 	// Build the initial aggregation pipeline
-	const pipeline = [{ $match: query }];
+		const pipeline = [{ $match: mainQuery }];
 
 	// Sort by createdAt descending initially
 	pipeline.push({ $sort: { createdAt: -1 } });
-
-	// Clone pipeline for counting
-	const countPipeline = [...pipeline, { $count: "totalRecords" }];
-
-	// Pagination
-	pipeline.push({ $skip: skip });
-	pipeline.push({ $limit: recordsPerPage });
 
 	// Lookups
 	pipeline.push(
@@ -1227,102 +1429,250 @@ exports.filteredProducts = async (req, res, next) => {
 	);
 
 	try {
-		// Parallel fetch
-		const [totalResult, products] = await Promise.all([
-			Product.aggregate(countPipeline),
-			Product.aggregate(pipeline),
-		]);
+		// Fetch the full matched dataset, then paginate after final card shaping.
+		const products = await Product.aggregate(pipeline);
 
-		const totalRecords = totalResult.length ? totalResult[0].totalRecords : 0;
-
-		// Additional pipelines for color, size, category, gender
-		const colorPipeline = [
-			{ $match: { activeProduct: true } },
-			{ $unwind: "$productAttributes" },
-			{ $group: { _id: "$productAttributes.color" } },
-			{ $project: { _id: 0, color: "$_id" } },
-			{ $sort: { color: 1 } },
-		];
-
-		const sizePipeline = [
-			{ $match: { activeProduct: true } },
-			{ $unwind: "$productAttributes" },
-			{ $group: { _id: "$productAttributes.size" } },
-			{ $project: { _id: 0, size: "$_id" } },
-			{ $sort: { size: 1 } },
-		];
-
-		const categoryPipeline = [
-			{ $match: { activeProduct: true } },
-			{
-				$lookup: {
-					from: "categories",
-					localField: "category",
-					foreignField: "_id",
-					as: "category",
-				},
-			},
-			{ $unwind: "$category" },
-			{
-				$group: {
-					_id: "$category._id",
-					name: { $first: "$category.categoryName" },
-				},
-			},
-			{ $project: { _id: 0, id: "$_id", name: 1 } },
-			{ $sort: { name: 1 } },
-		];
-
-		const genderPipeline = [
-			{ $match: { activeProduct: true } },
-			{
-				$lookup: {
-					from: "genders",
-					localField: "gender",
-					foreignField: "_id",
-					as: "gender",
-				},
-			},
-			{ $unwind: "$gender" },
-			{
-				$group: {
-					_id: "$gender._id",
-					name: { $first: "$gender.genderName" },
-				},
-			},
-			{ $project: { _id: 0, id: "$_id", name: 1 } },
-			{ $sort: { name: 1 } },
-		];
-
-		const [colors, sizes, categories, genders] = await Promise.all([
-			Product.aggregate(colorPipeline),
-			Product.aggregate(sizePipeline),
-			Product.aggregate(categoryPipeline),
-			Product.aggregate(genderPipeline),
-		]);
-
-		// Price range
-		const pricePipeline = [
-			{ $match: { activeProduct: true } },
-			{
-				$project: {
-					price: {
-						$cond: {
-							if: { $gt: [{ $size: "$productAttributes" }, 0] },
-							then: { $min: "$productAttributes.priceAfterDiscount" },
-							else: "$priceAfterDiscount",
+			// Additional pipelines for color, size, category, gender, store
+			const colorPipeline = [
+				{ $match: buildMatchQuery(["color"]) },
+				{
+					$project: {
+						colors: {
+							$concatArrays: [
+								[{ $ifNull: ["$color", ""] }],
+								{
+									$map: {
+										input: { $ifNull: ["$productAttributes", []] },
+										as: "attr",
+										in: { $ifNull: ["$$attr.color", ""] },
+									},
+								},
+							],
 						},
 					},
 				},
-			},
-			{
-				$group: {
-					_id: null,
-					minPrice: { $min: "$price" },
-					maxPrice: { $max: "$price" },
+				{ $unwind: "$colors" },
+				{
+					$project: {
+						color: {
+							$cond: [
+								{ $eq: [{ $type: "$colors" }, "string"] },
+								{ $trim: { input: "$colors" } },
+								"",
+							],
+						},
+					},
 				},
-			},
-		];
+				{
+					$project: {
+						color: 1,
+						colorLower: { $toLower: "$color" },
+					},
+				},
+				{
+					$match: {
+						colorLower: { $nin: ["", "unknown"] },
+					},
+				},
+				{
+					$group: {
+						_id: "$colorLower",
+						color: { $first: "$color" },
+					},
+				},
+				{ $project: { _id: 0, color: "$color" } },
+				{ $sort: { color: 1 } },
+			];
+
+			const sizePipeline = [
+				{ $match: buildMatchQuery(["size"]) },
+				{
+					$project: {
+						sizes: {
+							$concatArrays: [
+								[{ $ifNull: ["$size", ""] }],
+								{
+									$map: {
+										input: { $ifNull: ["$productAttributes", []] },
+										as: "attr",
+										in: { $ifNull: ["$$attr.size", ""] },
+									},
+								},
+							],
+						},
+					},
+				},
+				{ $unwind: "$sizes" },
+				{
+					$project: {
+						size: {
+							$cond: [
+								{ $eq: [{ $type: "$sizes" }, "string"] },
+								{ $trim: { input: "$sizes" } },
+								"",
+							],
+						},
+					},
+				},
+				{
+					$project: {
+						size: 1,
+						sizeLower: { $toLower: "$size" },
+					},
+				},
+				{
+					$match: {
+						sizeLower: { $nin: [""] },
+					},
+				},
+				{
+					$group: {
+						_id: "$sizeLower",
+						size: { $first: "$size" },
+					},
+				},
+				{ $project: { _id: 0, size: "$size" } },
+				{ $sort: { size: 1 } },
+			];
+
+			const categoryPipeline = [
+				{ $match: buildMatchQuery(["category"]) },
+				{
+					$lookup: {
+						from: "categories",
+						localField: "category",
+						foreignField: "_id",
+						as: "category",
+					},
+				},
+				{ $unwind: "$category" },
+				{
+					$group: {
+						_id: "$category._id",
+						name: { $first: "$category.categoryName" },
+					},
+				},
+				{ $project: { _id: 0, id: "$_id", name: 1 } },
+				{ $sort: { name: 1 } },
+			];
+
+			const genderPipeline = [
+				{ $match: buildMatchQuery(["gender"]) },
+				{
+					$lookup: {
+						from: "genders",
+						localField: "gender",
+						foreignField: "_id",
+						as: "gender",
+					},
+				},
+				{ $unwind: "$gender" },
+				{
+					$group: {
+						_id: "$gender._id",
+						name: { $first: "$gender.genderName" },
+					},
+				},
+				{ $project: { _id: 0, id: "$_id", name: 1 } },
+				{ $sort: { name: 1 } },
+			];
+
+			const storePipeline = [
+				{ $match: buildMatchQuery(["store"]) },
+				{
+					$lookup: {
+						from: "storemanagements",
+						localField: "store",
+						foreignField: "_id",
+						as: "storeDetails",
+					},
+				},
+				{
+					$unwind: {
+						path: "$storeDetails",
+						preserveNullAndEmptyArrays: false,
+					},
+				},
+				{
+					$project: {
+						id: "$storeDetails._id",
+						name: {
+							$trim: {
+								input: { $ifNull: ["$storeDetails.addStoreName", ""] },
+							},
+						},
+					},
+				},
+				{ $match: { name: { $ne: "" } } },
+				{
+					$group: {
+						_id: "$id",
+						name: { $first: "$name" },
+					},
+				},
+				{ $project: { _id: 0, id: "$_id", name: 1 } },
+				{ $sort: { name: 1 } },
+			];
+
+			const [colors, sizes, categories, genders, stores] = await Promise.all([
+				Product.aggregate(colorPipeline),
+				Product.aggregate(sizePipeline),
+				Product.aggregate(categoryPipeline),
+				Product.aggregate(genderPipeline),
+				Product.aggregate(storePipeline),
+			]);
+
+			// Price range: use effective price (discount when present, otherwise base price)
+			const pricePipeline = [
+				{ $match: buildMatchQuery(["price"]) },
+				{
+					$project: {
+						priceCandidates: {
+							$concatArrays: [
+								[
+									{
+										$cond: [
+											{ $gt: ["$priceAfterDiscount", 0] },
+											"$priceAfterDiscount",
+											{
+												$cond: [{ $gt: ["$price", 0] }, "$price", null],
+											},
+										],
+									},
+								],
+								{
+									$map: {
+										input: { $ifNull: ["$productAttributes", []] },
+										as: "attr",
+										in: {
+											$cond: [
+												{ $gt: ["$$attr.priceAfterDiscount", 0] },
+												"$$attr.priceAfterDiscount",
+												{
+													$cond: [
+														{ $gt: ["$$attr.price", 0] },
+														"$$attr.price",
+														null,
+													],
+												},
+											],
+										},
+									},
+								},
+							],
+						},
+					},
+				},
+				{ $unwind: "$priceCandidates" },
+				{ $match: { priceCandidates: { $ne: null } } },
+				{
+					$group: {
+						_id: null,
+						minPrice: { $min: "$priceCandidates" },
+						maxPrice: { $max: "$priceCandidates" },
+					},
+				},
+			];
 
 		const [priceRange] = await Product.aggregate(pricePipeline);
 
@@ -1351,11 +1701,14 @@ exports.filteredProducts = async (req, res, next) => {
 							let matchesColor = true;
 							let matchesSize = true;
 
-							if (color) {
-								matchesColor = attr.color === color;
+							if (colorCandidates.length > 0) {
+								const attrColor = `${attr.color || ""}`.toLowerCase();
+								matchesColor = colorCandidates.some(
+									(candidate) => `${candidate}`.toLowerCase() === attrColor
+								);
 							}
-							if (size) {
-								matchesSize = attr.size === size;
+							if (selectedSizes.length > 0) {
+								matchesSize = selectedSizes.includes(`${attr.size || ""}`);
 							}
 							return matchesColor && matchesSize;
 						}
@@ -1403,10 +1756,18 @@ exports.filteredProducts = async (req, res, next) => {
 			}
 		});
 
-		// ===============================
-		// Custom Sorting w/ In-Stock First
-		// ===============================
-		const pinnedIds = []; // e.g. ["someObjectId1","someObjectId2"]
+			// ===============================
+			// Custom Sorting w/ In-Stock First
+			// ===============================
+			const pinnedIds = []; // e.g. ["someObjectId1","someObjectId2"]
+			const sereneStoreIds = new Set(
+				(stores || [])
+					.filter(
+						(storeEntry) =>
+							`${storeEntry?.name || ""}`.trim().toLowerCase() === "serene jannat"
+					)
+					.map((storeEntry) => `${storeEntry.id}`)
+			);
 
 		function getTotalQuantity(prod) {
 			let attrSum = 0;
@@ -1419,14 +1780,17 @@ exports.filteredProducts = async (req, res, next) => {
 			return topLevelQty + attrSum;
 		}
 
-		finalProducts.forEach((prod) => {
-			const strId = String(prod._id);
-			const totalQty = getTotalQuantity(prod);
+			finalProducts.forEach((prod) => {
+				const strId = String(prod._id);
+				const totalQty = getTotalQuantity(prod);
+				const productStoreId = `${prod?.store || ""}`;
+				const isSereneStoreProduct = sereneStoreIds.has(productStoreId);
+				prod.storePriority = isSereneStoreProduct ? 0 : 1;
 
-			if (pinnedIds.includes(strId)) {
-				// pinned => top
-				prod.sortRank = pinnedIds.indexOf(strId); // 0 or 1...
-				prod.sortMark = "pinnedProduct";
+				if (pinnedIds.includes(strId)) {
+					// pinned => top
+					prod.sortRank = pinnedIds.indexOf(strId); // 0 or 1...
+					prod.sortMark = "pinnedProduct";
 				prod.subRank = 0; // pinned gets subRank=0
 			} else if (prod.printifyProductDetails) {
 				// bottom
@@ -1444,34 +1808,42 @@ exports.filteredProducts = async (req, res, next) => {
 		});
 
 		// Final sort
-		finalProducts.sort((a, b) => {
-			// 1. sort by rank ascending
-			if (a.sortRank !== b.sortRank) {
-				return a.sortRank - b.sortRank;
-			}
-			// 2. within same rank, sort by subRank ascending
-			if (a.subRank !== b.subRank) {
-				return a.subRank - b.subRank;
-			}
-			// 3. tie-break => updatedAt descending
-			return new Date(b.updatedAt) - new Date(a.updatedAt);
-		});
+			finalProducts.sort((a, b) => {
+				// 1. sort by rank ascending
+				if (a.sortRank !== b.sortRank) {
+					return a.sortRank - b.sortRank;
+				}
+				// 2. within same rank, prioritize Serene Jannat store
+				if (a.storePriority !== b.storePriority) {
+					return a.storePriority - b.storePriority;
+				}
+				// 3. within same rank, sort by subRank ascending
+				if (a.subRank !== b.subRank) {
+					return a.subRank - b.subRank;
+				}
+				// 4. tie-break => updatedAt descending
+				return new Date(b.updatedAt) - new Date(a.updatedAt);
+			});
 
-		console.log(
-			finalProducts.length,
-			"finalProducts.length after custom sorting"
-		);
+			const totalRecords = finalProducts.length;
+			const paginatedProducts = finalProducts.slice(skip, skip + recordsPerPage);
 
-		// Return final response
-		res.json({
-			products: finalProducts,
-			totalRecords,
-			colors: colors.map((c) => c.color),
-			sizes: sizes.map((s) => s.size),
-			categories,
-			genders,
-			priceRange: priceRange || { minPrice: 0, maxPrice: 0 },
-		});
+			debugFilteredProducts(
+				paginatedProducts.length,
+				"finalProducts.length after custom sorting"
+			);
+
+			// Return final response
+			res.json({
+				products: paginatedProducts,
+				totalRecords,
+				colors: colors.map((c) => c.color).filter(Boolean),
+					sizes: sizes.map((s) => s.size).filter(Boolean),
+				categories,
+				genders,
+				stores,
+				priceRange: priceRange || { minPrice: 0, maxPrice: 0 },
+			});
 	} catch (err) {
 		console.error(err);
 		res.status(500).json({ error: err.message });
@@ -1538,6 +1910,124 @@ exports.autoCompleteProducts = async (req, res) => {
 		console.error("Error in autoCompleteProducts:", error);
 		return res.status(500).json({
 			error: "Server error occurred while fetching product suggestions.",
+		});
+	}
+};
+
+exports.listProductsForSeo = async (req, res) => {
+	try {
+		const page = Math.max(1, Number.parseInt(req.params.page || "1", 10) || 1);
+		const records = Math.min(
+			500,
+			Math.max(1, Number.parseInt(req.params.records || "100", 10) || 100)
+		);
+		const skip = (page - 1) * records;
+		const match = {
+			activeProduct: true,
+			activeProductBySeller: { $ne: false },
+		};
+
+		const [products, totalRecords] = await Promise.all([
+			Product.find(match)
+				.select(
+					"_id productName slug description price priceAfterDiscount price_unit quantity updatedAt createdAt brandName isPrintifyProduct category thumbnailImage printifyProductDetails productAttributes"
+				)
+				.populate(
+					"category",
+					"_id categoryName categorySlug categoryName_Arabic"
+				)
+				.sort({ updatedAt: -1 })
+				.skip(skip)
+				.limit(records)
+				.lean(),
+			Product.countDocuments(match),
+		]);
+
+		const MAX_SEO_THUMBNAIL_IMAGES = 4;
+		const MAX_SEO_ATTRIBUTE_IMAGES = 10;
+
+		const slimProducts = (products || []).map((product) => {
+			const safeThumbnailImage = Array.isArray(product?.thumbnailImage)
+				? product.thumbnailImage.slice(0, 2).map((thumb) => ({
+						...thumb,
+						images: Array.isArray(thumb?.images)
+							? thumb.images.slice(0, MAX_SEO_THUMBNAIL_IMAGES)
+							: [],
+					}))
+				: [];
+
+			const safePrintify = product?.printifyProductDetails
+				? {
+						POD: product.printifyProductDetails.POD,
+						title: product.printifyProductDetails.title,
+						description: product.printifyProductDetails.description,
+						options: Array.isArray(product.printifyProductDetails.options)
+							? product.printifyProductDetails.options.map((opt) => ({
+									name: opt?.name,
+									values: Array.isArray(opt?.values) ? opt.values : [],
+								}))
+							: [],
+					}
+				: {};
+
+			const safeProductAttributes = Array.isArray(product?.productAttributes)
+				? product.productAttributes.map((attr) => ({
+						PK: attr?.PK,
+						size: attr?.size,
+						color: attr?.color,
+						scent: attr?.scent,
+						price: attr?.price,
+						priceAfterDiscount: attr?.priceAfterDiscount,
+						quantity: attr?.quantity,
+						exampleDesignImage: attr?.exampleDesignImage || null,
+						productImages: Array.isArray(attr?.productImages)
+							? attr.productImages.slice(0, MAX_SEO_ATTRIBUTE_IMAGES)
+							: [],
+						defaultDesigns: Array.isArray(attr?.defaultDesigns)
+							? attr.defaultDesigns.map((designSet) => ({
+									occassion: designSet?.occassion || designSet?.occasion || "",
+									defaultDesignImages: Array.isArray(
+										designSet?.defaultDesignImages
+									)
+										? designSet.defaultDesignImages
+										: [],
+								}))
+							: [],
+					}))
+				: [];
+
+			return {
+				_id: product?._id,
+				productName: product?.productName,
+				slug: product?.slug,
+				description: product?.description,
+				price: product?.price,
+				priceAfterDiscount: product?.priceAfterDiscount,
+				price_unit: product?.price_unit,
+				quantity: product?.quantity,
+				updatedAt: product?.updatedAt,
+				createdAt: product?.createdAt,
+				brandName: product?.brandName,
+				isPrintifyProduct: product?.isPrintifyProduct,
+				category: product?.category || null,
+				thumbnailImage: safeThumbnailImage,
+				printifyProductDetails: safePrintify,
+				productAttributes: safeProductAttributes,
+			};
+		});
+
+		return res.json({
+			page,
+			records,
+			totalRecords,
+			hasMore: skip + slimProducts.length < totalRecords,
+			products: slimProducts,
+		});
+	} catch (error) {
+		console.error("Error in listProductsForSeo:", error);
+		return res.status(500).json({
+			error: "Server error while preparing SEO products.",
+			details: error?.message || "unknown_error",
 		});
 	}
 };

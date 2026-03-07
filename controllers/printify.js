@@ -1,4 +1,5 @@
-const axios = require("axios");
+﻿const axios = require("axios");
+const crypto = require("crypto");
 const Category = require("../models/category");
 const Product = require("../models/product");
 const slugify = require("slugify");
@@ -17,8 +18,2402 @@ cloudinary.config({
 
 const localYourDesignHerePath = path.join(
 	__dirname,
-	"../shopLogo/YourDesignHere.png"
+	"../shopLogo/YourDesignHere.png",
 );
+
+const PRINTIFY_TOKEN_ENV_KEYS = [
+	"PRINTIFY_API_TOKEN",
+	"DESIGN_PRINTIFY_TOKEN",
+	"PRINTIFY_TOKEN",
+];
+
+function parseJwtExpiryMs(token = "") {
+	try {
+		const [, payloadPart] = String(token).split(".");
+		if (!payloadPart) return null;
+		const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+		const payload = JSON.parse(
+			Buffer.from(normalized, "base64").toString("utf8"),
+		);
+		return Number.isFinite(payload?.exp) ? payload.exp * 1000 : null;
+	} catch {
+		return null;
+	}
+}
+
+function resolvePrintifyToken() {
+	const candidates = PRINTIFY_TOKEN_ENV_KEYS.map((key) => ({
+		key,
+		token: process.env[key]?.trim(),
+	})).filter((entry) => !!entry.token);
+
+	if (!candidates.length) {
+		return {
+			token: null,
+			error:
+				"Missing Printify token. Set PRINTIFY_API_TOKEN, DESIGN_PRINTIFY_TOKEN, or PRINTIFY_TOKEN.",
+		};
+	}
+
+	const now = Date.now();
+	const enriched = candidates.map((entry) => {
+		const expMs = parseJwtExpiryMs(entry.token);
+		return {
+			...entry,
+			expMs,
+			isExpired: Number.isFinite(expMs) ? expMs <= now : false,
+		};
+	});
+
+	const validToken = enriched.find((entry) => !entry.isExpired);
+	if (validToken) {
+		return { token: validToken.token, source: validToken.key, error: null };
+	}
+
+	const knownExpirations = enriched
+		.filter((entry) => Number.isFinite(entry.expMs))
+		.map(
+			(entry) =>
+				`${entry.key} expired at ${new Date(entry.expMs).toISOString()}`,
+		);
+
+	if (knownExpirations.length) {
+		return {
+			token: null,
+			error: `All configured Printify tokens are expired. ${knownExpirations.join(
+				"; ",
+			)}. Generate a new token in Printify and restart the backend.`,
+		};
+	}
+
+	return {
+		token: enriched[0].token,
+		source: enriched[0].key,
+		error: null,
+	};
+}
+
+async function deletePreviewProductById({
+	previewProductId,
+	shopIdHint,
+	printifyToken,
+	debugId = "preview-cleanup",
+}) {
+	if (!previewProductId || !printifyToken) {
+		return {
+			success: false,
+			deleted: false,
+			reason: "missing_product_or_token",
+		};
+	}
+
+	const tryDeleteInShop = async (shopId) => {
+		try {
+			await axios.delete(
+				`https://api.printify.com/v1/shops/${shopId}/products/${previewProductId}.json`,
+				{
+					headers: {
+						Authorization: `Bearer ${printifyToken}`,
+						"User-Agent": "NodeJS-App",
+					},
+				},
+			);
+			return { success: true, deleted: true, shopId };
+		} catch (error) {
+			const status = error?.response?.status;
+			if (status === 404) {
+				return { success: false, deleted: false, shopId, notFound: true };
+			}
+			throw error;
+		}
+	};
+
+	if (shopIdHint) {
+		const directResult = await tryDeleteInShop(shopIdHint);
+		if (directResult.deleted || directResult.notFound) return directResult;
+	}
+
+	const shopsResp = await axios.get("https://api.printify.com/v1/shops.json", {
+		headers: {
+			Authorization: `Bearer ${printifyToken}`,
+			"User-Agent": "NodeJS-App",
+		},
+	});
+	const shopIds = Array.isArray(shopsResp.data)
+		? shopsResp.data.map((shop) => shop.id).filter(Boolean)
+		: [];
+
+	for (const shopId of shopIds) {
+		const result = await tryDeleteInShop(shopId);
+		if (result.deleted) return result;
+	}
+
+	console.log(`[${debugId}] Preview product not found in any shop`, {
+		previewProductId,
+		triedShopIdHint: shopIdHint || null,
+		shopCount: shopIds.length,
+	});
+	return { success: true, deleted: false, notFound: true };
+}
+
+const POD_LIST_PREVIEW_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
+const POD_LIST_PREVIEW_SHOP_CACHE_TTL_MS = 1000 * 60 * 5; // 5 minutes
+const POD_LIST_PREVIEW_MAX_DB_ENTRIES = 12;
+const POD_LIST_PREVIEW_CACHE_VERSION = "v23";
+const POD_LIST_PREVIEW_STALE_AGE_MS = 1000 * 60 * 60 * 24 * 2; // 48 hours
+const POD_LIST_PREVIEW_STALE_CLEANUP_INTERVAL_MS = 1000 * 60 * 15; // 15 minutes
+const POD_LIST_PREVIEW_STALE_CLEANUP_MAX_PRODUCTS = 120;
+const POD_LIST_PREVIEW_STALE_CLEANUP_MAX_DELETES = 240;
+
+const podListPreviewMemoryCache = new Map();
+const podListPreviewInFlight = new Map();
+const podListPreviewShopCache = {
+	expiresAt: 0,
+	shopIds: [],
+};
+const podListStaleCleanupState = {
+	running: false,
+	lastRunAt: 0,
+	lastSummary: null,
+};
+let podListStaleCleanupTimer = null;
+
+const POD_LIST_DEFAULT_OCCASION = "Birthday";
+const POD_LIST_OCCASION_OPTIONS = [
+	{ value: "Birthday", icon: "\u{1F382}" },
+	{ value: "Anniversary", icon: "\u{1F49E}" },
+	{ value: "Wedding", icon: "\u{1F48D}" },
+	{ value: "Graduation", icon: "\u{1F393}" },
+	{ value: "Baby Shower", icon: "\u{1F37C}" },
+	{ value: "Bridal Shower", icon: "\u{1F470}" },
+	{ value: "Housewarming", icon: "\u{1F3E1}" },
+	{ value: "Mother's Day", icon: "\u{1F339}" },
+	{ value: "Father's Day", icon: "\u{1F9D4}" },
+	{ value: "Valentine's Day", icon: "\u{2764}\u{FE0F}" },
+	{ value: "Ramadan", icon: "\u{1F319}" },
+	{ value: "Eid", icon: "\u{2728}" },
+	{ value: "Christmas", icon: "\u{1F384}" },
+	{ value: "Thanksgiving", icon: "\u{1F983}" },
+	{ value: "Retirement", icon: "\u{1F334}" },
+	{ value: "Get Well Soon", icon: "\u{1F490}" },
+	{ value: "New Baby", icon: "\u{1F476}" },
+	{ value: "Just Because", icon: "\u{1F381}" },
+];
+
+const podListOccasionLookup = new Map(
+	POD_LIST_OCCASION_OPTIONS.flatMap((option) => {
+		const value = option.value;
+		const normalized = value.toLowerCase();
+		const slug = value
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/(^-|-$)/g, "");
+		return [
+			[normalized, value],
+			[slug, value],
+		];
+	}),
+);
+
+const podListGiftMessageMap = {
+	Birthday: {
+		withName: (name) => `Happy Birthday, ${name}!`,
+		withoutName: "Happy Birthday!",
+	},
+	Anniversary: {
+		withName: (name) => `Happy Anniversary, ${name}!`,
+		withoutName: "Happy Anniversary!",
+	},
+	Wedding: {
+		withName: (name) => `Congrats on your wedding, ${name}!`,
+		withoutName: "Congrats on your wedding!",
+	},
+	Graduation: {
+		withName: (name) => `Congrats, ${name} - you did it!`,
+		withoutName: "Congrats - you did it!",
+	},
+	"Baby Shower": {
+		withName: (name) => `Celebrating Baby ${name}!`,
+		withoutName: "Celebrating a new little one!",
+	},
+	"Bridal Shower": {
+		withName: (name) => `Showered with love, ${name}!`,
+		withoutName: "Showered with love!",
+	},
+	Housewarming: {
+		withName: (name) => `Home sweet home, ${name}!`,
+		withoutName: "Home sweet home!",
+	},
+	"Mother's Day": {
+		withName: (name) => `Happy Mother's Day, ${name}!`,
+		withoutName: "Happy Mother's Day!",
+	},
+	"Father's Day": {
+		withName: (name) => `Happy Father's Day, ${name}!`,
+		withoutName: "Happy Father's Day!",
+	},
+	"Valentine's Day": {
+		withName: (name) => `Happy Valentine's Day, ${name}!`,
+		withoutName: "Happy Valentine's Day!",
+	},
+	Ramadan: {
+		withName: (name) => `Ramadan Mubarak, ${name}!`,
+		withoutName: "Ramadan Mubarak!",
+	},
+	Eid: {
+		withName: (name) => `Eid Mubarak, ${name}!`,
+		withoutName: "Eid Mubarak!",
+	},
+	Christmas: {
+		withName: (name) => `Merry Christmas, ${name}!`,
+		withoutName: "Merry Christmas!",
+	},
+	Thanksgiving: {
+		withName: (name) => `Grateful for you, ${name}!`,
+		withoutName: "Grateful for you!",
+	},
+	Retirement: {
+		withName: (name) => `Happy Retirement, ${name}!`,
+		withoutName: "Happy Retirement!",
+	},
+	"Get Well Soon": {
+		withName: (name) => `Get well soon, ${name}!`,
+		withoutName: "Get well soon!",
+	},
+	"New Baby": {
+		withName: (name) => `Welcome baby ${name}!`,
+		withoutName: "Welcome, little one!",
+	},
+	"Just Because": {
+		withName: (name) => `Made with love for ${name}`,
+		withoutName: "Made with love",
+	},
+};
+
+const POD_LIST_BASE_PRESET = {
+	fontFamily: "'Playfair Display', Georgia, serif",
+	fontSize: 76,
+	fontWeight: "600",
+	fontStyle: "normal",
+	textColor: "#1f2937",
+	textShadowColor: "rgba(15, 23, 42, 0.16)",
+	backgroundColor: "#fff7ed",
+	panelGradientStart: "#fdfcf8",
+	panelGradientEnd: "#efe6dd",
+	panelBorderColor: "rgba(123, 79, 40, 0.18)",
+	borderRadius: 16,
+	accentIcon: "\u{1F381}",
+	accentTextColor: "#1f2937",
+	accentBackgroundColor: "#ffffff",
+	accentBackgroundColor2: "#f2ece3",
+	accentBorderColor: "rgba(31, 41, 55, 0.15)",
+	ornamentLeft: "\u2726",
+	ornamentRight: "\u2726",
+	ornamentColor: "rgba(120, 80, 40, 0.3)",
+};
+
+const POD_LIST_FALLBACK_DESIGN_URL =
+	"https://res.cloudinary.com/infiniteapps/image/upload/v1746381000/serene_janat/YourDesignHere2_zl9oqo.png";
+
+const POD_LIST_PRESETS = {
+	Birthday: {
+		fontFamily: "'Lobster', 'Playfair Display', serif",
+		textColor: "#8d3b1f",
+		textShadowColor: "rgba(109, 56, 20, 0.3)",
+		backgroundColor: "#fff3e8",
+		panelGradientStart: "#fff8ef",
+		panelGradientEnd: "#ffe9d6",
+		panelBorderColor: "rgba(180, 103, 56, 0.34)",
+		borderRadius: 26,
+		accentIcon: "\u{1F382}",
+		accentTextColor: "#8d3b1f",
+		accentBackgroundColor: "#fff6ed",
+		accentBackgroundColor2: "#ffe8d3",
+		accentBorderColor: "rgba(180, 103, 56, 0.35)",
+		ornamentLeft: "\u2726",
+		ornamentRight: "\u2726",
+		ornamentColor: "rgba(180, 103, 56, 0.55)",
+	},
+	Anniversary: {
+		fontFamily: "'Great Vibes', 'Dancing Script', serif",
+		textColor: "#8a1f4b",
+		textShadowColor: "rgba(111, 28, 56, 0.28)",
+		backgroundColor: "#fff1f5",
+		panelGradientStart: "#fff8fb",
+		panelGradientEnd: "#ffe0ef",
+		panelBorderColor: "rgba(177, 64, 112, 0.3)",
+		borderRadius: 30,
+		accentIcon: "\u{1F49E}",
+		accentBackgroundColor: "#fff4f8",
+		accentBackgroundColor2: "#ffe3ef",
+		accentBorderColor: "rgba(177, 64, 112, 0.34)",
+		ornamentLeft: "\u2665",
+		ornamentRight: "\u2665",
+		ornamentColor: "rgba(177, 64, 112, 0.5)",
+	},
+	Wedding: {
+		fontFamily: "'Great Vibes', 'Dancing Script', serif",
+		textColor: "#5a2ca8",
+		textShadowColor: "rgba(76, 29, 149, 0.3)",
+		backgroundColor: "#f7f2ff",
+		panelGradientStart: "#fcf9ff",
+		panelGradientEnd: "#ece3ff",
+		panelBorderColor: "rgba(106, 67, 176, 0.32)",
+		borderRadius: 32,
+		accentIcon: "\u{1F48D}",
+		accentBackgroundColor: "#faf7ff",
+		accentBackgroundColor2: "#e9ddff",
+		accentBorderColor: "rgba(106, 67, 176, 0.36)",
+		ornamentLeft: "\u2727",
+		ornamentRight: "\u2727",
+		ornamentColor: "rgba(106, 67, 176, 0.5)",
+	},
+	Graduation: {
+		fontFamily: "'Poppins', Verdana, sans-serif",
+		textColor: "#1e3a8a",
+		textShadowColor: "rgba(30, 58, 138, 0.26)",
+		backgroundColor: "#eef6ff",
+		panelGradientStart: "#f8fbff",
+		panelGradientEnd: "#deebff",
+		panelBorderColor: "rgba(53, 88, 181, 0.3)",
+		borderRadius: 18,
+		accentIcon: "\u{1F393}",
+		accentBackgroundColor: "#f5f9ff",
+		accentBackgroundColor2: "#d9e8ff",
+		accentBorderColor: "rgba(53, 88, 181, 0.34)",
+		ornamentLeft: "\u2726",
+		ornamentRight: "\u2726",
+		ornamentColor: "rgba(53, 88, 181, 0.48)",
+	},
+	"Baby Shower": {
+		fontFamily: "'Dancing Script', 'Playfair Display', serif",
+		textColor: "#1d4e89",
+		textShadowColor: "rgba(29, 78, 137, 0.24)",
+		backgroundColor: "#ecfeff",
+		panelGradientStart: "#f6feff",
+		panelGradientEnd: "#dff7ff",
+		panelBorderColor: "rgba(62, 138, 182, 0.3)",
+		borderRadius: 24,
+		accentIcon: "\u{1F37C}",
+		accentBackgroundColor: "#f4fdff",
+		accentBackgroundColor2: "#dbf3ff",
+		accentBorderColor: "rgba(62, 138, 182, 0.33)",
+		ornamentLeft: "\u2727",
+		ornamentRight: "\u2727",
+		ornamentColor: "rgba(62, 138, 182, 0.46)",
+	},
+	"Bridal Shower": {
+		fontFamily: "'Great Vibes', 'Dancing Script', serif",
+		textColor: "#6b21a8",
+		textShadowColor: "rgba(107, 33, 168, 0.28)",
+		backgroundColor: "#faf5ff",
+		panelGradientStart: "#fefbff",
+		panelGradientEnd: "#f0e2ff",
+		panelBorderColor: "rgba(125, 76, 191, 0.3)",
+		borderRadius: 28,
+		accentIcon: "\u{1F470}",
+		accentBackgroundColor: "#fcf8ff",
+		accentBackgroundColor2: "#ecddff",
+		accentBorderColor: "rgba(125, 76, 191, 0.34)",
+		ornamentLeft: "\u273f",
+		ornamentRight: "\u273f",
+		ornamentColor: "rgba(125, 76, 191, 0.46)",
+	},
+	Housewarming: {
+		fontFamily: "'Cormorant Garamond', Georgia, serif",
+		textColor: "#78350f",
+		textShadowColor: "rgba(120, 53, 15, 0.26)",
+		backgroundColor: "#fffbeb",
+		panelGradientStart: "#fffdf4",
+		panelGradientEnd: "#fcebc6",
+		panelBorderColor: "rgba(168, 119, 42, 0.31)",
+		borderRadius: 20,
+		accentIcon: "\u{1F3E1}",
+		accentBackgroundColor: "#fffdf2",
+		accentBackgroundColor2: "#f8ebcb",
+		accentBorderColor: "rgba(168, 119, 42, 0.35)",
+		ornamentLeft: "\u2726",
+		ornamentRight: "\u2726",
+		ornamentColor: "rgba(168, 119, 42, 0.5)",
+	},
+	"Mother's Day": {
+		fontFamily: "'Great Vibes', 'Dancing Script', serif",
+		textColor: "#9d174d",
+		textShadowColor: "rgba(157, 23, 77, 0.28)",
+		backgroundColor: "#fdf2f8",
+		panelGradientStart: "#fff7fb",
+		panelGradientEnd: "#ffdceb",
+		panelBorderColor: "rgba(189, 62, 125, 0.3)",
+		borderRadius: 30,
+		accentIcon: "\u{1F339}",
+		accentBackgroundColor: "#fff7fb",
+		accentBackgroundColor2: "#ffd9ea",
+		accentBorderColor: "rgba(189, 62, 125, 0.35)",
+		ornamentLeft: "\u273f",
+		ornamentRight: "\u273f",
+		ornamentColor: "rgba(189, 62, 125, 0.5)",
+	},
+	"Father's Day": {
+		fontFamily: "'Poppins', Verdana, sans-serif",
+		textColor: "#0f172a",
+		textShadowColor: "rgba(15, 23, 42, 0.26)",
+		backgroundColor: "#f1f5f9",
+		panelGradientStart: "#f9fbfd",
+		panelGradientEnd: "#e2eaf4",
+		panelBorderColor: "rgba(70, 94, 124, 0.28)",
+		borderRadius: 16,
+		accentIcon: "\u{1F9D4}",
+		accentBackgroundColor: "#f8fbff",
+		accentBackgroundColor2: "#e3ecf7",
+		accentBorderColor: "rgba(70, 94, 124, 0.32)",
+		ornamentLeft: "\u2726",
+		ornamentRight: "\u2726",
+		ornamentColor: "rgba(70, 94, 124, 0.46)",
+	},
+	"Valentine's Day": {
+		fontFamily: "'Great Vibes', 'Dancing Script', serif",
+		textColor: "#881337",
+		textShadowColor: "rgba(136, 19, 55, 0.28)",
+		backgroundColor: "#fff1f2",
+		panelGradientStart: "#fff7f9",
+		panelGradientEnd: "#ffdce5",
+		panelBorderColor: "rgba(176, 45, 89, 0.31)",
+		borderRadius: 32,
+		accentIcon: "\u{2764}\u{FE0F}",
+		accentBackgroundColor: "#fff8fb",
+		accentBackgroundColor2: "#ffd8e5",
+		accentBorderColor: "rgba(176, 45, 89, 0.35)",
+		ornamentLeft: "\u2665",
+		ornamentRight: "\u2665",
+		ornamentColor: "rgba(176, 45, 89, 0.52)",
+	},
+	Ramadan: {
+		fontFamily: "'Cormorant Garamond', 'Amiri', Georgia, serif",
+		fontStyle: "normal",
+		fontWeight: "700",
+		textColor: "#14532d",
+		textShadowColor: "rgba(20, 83, 45, 0.26)",
+		backgroundColor: "#ecfdf5",
+		panelGradientStart: "#f7fff9",
+		panelGradientEnd: "#d7f8e7",
+		panelBorderColor: "rgba(38, 130, 78, 0.29)",
+		borderRadius: 24,
+		textSizeBoost: 1.16,
+		iconScaleBoost: 1.12,
+		panelScaleX: 1.07,
+		panelScaleY: 1.09,
+		accentIcon: "\u{1F319}",
+		accentBackgroundColor: "#f5fff8",
+		accentBackgroundColor2: "#d4f6e2",
+		accentBorderColor: "rgba(38, 130, 78, 0.33)",
+		ornamentLeft: "\u2727",
+		ornamentRight: "\u2727",
+		ornamentColor: "rgba(38, 130, 78, 0.46)",
+	},
+	Eid: {
+		fontFamily: "'Playfair Display', 'Dancing Script', serif",
+		textColor: "#4c1d95",
+		textShadowColor: "rgba(76, 29, 149, 0.28)",
+		backgroundColor: "#f5f3ff",
+		panelGradientStart: "#fbfaff",
+		panelGradientEnd: "#e8ddff",
+		panelBorderColor: "rgba(105, 67, 173, 0.3)",
+		borderRadius: 30,
+		accentIcon: "\u{2728}",
+		accentBackgroundColor: "#faf8ff",
+		accentBackgroundColor2: "#e7ddff",
+		accentBorderColor: "rgba(105, 67, 173, 0.34)",
+		ornamentLeft: "\u2728",
+		ornamentRight: "\u2728",
+		ornamentColor: "rgba(105, 67, 173, 0.48)",
+	},
+	Christmas: {
+		fontFamily: "'Cormorant Garamond', Georgia, serif",
+		fontWeight: "600",
+		textColor: "#174b34",
+		textShadowColor: "rgba(20, 83, 45, 0.18)",
+		backgroundColor: "#f0fdf4",
+		panelGradientStart: "#f4fbf6",
+		panelGradientEnd: "#dfece3",
+		panelBorderColor: "rgba(29, 87, 60, 0.22)",
+		borderRadius: 18,
+		accentIcon: "\u{1F384}",
+		accentBackgroundColor: "#f6fbf7",
+		accentBackgroundColor2: "#dfece3",
+		accentBorderColor: "rgba(29, 87, 60, 0.22)",
+		ornamentLeft: "\u2736",
+		ornamentRight: "\u2736",
+		ornamentColor: "rgba(29, 87, 60, 0.32)",
+	},
+	Thanksgiving: {
+		fontFamily: "'Cormorant Garamond', 'Times New Roman', serif",
+		textColor: "#7c2d12",
+		textShadowColor: "rgba(124, 45, 18, 0.28)",
+		backgroundColor: "#fff7ed",
+		panelGradientStart: "#fffaf1",
+		panelGradientEnd: "#ffe8ce",
+		panelBorderColor: "rgba(167, 103, 49, 0.31)",
+		borderRadius: 20,
+		accentIcon: "\u{1F983}",
+		accentBackgroundColor: "#fff9f0",
+		accentBackgroundColor2: "#ffe6c7",
+		accentBorderColor: "rgba(167, 103, 49, 0.35)",
+		ornamentLeft: "\u2726",
+		ornamentRight: "\u2726",
+		ornamentColor: "rgba(167, 103, 49, 0.5)",
+	},
+	Retirement: {
+		fontFamily: "'Playfair Display', Georgia, serif",
+		textColor: "#0f172a",
+		textShadowColor: "rgba(15, 23, 42, 0.24)",
+		backgroundColor: "#f8fafc",
+		panelGradientStart: "#fdfefe",
+		panelGradientEnd: "#e6edf5",
+		panelBorderColor: "rgba(96, 117, 142, 0.28)",
+		borderRadius: 22,
+		accentIcon: "\u{1F334}",
+		accentBackgroundColor: "#fcfeff",
+		accentBackgroundColor2: "#e6eef7",
+		accentBorderColor: "rgba(96, 117, 142, 0.33)",
+		ornamentLeft: "\u2727",
+		ornamentRight: "\u2727",
+		ornamentColor: "rgba(96, 117, 142, 0.45)",
+	},
+	"Get Well Soon": {
+		fontFamily: "'Poppins', Verdana, sans-serif",
+		textColor: "#166534",
+		textShadowColor: "rgba(22, 101, 52, 0.24)",
+		backgroundColor: "#f0fdf4",
+		panelGradientStart: "#f8fff9",
+		panelGradientEnd: "#dcf7e3",
+		panelBorderColor: "rgba(54, 140, 83, 0.28)",
+		borderRadius: 20,
+		accentIcon: "\u{1F490}",
+		accentBackgroundColor: "#f7fff9",
+		accentBackgroundColor2: "#d8f3df",
+		accentBorderColor: "rgba(54, 140, 83, 0.33)",
+		ornamentLeft: "\u2727",
+		ornamentRight: "\u2727",
+		ornamentColor: "rgba(54, 140, 83, 0.44)",
+	},
+	"New Baby": {
+		fontFamily: "'Dancing Script', 'Playfair Display', serif",
+		textColor: "#0c4a6e",
+		textShadowColor: "rgba(12, 74, 110, 0.24)",
+		backgroundColor: "#eff6ff",
+		panelGradientStart: "#f8fbff",
+		panelGradientEnd: "#dcecff",
+		panelBorderColor: "rgba(68, 135, 182, 0.28)",
+		borderRadius: 26,
+		accentIcon: "\u{1F476}",
+		accentBackgroundColor: "#f7fbff",
+		accentBackgroundColor2: "#dbeaff",
+		accentBorderColor: "rgba(68, 135, 182, 0.32)",
+		ornamentLeft: "\u2728",
+		ornamentRight: "\u2728",
+		ornamentColor: "rgba(68, 135, 182, 0.45)",
+	},
+	"Just Because": {
+		fontFamily: "'Playfair Display', Georgia, serif",
+		textColor: "#334155",
+		textShadowColor: "rgba(51, 65, 85, 0.22)",
+		backgroundColor: "#f8fafc",
+		panelGradientStart: "#fdfefe",
+		panelGradientEnd: "#e8eef5",
+		panelBorderColor: "rgba(105, 123, 149, 0.28)",
+		borderRadius: 18,
+		accentIcon: "\u{1F381}",
+		accentBackgroundColor: "#fcfdff",
+		accentBackgroundColor2: "#e7edf6",
+		accentBorderColor: "rgba(105, 123, 149, 0.32)",
+		ornamentLeft: "\u2726",
+		ornamentRight: "\u2726",
+		ornamentColor: "rgba(105, 123, 149, 0.44)",
+	},
+};
+
+function normalizePodListOccasion(value) {
+	if (!value || typeof value !== "string") return POD_LIST_DEFAULT_OCCASION;
+	let decoded = String(value);
+	try {
+		decoded = decodeURIComponent(decoded);
+	} catch {
+		decoded = String(value);
+	}
+	const trimmed = decoded.trim();
+	if (!trimmed) return POD_LIST_DEFAULT_OCCASION;
+	return (
+		podListOccasionLookup.get(trimmed.toLowerCase()) ||
+		POD_LIST_DEFAULT_OCCASION
+	);
+}
+
+function sanitizePodListName(value) {
+	if (typeof value !== "string") return "";
+	let decoded = String(value);
+	try {
+		decoded = decodeURIComponent(decoded.replace(/\+/g, "%20"));
+	} catch {
+		decoded = String(value).replace(/\+/g, " ");
+	}
+	const normalized = decoded
+		.replace(/\+/g, " ")
+		.replace(/[\r\n\t]/g, " ")
+		.trim();
+	return normalized.slice(0, 40);
+}
+
+function buildPodListGiftMessage(occasion, name) {
+	const safeOccasion = normalizePodListOccasion(occasion);
+	const safeName = sanitizePodListName(name);
+	const template = podListGiftMessageMap[safeOccasion];
+	if (!template) {
+		return safeName ? `Made with love for ${safeName}` : "Made with love";
+	}
+	return safeName ? template.withName(safeName) : template.withoutName;
+}
+
+function getPodListPreset(occasion) {
+	const safeOccasion = normalizePodListOccasion(occasion);
+	return {
+		...POD_LIST_BASE_PRESET,
+		...(POD_LIST_PRESETS[safeOccasion] || {}),
+	};
+}
+
+function normalizePodListProductName(product = {}) {
+	return String(product?.productName || product?.title || "").toLowerCase();
+}
+
+function getPodListProductKind(product = {}) {
+	const normalizedName = normalizePodListProductName(product);
+	const isApparel =
+		normalizedName.includes("t-shirt") ||
+		normalizedName.includes("tee") ||
+		(normalizedName.includes("shirt") &&
+			!normalizedName.includes("sweatshirt"));
+	const isHoodieLike =
+		normalizedName.includes("hoodie") ||
+		normalizedName.includes("sweatshirt") ||
+		normalizedName.includes("pullover");
+	const isMug = normalizedName.includes("mug");
+	const isTote = normalizedName.includes("tote");
+	const isWeekender =
+		normalizedName.includes("weekender") || normalizedName.includes("bag");
+	const isPillow = normalizedName.includes("pillow");
+	const isMagnet = normalizedName.includes("magnet");
+	const isCandle = normalizedName.includes("candle");
+	if (isApparel) return "apparel";
+	if (isHoodieLike) return "hoodie";
+	if (isMug) return "mug";
+	if (isTote) return "tote";
+	if (isWeekender) return "bag";
+	if (isPillow) return "pillow";
+	if (isMagnet) return "magnet";
+	if (isCandle) return "candle";
+	return "default";
+}
+
+function scorePodListPlaceholder(placeholder = {}, product = {}) {
+	const position = String(placeholder?.position || "").toLowerCase();
+	const hasImage =
+		Array.isArray(placeholder?.images) && placeholder.images.length > 0;
+	const kind = getPodListProductKind(product);
+	let score = 0;
+
+	if (hasImage) score += 4;
+	if (position.includes("front")) score += 12;
+	if (position.includes("center")) score += 7;
+	if (position.includes("default")) score += 4;
+	if (position.includes("full")) score += 5;
+	if (position.includes("back")) score -= 6;
+	if (position.includes("sleeve")) score -= 8;
+	if (position.includes("neck")) score -= 7;
+
+	if (kind === "mug") {
+		if (position.includes("wrap")) score += 8;
+		if (position.includes("front")) score += 7;
+		if (position.includes("left") || position.includes("right")) score -= 2;
+	}
+
+	if (kind === "apparel" || kind === "hoodie") {
+		if (position.includes("front")) score += 8;
+		if (position.includes("center")) score += 5;
+		if (position.includes("left_chest") || position.includes("right_chest"))
+			score -= 6;
+		if (position.includes("pocket")) score -= 5;
+	}
+
+	if (
+		kind === "tote" ||
+		kind === "bag" ||
+		kind === "pillow" ||
+		kind === "magnet"
+	) {
+		if (position.includes("front")) score += 8;
+	}
+
+	return score;
+}
+
+function pickBestPodListPlaceholder(placeholders = [], product = {}) {
+	const safe = Array.isArray(placeholders) ? placeholders : [];
+	if (!safe.length) return null;
+	const kind = getPodListProductKind(product);
+	let candidates = [...safe];
+	if (
+		kind === "apparel" ||
+		kind === "hoodie" ||
+		kind === "bag" ||
+		kind === "pillow" ||
+		kind === "candle"
+	) {
+		const frontPreferred = candidates.filter((placeholder) => {
+			const position = String(placeholder?.position || "").toLowerCase();
+			return (
+				position.includes("front") ||
+				position.includes("center") ||
+				position.includes("default") ||
+				position.includes("full")
+			);
+		});
+		if (frontPreferred.length) {
+			candidates = frontPreferred;
+		}
+	}
+	return candidates.sort(
+		(a, b) =>
+			scorePodListPlaceholder(b, product) - scorePodListPlaceholder(a, product),
+	)[0];
+}
+
+function getPodListPlacementDefaults(product = {}, positionInput = "") {
+	const kind = getPodListProductKind(product);
+	const position = String(positionInput || "").toLowerCase();
+	let base;
+
+	switch (kind) {
+		case "apparel":
+			base = { x: 0.5, y: 0.39, scale: 1.18, angle: 0 };
+			break;
+		case "hoodie":
+			base = { x: 0.5, y: 0.37, scale: 1.16, angle: 0 };
+			break;
+		case "tote":
+			base = { x: 0.5, y: 0.47, scale: 1.26, angle: 0 };
+			break;
+		case "bag":
+			base = { x: 0.5, y: 0.16, scale: 0.64, angle: 0 };
+			break;
+		case "mug":
+			base = { x: 0.5, y: 0.5, scale: 0.86, angle: 0 };
+			break;
+		case "pillow":
+			base = { x: 0.25, y: 0.5, scale: 0.56, angle: 0 };
+			break;
+		case "magnet":
+			base = { x: 0.5, y: 0.5, scale: 0.9, angle: 0 };
+			break;
+		case "candle":
+			base = { x: 0.5, y: 0.5, scale: 1.72, angle: 0 };
+			break;
+		default:
+			base = { x: 0.5, y: 0.5, scale: 1.02, angle: 0 };
+	}
+
+	if (position.includes("left_chest")) {
+		return {
+			x: 0.38,
+			y: 0.34,
+			scale: Math.min(0.64, base.scale * 0.58),
+			angle: 0,
+		};
+	}
+	if (position.includes("right_chest")) {
+		return {
+			x: 0.62,
+			y: 0.34,
+			scale: Math.min(0.64, base.scale * 0.58),
+			angle: 0,
+		};
+	}
+	if (position.includes("sleeve")) {
+		return {
+			x: position.includes("left") ? 0.23 : 0.77,
+			y: 0.38,
+			scale: Math.min(0.48, base.scale * 0.44),
+			angle: 0,
+		};
+	}
+	if (position.includes("back")) {
+		return {
+			...base,
+			y: Math.min(0.5, base.y + 0.02),
+			scale: base.scale * 0.95,
+		};
+	}
+	return base;
+}
+
+function getPodPreviewPlacementBoost(product = {}, positionInput = "") {
+	const kind = getPodListProductKind(product);
+	const position = String(positionInput || "").toLowerCase();
+	let boost = 1.22;
+
+	if (kind === "apparel") boost = 1.58;
+	else if (kind === "hoodie") boost = 1.52;
+	else if (kind === "tote") boost = 1.32;
+	else if (kind === "bag") boost = 1;
+	else if (kind === "mug") boost = 1.24;
+	else if (kind === "pillow") boost = 1.0;
+	else if (kind === "magnet") boost = 1.2;
+	else if (kind === "candle") boost = 1.26;
+
+	if (
+		position.includes("left_chest") ||
+		position.includes("right_chest") ||
+		position.includes("sleeve")
+	) {
+		boost *= 0.8;
+	}
+	if (position.includes("back")) {
+		boost *= 0.9;
+	}
+
+	return Math.max(1, Math.min(1.9, boost));
+}
+
+function getPodListOccasionScaleBoost(occasion = "", product = {}) {
+	const safeOccasion = normalizePodListOccasion(occasion);
+	if (safeOccasion !== "Ramadan") return 1;
+	const kind = getPodListProductKind(product);
+	let boost = 1.1;
+	if (kind === "apparel") boost = 1.14;
+	else if (kind === "hoodie") boost = 1.14;
+	else if (kind === "tote") boost = 1.1;
+	else if (kind === "bag") boost = 1.04;
+	else if (kind === "mug") boost = 1.08;
+	else if (kind === "pillow" || kind === "magnet") boost = 1.04;
+	else if (kind === "candle") boost = 1.18;
+	return Math.max(1, Math.min(1.6, boost));
+}
+
+function getFullPrintAreaPreviewScale(product = {}, positionInput = "") {
+	const kind = getPodListProductKind(product);
+	const position = String(positionInput || "").toLowerCase();
+	let scale = 1.45;
+
+	if (kind === "apparel") scale = 1.72;
+	else if (kind === "hoodie") scale = 1.66;
+	else if (kind === "tote") scale = 1.38;
+	else if (kind === "bag") scale = 1.34;
+	else if (kind === "mug") scale = 1.24;
+	else if (kind === "pillow" || kind === "magnet") scale = 1.2;
+	else if (kind === "candle") scale = 1.86;
+
+	if (
+		position.includes("left_chest") ||
+		position.includes("right_chest") ||
+		position.includes("sleeve")
+	) {
+		scale *= 0.84;
+	}
+	if (position.includes("back")) {
+		scale *= 0.92;
+	}
+
+	return Math.max(1.08, Math.min(2.2, scale));
+}
+
+function resolvePodListPlacementFromSource({ sourceImage, placementDefaults }) {
+	const sourceX = Number(sourceImage?.x);
+	const sourceY = Number(sourceImage?.y);
+	const sourceScale = Number(sourceImage?.scale);
+	const sourceAngle = Number(sourceImage?.angle);
+	const hasValidSourcePlacement =
+		Number.isFinite(sourceX) &&
+		Number.isFinite(sourceY) &&
+		Number.isFinite(sourceScale) &&
+		sourceX >= 0 &&
+		sourceX <= 1 &&
+		sourceY >= 0 &&
+		sourceY <= 1 &&
+		sourceScale >= 0.18 &&
+		sourceScale <= 2.6;
+	const baseScale = Number(placementDefaults.scale || 0.88);
+	const sourceNearExpectedArea =
+		hasValidSourcePlacement &&
+		Math.abs(sourceX - Number(placementDefaults.x || 0.5)) <= 0.2 &&
+		Math.abs(sourceY - Number(placementDefaults.y || 0.5)) <= 0.22;
+	const minAcceptedScale = Math.max(0.42, baseScale * 0.9);
+	const maxAcceptedScale = Math.max(1.26, baseScale * 1.16);
+	const sourcePlacementIsTooSmall =
+		hasValidSourcePlacement && sourceScale < minAcceptedScale;
+	const sourcePlacementIsTooLarge =
+		hasValidSourcePlacement && sourceScale > maxAcceptedScale;
+	const useSourcePlacement =
+		hasValidSourcePlacement &&
+		sourceNearExpectedArea &&
+		!sourcePlacementIsTooSmall &&
+		!sourcePlacementIsTooLarge;
+	const finalX = useSourcePlacement
+		? sourceX
+		: Number(placementDefaults.x || 0.5);
+	const finalY = useSourcePlacement
+		? sourceY
+		: Number(placementDefaults.y || 0.5);
+	const finalScale = useSourcePlacement
+		? Math.min(maxAcceptedScale, Math.max(minAcceptedScale, sourceScale))
+		: baseScale;
+	const finalAngle = useSourcePlacement
+		? Number.isFinite(sourceAngle)
+			? sourceAngle
+			: 0
+		: Number(placementDefaults.angle || 0);
+
+	return {
+		finalX,
+		finalY,
+		finalScale,
+		finalAngle,
+		hasValidSourcePlacement,
+		sourceNearExpectedArea,
+		sourcePlacementIsTooSmall,
+		sourcePlacementIsTooLarge,
+		minAcceptedScale,
+		maxAcceptedScale,
+		useSourcePlacement,
+		sourcePlacement: {
+			x: Number.isFinite(sourceX) ? sourceX : null,
+			y: Number.isFinite(sourceY) ? sourceY : null,
+			scale: Number.isFinite(sourceScale) ? sourceScale : null,
+			angle: Number.isFinite(sourceAngle) ? sourceAngle : null,
+		},
+	};
+}
+
+function getPodListDesignLayout(product = {}) {
+	const kind = getPodListProductKind(product);
+	switch (kind) {
+		case "apparel":
+			return {
+				canvasWidth: 1400,
+				canvasHeight: 920,
+				maxCharsPerLine: 15,
+				maxLines: 2,
+				lineHeight: 92,
+				textFontSize: 98,
+				textBaseY: 544,
+				textX: 700,
+				iconCx: 700,
+				iconCy: 300,
+				iconR: 50,
+				iconFontSize: 44,
+				panelX: 270,
+				panelY: 372,
+				panelWidth: 860,
+				panelHeight: 246,
+				panelRadius: 56,
+				panelStrokeWidth: 6,
+			};
+		case "hoodie":
+			return {
+				canvasWidth: 1480,
+				canvasHeight: 980,
+				maxCharsPerLine: 15,
+				maxLines: 2,
+				lineHeight: 92,
+				textFontSize: 96,
+				textBaseY: 572,
+				textX: 740,
+				iconCx: 740,
+				iconCy: 322,
+				iconR: 52,
+				iconFontSize: 46,
+				panelX: 286,
+				panelY: 404,
+				panelWidth: 908,
+				panelHeight: 252,
+				panelRadius: 58,
+				panelStrokeWidth: 6,
+			};
+		case "tote":
+			return {
+				canvasWidth: 1380,
+				canvasHeight: 1060,
+				maxCharsPerLine: 15,
+				maxLines: 2,
+				lineHeight: 88,
+				textFontSize: 90,
+				textBaseY: 620,
+				textX: 690,
+				iconCx: 690,
+				iconCy: 340,
+				iconR: 46,
+				iconFontSize: 42,
+				panelX: 264,
+				panelY: 448,
+				panelWidth: 852,
+				panelHeight: 236,
+				panelRadius: 52,
+				panelStrokeWidth: 6,
+			};
+		case "bag":
+			return {
+				canvasWidth: 1460,
+				canvasHeight: 1040,
+				maxCharsPerLine: 15,
+				maxLines: 2,
+				lineHeight: 86,
+				textFontSize: 88,
+				textBaseY: 602,
+				textX: 730,
+				iconCx: 730,
+				iconCy: 332,
+				iconR: 46,
+				iconFontSize: 42,
+				panelX: 286,
+				panelY: 432,
+				panelWidth: 888,
+				panelHeight: 230,
+				panelRadius: 50,
+				panelStrokeWidth: 6,
+			};
+		case "mug":
+			return {
+				canvasWidth: 1320,
+				canvasHeight: 980,
+				maxCharsPerLine: 19,
+				maxLines: 2,
+				lineHeight: 86,
+				textFontSize: 84,
+				textBaseY: 560,
+				textX: 660,
+				iconCx: 660,
+				iconCy: 326,
+				iconR: 46,
+				iconFontSize: 40,
+				panelX: 320,
+				panelY: 430,
+				panelWidth: 680,
+				panelHeight: 238,
+				panelRadius: 54,
+				panelStrokeWidth: 5,
+			};
+		case "pillow":
+			return {
+				canvasWidth: 1600,
+				canvasHeight: 1600,
+				maxCharsPerLine: 18,
+				maxLines: 2,
+				lineHeight: 84,
+				textFontSize: 70,
+				textBaseY: 930,
+				textX: 800,
+				iconCx: 800,
+				iconCy: 618,
+				iconR: 54,
+				iconFontSize: 50,
+				panelX: 360,
+				panelY: 760,
+				panelWidth: 880,
+				panelHeight: 284,
+				panelRadius: 90,
+				panelStrokeWidth: 6,
+			};
+		case "magnet":
+			return {
+				canvasWidth: 1600,
+				canvasHeight: 1600,
+				maxCharsPerLine: 22,
+				maxLines: 3,
+				lineHeight: 90,
+				textFontSize: 78,
+				textBaseY: 920,
+				textX: 800,
+				iconCx: 800,
+				iconCy: 566,
+				iconR: 64,
+				iconFontSize: 58,
+				panelX: 252,
+				panelY: 716,
+				panelWidth: 1096,
+				panelHeight: 308,
+				panelRadius: 74,
+				panelStrokeWidth: 6,
+			};
+		case "candle":
+			return {
+				canvasWidth: 1480,
+				canvasHeight: 1120,
+				maxCharsPerLine: 20,
+				maxLines: 2,
+				lineHeight: 94,
+				textFontSize: 96,
+				textBaseY: 600,
+				textX: 740,
+				iconCx: 740,
+				iconCy: 268,
+				iconR: 58,
+				iconFontSize: 52,
+				panelX: 120,
+				panelY: 280,
+				panelWidth: 1240,
+				panelHeight: 560,
+				panelRadius: 110,
+				panelStrokeWidth: 7,
+			};
+		default:
+			return {
+				canvasWidth: 1640,
+				canvasHeight: 1240,
+				maxCharsPerLine: 22,
+				maxLines: 2,
+				lineHeight: 96,
+				textFontSize: 84,
+				textBaseY: 678,
+				textX: 820,
+				iconCx: 820,
+				iconCy: 326,
+				iconR: 58,
+				iconFontSize: 52,
+				panelX: 268,
+				panelY: 458,
+				panelWidth: 1104,
+				panelHeight: 228,
+				panelRadius: 58,
+				panelStrokeWidth: 6,
+			};
+	}
+}
+
+function escapeForSvg(text = "") {
+	return String(text)
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#39;");
+}
+
+function splitPodListSvgLines(message, maxCharsPerLine = 22, maxLines = 3) {
+	const safeMaxChars = Math.max(6, Number(maxCharsPerLine) || 22);
+	const safeMaxLines = Math.max(1, Number(maxLines) || 3);
+	const words = String(message || "")
+		.trim()
+		.split(/\s+/)
+		.filter(Boolean);
+	if (!words.length) return ["Made with love"];
+
+	const wrapByCharLimit = (limit) => {
+		const safeLimit = Math.max(6, Number(limit) || safeMaxChars);
+		const wrapped = [];
+		let current = "";
+		for (const word of words) {
+			const tentative = current ? `${current} ${word}` : word;
+			if (!current || tentative.length <= safeLimit) {
+				current = tentative;
+				continue;
+			}
+			wrapped.push(current);
+			current = word;
+		}
+		if (current) wrapped.push(current);
+		return wrapped;
+	};
+
+	const initialLines = wrapByCharLimit(safeMaxChars);
+	if (initialLines.length <= safeMaxLines) {
+		return initialLines;
+	}
+
+	// Keep full message by expanding line capacity before any truncation.
+	const totalChars = words.join(" ").length;
+	let adaptiveLimit = Math.max(
+		safeMaxChars,
+		Math.ceil(totalChars / safeMaxLines),
+	);
+	let adaptiveLines = initialLines;
+	const maxAdaptiveLimit = Math.max(
+		adaptiveLimit,
+		safeMaxChars * 4,
+		totalChars,
+	);
+	while (
+		adaptiveLines.length > safeMaxLines &&
+		adaptiveLimit <= maxAdaptiveLimit
+	) {
+		adaptiveLines = wrapByCharLimit(adaptiveLimit);
+		if (adaptiveLines.length <= safeMaxLines) {
+			return adaptiveLines;
+		}
+		adaptiveLimit += 1;
+	}
+
+	// Final fallback: preserve all text by merging the remaining content into
+	// the last line instead of adding ellipsis.
+	const mergedLines = adaptiveLines.slice(0, safeMaxLines);
+	mergedLines[safeMaxLines - 1] = adaptiveLines
+		.slice(safeMaxLines - 1)
+		.join(" ");
+	return mergedLines;
+}
+
+function buildPodListDesignSvgDataUri({ message, preset, product }) {
+	const safeIcon = escapeForSvg(preset.accentIcon || "\u{1F381}");
+	const safeTextColor = escapeForSvg(preset.textColor || "#1f2937");
+	const safeBackgroundColor = escapeForSvg(preset.backgroundColor || "#fff7ed");
+	const safePanelGradientStart = escapeForSvg(
+		preset.panelGradientStart || preset.backgroundColor || "#fff7ed",
+	);
+	const safePanelGradientEnd = escapeForSvg(
+		preset.panelGradientEnd || preset.backgroundColor || "#ffe7d6",
+	);
+	const safePanelBorderColor = escapeForSvg(
+		preset.panelBorderColor ||
+			preset.accentBorderColor ||
+			"rgba(31, 41, 55, 0.2)",
+	);
+	const safeTextShadowColor = escapeForSvg(
+		preset.textShadowColor || "rgba(15, 23, 42, 0.22)",
+	);
+	const safeAccentTextColor = escapeForSvg(preset.accentTextColor || "#1f2937");
+	const safeAccentBackgroundColor = escapeForSvg(
+		preset.accentBackgroundColor || "#ffffff",
+	);
+	const safeAccentBackgroundColor2 = escapeForSvg(
+		preset.accentBackgroundColor2 || preset.accentBackgroundColor || "#f3f4f6",
+	);
+	const safeBorderColor = escapeForSvg(
+		preset.accentBorderColor || "rgba(31, 41, 55, 0.18)",
+	);
+	const safeOrnamentLeft = escapeForSvg(preset.ornamentLeft || "\u2726");
+	const safeOrnamentRight = escapeForSvg(preset.ornamentRight || "\u2726");
+	const safeOrnamentColor = escapeForSvg(
+		preset.ornamentColor || "rgba(120, 80, 40, 0.42)",
+	);
+	const safeFontFamily = escapeForSvg(preset.fontFamily || "Georgia, serif");
+	const safeFontWeight = escapeForSvg(String(preset.fontWeight || "700"));
+	const safeFontStyle = escapeForSvg(preset.fontStyle || "normal");
+	const layout = getPodListDesignLayout(product);
+	const canvasWidth = Number(layout.canvasWidth) || 1600;
+	const canvasHeight = Number(layout.canvasHeight) || 1600;
+	const textSizeBoost = Number.isFinite(Number(preset.textSizeBoost))
+		? Number(preset.textSizeBoost)
+		: 1;
+	const iconScaleBoost = Number.isFinite(Number(preset.iconScaleBoost))
+		? Number(preset.iconScaleBoost)
+		: 1;
+	const panelScaleX = Number.isFinite(Number(preset.panelScaleX))
+		? Number(preset.panelScaleX)
+		: 1;
+	const panelScaleY = Number.isFinite(Number(preset.panelScaleY))
+		? Number(preset.panelScaleY)
+		: 1;
+	const lineHeightScale = Number.isFinite(Number(preset.lineHeightScale))
+		? Number(preset.lineHeightScale)
+		: 1;
+	const borderRadius = Number.isFinite(Number(preset.borderRadius))
+		? Number(preset.borderRadius)
+		: 18;
+	const baseMaxCharsPerLine = Number(layout.maxCharsPerLine) || 22;
+	const maxLines = Number(layout.maxLines) || 2;
+	const rawTextLines = splitPodListSvgLines(
+		String(message || "Made with love"),
+		baseMaxCharsPerLine,
+		maxLines,
+	);
+	const textLines = rawTextLines.map((line) => escapeForSvg(line));
+	const longestLineCharCount = rawTextLines.reduce(
+		(max, line) => Math.max(max, String(line || "").length),
+		0,
+	);
+	const lineCompressionScale =
+		longestLineCharCount > baseMaxCharsPerLine
+			? Math.max(
+					0.62,
+					baseMaxCharsPerLine /
+						Math.max(baseMaxCharsPerLine, longestLineCharCount),
+				)
+			: 1;
+	const baseLineHeight = Number(layout.lineHeight) || 132;
+	const lineHeight = Math.max(
+		58,
+		Math.round(baseLineHeight * lineHeightScale * lineCompressionScale),
+	);
+	const basePanelX = Number(layout.panelX) || Math.round(canvasWidth * 0.06);
+	const basePanelY = Number(layout.panelY) || Math.round(canvasHeight * 0.36);
+	const basePanelWidth =
+		Number(layout.panelWidth) || Math.round(canvasWidth - basePanelX * 2);
+	const basePanelHeight =
+		Number(layout.panelHeight) || Math.round(canvasHeight * 0.46);
+	const panelWidth = Math.min(
+		Math.round(canvasWidth * 0.94),
+		Math.max(260, Math.round(basePanelWidth * panelScaleX)),
+	);
+	const panelHeight = Math.min(
+		Math.round(canvasHeight * 0.72),
+		Math.max(120, Math.round(basePanelHeight * panelScaleY)),
+	);
+	const panelX = Math.round((canvasWidth - panelWidth) / 2);
+	const panelY = Math.max(
+		0,
+		Math.round(basePanelY - (panelHeight - basePanelHeight) * 0.45),
+	);
+	const baseTextBaseY =
+		Number(layout.textBaseY) || Math.round(canvasHeight * 0.58);
+	const textBaseY = Math.round(
+		baseTextBaseY +
+			(panelY - basePanelY) +
+			Math.round((panelHeight - basePanelHeight) * 0.24),
+	);
+	const startY = textBaseY - ((textLines.length - 1) * lineHeight) / 2;
+	const textX = Number(layout.textX) || Math.round(canvasWidth / 2);
+	const iconCx = Number(layout.iconCx) || Math.round(canvasWidth / 2);
+	const baseIconR = Number(layout.iconR) || Math.round(canvasWidth * 0.07);
+	const iconR = Math.max(34, Math.round(baseIconR * iconScaleBoost));
+	const baseIconCy = Number(layout.iconCy) || Math.round(canvasHeight * 0.3);
+	const iconCy = Math.max(
+		iconR + 10,
+		Math.round(baseIconCy - (iconR - baseIconR) * 0.42),
+	);
+	const iconFontSize = Math.max(
+		24,
+		Math.round(
+			(Number(layout.iconFontSize) || Math.round(baseIconR * 0.95)) *
+				iconScaleBoost,
+		),
+	);
+	const panelStrokeWidth = Number(layout.panelStrokeWidth) || 8;
+	const panelRadius = Math.max(
+		30,
+		Math.min(180, Number(layout.panelRadius || borderRadius * 2.4)),
+	);
+	const textFontSize = Math.max(
+		42,
+		Math.round(
+			(Number(layout.textFontSize) || 116) *
+				textSizeBoost *
+				lineCompressionScale,
+		),
+	);
+	const ornamentY =
+		panelY + panelHeight - Math.max(24, Math.round(panelHeight * 0.18));
+	const ornamentLeftX = panelX + Math.max(38, Math.round(panelWidth * 0.05));
+	const ornamentRightX =
+		panelX + panelWidth - Math.max(38, Math.round(panelWidth * 0.05));
+	const textTspans = textLines
+		.map((line, index) => {
+			const dy = index === 0 ? 0 : lineHeight;
+			return `<tspan x="${textX}" dy="${dy}">${line}</tspan>`;
+		})
+		.join("");
+
+	const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}">
+	<defs>
+		<linearGradient id="panelGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+			<stop offset="0%" stop-color="${safePanelGradientStart}"/>
+			<stop offset="100%" stop-color="${safePanelGradientEnd}"/>
+		</linearGradient>
+		<linearGradient id="iconGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+			<stop offset="0%" stop-color="${safeAccentBackgroundColor}"/>
+			<stop offset="100%" stop-color="${safeAccentBackgroundColor2}"/>
+		</linearGradient>
+		<filter id="softShadow" x="-20%" y="-20%" width="140%" height="150%">
+			<feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#0f172a" flood-opacity="0.22"/>
+		</filter>
+		<filter id="titleShadow" x="-25%" y="-25%" width="150%" height="150%">
+			<feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="${safeTextShadowColor}" flood-opacity="0.65"/>
+		</filter>
+	</defs>
+	<rect x="0" y="0" width="${canvasWidth}" height="${canvasHeight}" fill="transparent"/>
+	<rect x="${panelX}" y="${panelY}" width="${panelWidth}" height="${panelHeight}" rx="${panelRadius}" ry="${panelRadius}" fill="url(#panelGrad)" stroke="${safePanelBorderColor}" stroke-width="${panelStrokeWidth}" filter="url(#softShadow)"/>
+	<circle cx="${iconCx}" cy="${iconCy}" r="${iconR}" fill="url(#iconGrad)" stroke="${safeBorderColor}" stroke-width="${Math.max(6, Math.round(panelStrokeWidth * 0.9))}" filter="url(#softShadow)"/>
+	<text x="${iconCx}" y="${iconCy}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${iconFontSize}px; font-weight: 700; fill: ${safeAccentTextColor};">${safeIcon}</text>
+	<text x="${ornamentLeftX}" y="${ornamentY}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${Math.max(34, Math.round(textFontSize * 0.34))}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentLeft}</text>
+	<text x="${ornamentRightX}" y="${ornamentY}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${Math.max(34, Math.round(textFontSize * 0.34))}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentRight}</text>
+	<text x="${textX}" y="${startY}" text-anchor="middle" filter="url(#titleShadow)" style="font-family: ${safeFontFamily}; font-size: ${textFontSize}px; font-weight: ${safeFontWeight}; font-style: ${safeFontStyle}; fill: ${safeTextColor}; letter-spacing: -0.02em;">${textTspans}</text>
+</svg>`;
+
+	return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
+function makePodListPreviewCacheKey({ productId, variantId, occasion, name }) {
+	const hashInput = JSON.stringify({
+		version: POD_LIST_PREVIEW_CACHE_VERSION,
+		productId: String(productId || ""),
+		variantId: String(variantId || ""),
+		occasion: normalizePodListOccasion(occasion),
+		name: sanitizePodListName(name),
+	});
+	const digest = crypto
+		.createHash("sha1")
+		.update(hashInput)
+		.digest("hex")
+		.slice(0, 18);
+	return `${productId}:${variantId || "na"}:${digest}`;
+}
+
+function getCachedPodListPreview(cacheKey) {
+	const entry = podListPreviewMemoryCache.get(cacheKey);
+	if (!entry) return null;
+	if (entry.expiresAt <= Date.now()) {
+		podListPreviewMemoryCache.delete(cacheKey);
+		return null;
+	}
+	return entry.value;
+}
+
+function setCachedPodListPreview(cacheKey, value) {
+	podListPreviewMemoryCache.set(cacheKey, {
+		expiresAt: Date.now() + POD_LIST_PREVIEW_CACHE_TTL_MS,
+		value,
+	});
+}
+
+function scorePreviewImageForList(image = {}, product = {}) {
+	let score = 0;
+	const pos = String(image.position || image.placeholder || "").toLowerCase();
+	const src = String(image.src || "").toLowerCase();
+	const kind = getPodListProductKind(product);
+	const isWearable = kind === "apparel" || kind === "hoodie";
+	const productFacingHint = /(front|center|main|default|hero|primary)/.test(
+		`${pos} ${src}`,
+	);
+	const strictFacingHint =
+		/(front|center|main|default|hero|primary|straight|full)/.test(
+			`${pos} ${src}`,
+		);
+	const angledOrCroppedHint =
+		/(side|left|right|back|detail|closeup|zoom|corner|crop|angle|tilt|45)/.test(
+			`${pos} ${src}`,
+		);
+	const strongAngledHint =
+		/(side|left|right|back|detail|closeup|zoom|corner|crop|angle|tilt|45|perspective)/.test(
+			`${pos} ${src}`,
+		);
+
+	if (pos.includes("front")) score += 7;
+	if (pos.includes("center")) score += 3;
+	if (image.is_default) score += 2;
+	if (src.includes("front")) score += 1;
+	if (pos.includes("back") || src.includes("back")) score -= 4;
+
+	if (isWearable) {
+		const lifestyleHint =
+			/(lifestyle|model|wear|wearing|person|people|man|woman|male|female|on-model|on_model|studio)/.test(
+				`${pos} ${src}`,
+			);
+		const flatHint = /(flat|blank|template|ghost|isolated|side)/.test(src);
+		if (lifestyleHint) score += 14;
+		if (flatHint) score -= 6;
+		if (!image.is_default) score += 3;
+		if (image.is_default) score -= 2;
+	}
+
+	if (!isWearable) {
+		if (image.is_default) score += 4;
+		if (productFacingHint) score += 3;
+		if (strictFacingHint) score += 2;
+		if (angledOrCroppedHint) score -= 5;
+	}
+
+	if (kind === "mug" && pos.includes("wrap")) score += 5;
+	if (kind === "tote" || kind === "bag") {
+		if (strictFacingHint) score += 10;
+		if (image.is_default) score += 4;
+		if (strongAngledHint) score -= 18;
+	}
+	if (kind === "pillow") {
+		if (productFacingHint) score += 8;
+		if (strictFacingHint) score += 16;
+		if (image.is_default) score += 8;
+		if (strongAngledHint) score -= 40;
+	}
+	if (kind === "candle") {
+		if (productFacingHint) score += 6;
+		if (strictFacingHint) score += 12;
+		if (src.includes("label")) score += 10;
+		if (image.is_default) score += 6;
+		if (strongAngledHint) score -= 14;
+	}
+	return score;
+}
+
+function normalizeVariantId(value) {
+	const num = Number(value);
+	if (Number.isFinite(num) && num > 0) return num;
+	return value;
+}
+
+function pickProductFallbackImage(product = {}) {
+	const productImages = product?.productAttributes?.[0]?.productImages;
+	const thumbnailImages = product?.thumbnailImage?.[0]?.images;
+	const printifyImages = product?.printifyProductDetails?.images;
+	const candidates = [
+		Array.isArray(productImages) ? productImages[0]?.url : null,
+		Array.isArray(productImages) ? productImages[0]?.src : null,
+		Array.isArray(thumbnailImages) ? thumbnailImages[0]?.url : null,
+		Array.isArray(thumbnailImages) ? thumbnailImages[0]?.src : null,
+		Array.isArray(printifyImages) ? printifyImages[0]?.src : null,
+	];
+	return candidates.find(Boolean) || null;
+}
+
+function resolvePodListVariantId(product, variantIdInput) {
+	const printifyVariants = Array.isArray(
+		product?.printifyProductDetails?.variants,
+	)
+		? product.printifyProductDetails.variants
+		: [];
+	const requested = normalizeVariantId(variantIdInput);
+	if (requested) {
+		const hasRequested = printifyVariants.some(
+			(variant) => String(variant?.id) === String(requested),
+		);
+		if (hasRequested) return requested;
+	}
+	const enabledVariant =
+		printifyVariants.find((variant) => variant?.is_enabled) ||
+		printifyVariants[0];
+	return normalizeVariantId(enabledVariant?.id || requested || null);
+}
+
+function normalizePodDefaultDesignImages(images = []) {
+	const safeImages = Array.isArray(images) ? images : [];
+	const dedupe = new Set();
+	const normalized = [];
+	for (const image of safeImages) {
+		const url = String(image?.url || image?.src || "").trim();
+		if (!url) continue;
+		if (dedupe.has(url)) continue;
+		dedupe.add(url);
+		normalized.push({
+			url,
+			public_id: String(image?.public_id || image?.publicId || "").trim(),
+		});
+	}
+	return normalized;
+}
+
+function clonePodDefaultDesignEntries(entries = []) {
+	const safeEntries = Array.isArray(entries) ? entries : [];
+	return safeEntries
+		.map((entry) => {
+			const rawOccasion = String(
+				entry?.occassion || entry?.occasion || "",
+			).trim();
+			if (!rawOccasion) return null;
+			return {
+				occassion: normalizePodListOccasion(rawOccasion),
+				defaultDesignImages: normalizePodDefaultDesignImages(
+					entry?.defaultDesignImages,
+				),
+			};
+		})
+		.filter(Boolean);
+}
+
+function collectPodDefaultDesignEntriesFromProduct(product = {}) {
+	const attributes = Array.isArray(product?.productAttributes)
+		? product.productAttributes
+		: [];
+	const byOccasion = new Map();
+	for (const attr of attributes) {
+		const entries = Array.isArray(attr?.defaultDesigns)
+			? attr.defaultDesigns
+			: [];
+		for (const entry of entries) {
+			const rawOccasion = String(
+				entry?.occassion || entry?.occasion || "",
+			).trim();
+			if (!rawOccasion) continue;
+			const occasion = normalizePodListOccasion(rawOccasion);
+			const key = occasion.toLowerCase();
+			const images = normalizePodDefaultDesignImages(
+				entry?.defaultDesignImages,
+			);
+			if (!images.length) continue;
+			const existing = byOccasion.get(key);
+			if (
+				!existing ||
+				images.length > Number(existing?.defaultDesignImages?.length || 0)
+			) {
+				byOccasion.set(key, {
+					occassion: occasion,
+					defaultDesignImages: images,
+				});
+			}
+		}
+	}
+	return POD_LIST_OCCASION_OPTIONS.map((option) =>
+		byOccasion.get(option.value.toLowerCase()),
+	).filter(Boolean);
+}
+
+function getPodStoredDefaultDesignEntry(product = {}, occasion = "") {
+	const safeOccasion = normalizePodListOccasion(occasion);
+	const key = safeOccasion.toLowerCase();
+	const entries = collectPodDefaultDesignEntriesFromProduct(product);
+	return (
+		entries.find(
+			(entry) =>
+				String(entry?.occassion || "").toLowerCase() === key &&
+				Array.isArray(entry?.defaultDesignImages) &&
+				entry.defaultDesignImages.length > 0,
+		) || null
+	);
+}
+
+async function getPrintifyShopIdsCached(printifyToken) {
+	if (
+		Array.isArray(podListPreviewShopCache.shopIds) &&
+		podListPreviewShopCache.shopIds.length > 0 &&
+		podListPreviewShopCache.expiresAt > Date.now()
+	) {
+		return podListPreviewShopCache.shopIds;
+	}
+	const shopsResp = await axios.get("https://api.printify.com/v1/shops.json", {
+		headers: {
+			Authorization: `Bearer ${printifyToken}`,
+			"User-Agent": "NodeJS-App",
+		},
+	});
+	const shopIds = Array.isArray(shopsResp.data)
+		? shopsResp.data.map((shop) => shop.id).filter(Boolean)
+		: [];
+	podListPreviewShopCache.shopIds = shopIds;
+	podListPreviewShopCache.expiresAt =
+		Date.now() + POD_LIST_PREVIEW_SHOP_CACHE_TTL_MS;
+	return shopIds;
+}
+
+function getPersistedPodListPreviews(product) {
+	const entries = product?.printifyProductDetails?.listingPreviews;
+	if (!Array.isArray(entries)) return [];
+	return entries
+		.filter((entry) => entry && entry.key && entry.preview_image_url)
+		.slice(0, POD_LIST_PREVIEW_MAX_DB_ENTRIES);
+}
+
+async function persistPodListPreview({ product, cacheEntry }) {
+	const existingEntries = getPersistedPodListPreviews(product).filter(
+		(entry) => entry.key !== cacheEntry.key,
+	);
+	const mergedEntries = [cacheEntry, ...existingEntries];
+	const nextEntries = mergedEntries.slice(0, POD_LIST_PREVIEW_MAX_DB_ENTRIES);
+	const evictedEntries = mergedEntries
+		.slice(POD_LIST_PREVIEW_MAX_DB_ENTRIES)
+		.filter((entry) => entry?.preview_product_id);
+	await Product.findByIdAndUpdate(product._id, {
+		$set: {
+			"printifyProductDetails.listingPreviews": nextEntries,
+			"printifyProductDetails.latestListingPreviewKey": cacheEntry.key,
+			"printifyProductDetails.latestListingPreviewUpdatedAt":
+				cacheEntry.generated_at,
+		},
+	});
+
+	return evictedEntries;
+}
+
+function normalizePodListCleanupItems(rawItems) {
+	if (!Array.isArray(rawItems)) return [];
+	const dedupe = new Set();
+	const normalized = [];
+	for (const rawItem of rawItems) {
+		const previewProductId = String(
+			rawItem?.preview_product_id || rawItem?.previewProductId || "",
+		).trim();
+		if (!previewProductId) continue;
+		const shopIdRaw = rawItem?.shop_id ?? rawItem?.shopId ?? null;
+		const shopIdHint =
+			shopIdRaw === null || shopIdRaw === undefined || shopIdRaw === ""
+				? null
+				: shopIdRaw;
+		const productId = String(
+			rawItem?.product_id || rawItem?.productId || "",
+		).trim();
+		const entry = {
+			previewProductId,
+			shopIdHint,
+			productId: productId || null,
+		};
+		const dedupeKey = `${entry.previewProductId}|${entry.shopIdHint || ""}|${
+			entry.productId || ""
+		}`;
+		if (dedupe.has(dedupeKey)) continue;
+		dedupe.add(dedupeKey);
+		normalized.push(entry);
+		if (normalized.length >= 600) break;
+	}
+	return normalized;
+}
+
+async function removePersistedPodListPreviewsForProduct({
+	productId,
+	previewProductIds,
+}) {
+	if (
+		!productId ||
+		!Array.isArray(previewProductIds) ||
+		!previewProductIds.length
+	) {
+		return {
+			productId: productId || null,
+			updated: false,
+			reason: "missing_product_or_preview_ids",
+		};
+	}
+
+	const product = await Product.findById(productId)
+		.select("_id printifyProductDetails")
+		.lean();
+	if (!product) {
+		return {
+			productId: String(productId),
+			updated: false,
+			reason: "product_not_found",
+		};
+	}
+
+	const existingEntries = getPersistedPodListPreviews(product);
+	if (!existingEntries.length) {
+		return {
+			productId: String(productId),
+			updated: false,
+			reason: "no_listing_previews",
+		};
+	}
+
+	const previewProductIdSet = new Set(
+		previewProductIds.map((id) => String(id || "").trim()).filter(Boolean),
+	);
+	const nextEntries = existingEntries.filter(
+		(entry) =>
+			!previewProductIdSet.has(String(entry?.preview_product_id || "").trim()),
+	);
+	if (nextEntries.length === existingEntries.length) {
+		return {
+			productId: String(productId),
+			updated: false,
+			reason: "no_matching_preview_ids",
+		};
+	}
+
+	const previousLatestKey =
+		product?.printifyProductDetails?.latestListingPreviewKey || null;
+	const latestStillPresent = nextEntries.some(
+		(entry) => String(entry?.key || "") === String(previousLatestKey || ""),
+	);
+	const nextLatestKey = latestStillPresent
+		? previousLatestKey
+		: nextEntries[0]?.key;
+	const nextLatestUpdatedAt =
+		nextEntries.find((entry) => entry?.key === nextLatestKey)?.generated_at ||
+		new Date().toISOString();
+
+	await Product.findByIdAndUpdate(productId, {
+		$set: {
+			"printifyProductDetails.listingPreviews": nextEntries,
+			"printifyProductDetails.latestListingPreviewKey": nextLatestKey || null,
+			"printifyProductDetails.latestListingPreviewUpdatedAt":
+				nextLatestUpdatedAt || null,
+		},
+	});
+
+	return {
+		productId: String(productId),
+		updated: true,
+		removed: existingEntries.length - nextEntries.length,
+		remaining: nextEntries.length,
+	};
+}
+
+function parsePodListPreviewGeneratedAtMs(entry = {}) {
+	const generatedAtMs = Date.parse(String(entry?.generated_at || ""));
+	if (Number.isFinite(generatedAtMs)) return generatedAtMs;
+	const createdAtMs = Date.parse(String(entry?.created_at || ""));
+	if (Number.isFinite(createdAtMs)) return createdAtMs;
+	return null;
+}
+
+function isPodListPreviewEntryStale(entry = {}, nowMs = Date.now()) {
+	if (!entry?.preview_product_id) return false;
+	const generatedAtMs = parsePodListPreviewGeneratedAtMs(entry);
+	if (!Number.isFinite(generatedAtMs)) return true;
+	return nowMs - generatedAtMs >= POD_LIST_PREVIEW_STALE_AGE_MS;
+}
+
+async function cleanupStalePodListPreviewProducts({
+	reason = "scheduled",
+} = {}) {
+	if (podListStaleCleanupState.running) {
+		return {
+			success: false,
+			skipped: true,
+			reason: "already_running",
+		};
+	}
+
+	const nowMs = Date.now();
+	podListStaleCleanupState.running = true;
+	podListStaleCleanupState.lastRunAt = nowMs;
+	const debugId = `pod-list-stale-cleanup-${nowMs}-${Math.random()
+		.toString(36)
+		.slice(2, 8)}`;
+	const startedAt = Date.now();
+	try {
+		const tokenInfo = resolvePrintifyToken();
+		if (!tokenInfo.token) {
+			return {
+				success: false,
+				skipped: true,
+				reason: "no_token",
+				error: tokenInfo.error || "Missing Printify token",
+			};
+		}
+
+		const products = await Product.find({
+			"printifyProductDetails.listingPreviews.0": { $exists: true },
+		})
+			.select("_id printifyProductDetails")
+			.limit(POD_LIST_PREVIEW_STALE_CLEANUP_MAX_PRODUCTS)
+			.lean();
+
+		let scannedProducts = 0;
+		let staleCandidates = 0;
+		let deleteAttempts = 0;
+		let deletedCount = 0;
+		let notFoundCount = 0;
+		let failedCount = 0;
+		let dbUpdatedProducts = 0;
+
+		for (const product of products) {
+			if (deleteAttempts >= POD_LIST_PREVIEW_STALE_CLEANUP_MAX_DELETES) break;
+			scannedProducts += 1;
+			const entries = getPersistedPodListPreviews(product);
+			if (!entries.length) continue;
+
+			const staleEntries = entries.filter((entry) =>
+				isPodListPreviewEntryStale(entry, nowMs),
+			);
+			if (!staleEntries.length) continue;
+
+			const removablePreviewIds = [];
+			for (const staleEntry of staleEntries) {
+				if (deleteAttempts >= POD_LIST_PREVIEW_STALE_CLEANUP_MAX_DELETES) break;
+				const previewProductId = String(
+					staleEntry?.preview_product_id || "",
+				).trim();
+				if (!previewProductId) continue;
+				staleCandidates += 1;
+				deleteAttempts += 1;
+				try {
+					const cleanupResult = await deletePreviewProductById({
+						previewProductId,
+						shopIdHint: staleEntry?.shop_id || null,
+						printifyToken: tokenInfo.token,
+						debugId,
+					});
+					if (cleanupResult?.deleted) deletedCount += 1;
+					if (cleanupResult?.notFound) notFoundCount += 1;
+					if (cleanupResult?.deleted || cleanupResult?.notFound) {
+						removablePreviewIds.push(previewProductId);
+					}
+				} catch (cleanupError) {
+					failedCount += 1;
+					console.warn(`[${debugId}] Failed stale preview delete`, {
+						productId: String(product?._id || ""),
+						previewProductId,
+						status: cleanupError?.response?.status || null,
+						data: cleanupError?.response?.data || null,
+						message: cleanupError?.message,
+					});
+				}
+			}
+
+			if (removablePreviewIds.length) {
+				const updateSummary = await removePersistedPodListPreviewsForProduct({
+					productId: String(product._id),
+					previewProductIds: removablePreviewIds,
+				});
+				if (updateSummary?.updated) dbUpdatedProducts += 1;
+			}
+		}
+
+		const summary = {
+			success: true,
+			reason,
+			scannedProducts,
+			staleCandidates,
+			deleteAttempts,
+			deletedCount,
+			notFoundCount,
+			failedCount,
+			dbUpdatedProducts,
+			durationMs: Date.now() - startedAt,
+		};
+		podListStaleCleanupState.lastSummary = summary;
+		const verboseCleanupLogs =
+			String(
+				process.env.POD_LIST_PREVIEW_VERBOSE_CLEANUP_LOGS || "",
+			).toLowerCase() === "true";
+		const shouldLogSummary =
+			verboseCleanupLogs ||
+			reason !== "interval" ||
+			staleCandidates > 0 ||
+			deleteAttempts > 0 ||
+			failedCount > 0 ||
+			dbUpdatedProducts > 0;
+		if (shouldLogSummary) {
+			console.log(
+				`[${debugId}] Stale POD list preview cleanup summary`,
+				summary,
+			);
+		}
+		return summary;
+	} catch (error) {
+		console.error(`[${debugId}] Stale POD list preview cleanup failed`, {
+			status: error?.response?.status || null,
+			data: error?.response?.data || null,
+			message: error?.message,
+		});
+		return {
+			success: false,
+			reason,
+			error: error?.message || "unknown_error",
+		};
+	} finally {
+		podListStaleCleanupState.running = false;
+	}
+}
+
+function startPodListStaleCleanupTimer() {
+	if (podListStaleCleanupTimer) return;
+	podListStaleCleanupTimer = setInterval(() => {
+		cleanupStalePodListPreviewProducts({ reason: "interval" }).catch(
+			(cleanupError) => {
+				console.warn("Interval stale POD preview cleanup warning:", {
+					message: cleanupError?.message,
+				});
+			},
+		);
+	}, POD_LIST_PREVIEW_STALE_CLEANUP_INTERVAL_MS);
+	if (typeof podListStaleCleanupTimer.unref === "function") {
+		podListStaleCleanupTimer.unref();
+	}
+}
+
+startPodListStaleCleanupTimer();
+
+async function generatePodListPreview({
+	product,
+	occasion,
+	name,
+	variantIdInput,
+	cacheKey,
+	debugId,
+	options = {},
+}) {
+	const {
+		returnPreviewImages = false,
+		maxPreviewImages = 3,
+		uploadPreviewImagesToCloudinary = false,
+		previewImagesCloudinaryFolder = "serene_janat/pod_default_designs",
+		cleanupPreviewProduct = false,
+		cleanupDesignUpload = false,
+	} = options || {};
+	const safeMaxPreviewImages = Math.max(1, Number(maxPreviewImages) || 3);
+	const tokenInfo = resolvePrintifyToken();
+	if (!tokenInfo.token) {
+		throw new Error(tokenInfo.error || "No valid Printify token.");
+	}
+	const printifyToken = tokenInfo.token;
+	const safeOccasion = normalizePodListOccasion(occasion);
+	const safeName = sanitizePodListName(name);
+	const message = buildPodListGiftMessage(safeOccasion, safeName);
+	const preset = getPodListPreset(safeOccasion);
+	const variantId = resolvePodListVariantId(product, variantIdInput);
+
+	if (!variantId) {
+		throw new Error("Could not resolve a valid variant ID for POD preview.");
+	}
+
+	const designSvgDataUri = buildPodListDesignSvgDataUri({
+		message,
+		preset,
+		product,
+	});
+	const designUpload = await cloudinary.uploader.upload(designSvgDataUri, {
+		folder: "serene_janat/pod_list_preview_designs",
+		resource_type: "image",
+	});
+	const designPublicId = designUpload?.public_id || null;
+	const pngDeliveryUrl = designPublicId
+		? cloudinary.url(designPublicId, {
+				secure: true,
+				resource_type: "image",
+				type: "upload",
+				format: "png",
+				transformation: [{ fetch_format: "png" }],
+			})
+		: null;
+	const designUrlCandidates = [
+		...new Set(
+			[
+				pngDeliveryUrl,
+				designUpload?.secure_url || null,
+				POD_LIST_FALLBACK_DESIGN_URL,
+			].filter(Boolean),
+		),
+	];
+	if (!designUrlCandidates.length) {
+		throw new Error("Failed to upload generated design image to Cloudinary.");
+	}
+
+	const shopIds = await getPrintifyShopIdsCached(printifyToken);
+	if (!shopIds.length) {
+		throw new Error("No Printify shops found.");
+	}
+	const shopIdHint = product?.printifyProductDetails?.shop_id;
+	const shopId = shopIds.includes(shopIdHint) ? shopIdHint : shopIds[0];
+
+	console.log(`[${debugId}] Generating POD list preview`, {
+		productId: String(product?._id || ""),
+		shopId,
+		variantId,
+		occasion: safeOccasion,
+		hasName: Boolean(safeName),
+		cacheKey,
+	});
+
+	let uploadedImageId = null;
+	let selectedDesignImageUrl = null;
+	let lastUploadError = null;
+	for (const candidateUrl of designUrlCandidates) {
+		try {
+			console.log(`[${debugId}] Uploading POD list design to Printify`, {
+				candidateHost: (() => {
+					try {
+						return new URL(candidateUrl).host;
+					} catch {
+						return "invalid-url";
+					}
+				})(),
+			});
+			const uploadResp = await axios.post(
+				"https://api.printify.com/v1/uploads/images.json",
+				{
+					file_name: `pod-list-preview-${Date.now()}.png`,
+					url: candidateUrl,
+				},
+				{
+					headers: {
+						Authorization: `Bearer ${printifyToken}`,
+						"Content-Type": "application/json",
+						"User-Agent": "NodeJS-App",
+					},
+				},
+			);
+			uploadedImageId = uploadResp?.data?.id || null;
+			if (uploadedImageId) {
+				selectedDesignImageUrl = candidateUrl;
+				break;
+			}
+		} catch (uploadError) {
+			lastUploadError = uploadError;
+			console.warn(`[${debugId}] Printify design upload candidate failed`, {
+				status: uploadError?.response?.status || null,
+				data: uploadError?.response?.data || null,
+				message: uploadError?.message,
+			});
+		}
+	}
+	if (!uploadedImageId) {
+		if (lastUploadError) throw lastUploadError;
+		throw new Error("Printify image upload did not return an ID.");
+	}
+
+	const printAreas = Array.isArray(product?.printifyProductDetails?.print_areas)
+		? product.printifyProductDetails.print_areas
+		: [];
+	const variantPrintArea =
+		printAreas.find(
+			(area) =>
+				Array.isArray(area?.variant_ids) &&
+				area.variant_ids.some((id) => String(id) === String(variantId)),
+		) || printAreas[0];
+	const sourcePlaceholders = Array.isArray(variantPrintArea?.placeholders)
+		? variantPrintArea.placeholders
+		: [];
+	const sourcePlaceholder =
+		pickBestPodListPlaceholder(sourcePlaceholders, product) ||
+		sourcePlaceholders[0];
+	const sourcePosition = String(sourcePlaceholder?.position || "front");
+	const sourceImage = Array.isArray(sourcePlaceholder?.images)
+		? sourcePlaceholder.images[0]
+		: null;
+	const placementDefaults = getPodListPlacementDefaults(
+		product,
+		sourcePosition,
+	);
+	const placementResult = resolvePodListPlacementFromSource({
+		sourceImage,
+		placementDefaults,
+	});
+	const {
+		finalX,
+		finalY,
+		finalScale,
+		finalAngle,
+		useSourcePlacement,
+		sourceNearExpectedArea,
+		sourcePlacementIsTooSmall,
+		sourcePlacementIsTooLarge,
+		sourcePlacement,
+	} = placementResult;
+	const previewScaleBoost = getPodPreviewPlacementBoost(
+		product,
+		sourcePosition,
+	);
+	const boostedScale = Math.min(
+		2.6,
+		Math.max(
+			0.28,
+			Number(finalScale || placementDefaults.scale || 0.88) * previewScaleBoost,
+		),
+	);
+
+	console.log(`[${debugId}] POD list placement resolved`, {
+		productId: String(product?._id || ""),
+		productName: String(product?.productName || ""),
+		variantId,
+		sourcePosition,
+		availablePositions: sourcePlaceholders.map(
+			(item) => item?.position || null,
+		),
+		useSourcePlacement,
+		sourceNearExpectedArea,
+		sourcePlacementIsTooSmall,
+		sourcePlacementIsTooLarge,
+		sourcePlacement,
+		defaultPlacement: placementDefaults,
+		previewScaleBoost,
+		finalPlacement: {
+			x: finalX,
+			y: finalY,
+			scale: boostedScale,
+			baseScale: finalScale,
+			angle: finalAngle,
+		},
+	});
+
+	const createPayload = {
+		title: `POD List Preview - ${product?.productName || "Custom Gift"}`,
+		description: "Temporary POD list preview product",
+		blueprint_id: product?.printifyProductDetails?.blueprint_id,
+		print_provider_id: product?.printifyProductDetails?.print_provider_id,
+		variants: [
+			{
+				id: normalizeVariantId(variantId),
+				price: 2500,
+				is_enabled: true,
+				is_default: true,
+			},
+		],
+		print_areas: [
+			{
+				variant_ids: [normalizeVariantId(variantId)],
+				placeholders: [
+					{
+						position: sourcePosition,
+						images: [
+							{
+								type: "image/png",
+								id: uploadedImageId,
+								x: finalX,
+								y: finalY,
+								scale: boostedScale,
+								angle: finalAngle,
+							},
+						],
+					},
+				],
+			},
+		],
+		visible: false,
+	};
+
+	let previewProductId = null;
+	let previewImageUrl = null;
+	let previewImageCandidates = [];
+	let uploadedPreviewImages = [];
+
+	try {
+		const createResp = await axios.post(
+			`https://api.printify.com/v1/shops/${shopId}/products.json`,
+			createPayload,
+			{
+				headers: {
+					Authorization: `Bearer ${printifyToken}`,
+					"Content-Type": "application/json",
+					"User-Agent": "NodeJS-App",
+				},
+			},
+		);
+		previewProductId = createResp?.data?.id;
+		if (!previewProductId) {
+			throw new Error("Printify preview product was not created.");
+		}
+
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const previewResp = await axios.get(
+				`https://api.printify.com/v1/shops/${shopId}/products/${previewProductId}.json`,
+				{
+					headers: {
+						Authorization: `Bearer ${printifyToken}`,
+						"User-Agent": "NodeJS-App",
+					},
+				},
+			);
+			const images = Array.isArray(previewResp?.data?.images)
+				? previewResp.data.images
+				: [];
+			const rankedImages = [...images].sort(
+				(a, b) =>
+					scorePreviewImageForList(b, product) -
+					scorePreviewImageForList(a, product),
+			);
+			const selected = [
+				...new Set(rankedImages.map((image) => image?.src).filter(Boolean)),
+			];
+			previewImageCandidates = selected;
+			const productKind = getPodListProductKind(product);
+			const isWearableProduct = ["apparel", "hoodie"].includes(productKind);
+			const lifestylePreferred = isWearableProduct
+				? rankedImages.find((image) =>
+						/(lifestyle|model|wear|wearing|person|people|man|woman|male|female|on-model|on_model|studio)/.test(
+							`${String(image?.position || image?.placeholder || "").toLowerCase()} ${String(
+								image?.src || "",
+							).toLowerCase()}`,
+						),
+					)?.src || null
+				: null;
+			const centeredFrontPreferred = ["bag", "pillow", "candle"].includes(
+				productKind,
+			)
+				? rankedImages.find((image) => {
+						const metadata = `${String(image?.position || image?.placeholder || "").toLowerCase()} ${String(
+							image?.src || "",
+						).toLowerCase()}`;
+						return (
+							/(front|center|main|default|hero|primary|straight|full|label)/.test(
+								metadata,
+							) &&
+							!/(side|left|right|back|detail|closeup|zoom|corner|crop|angle|tilt|45|perspective)/.test(
+								metadata,
+							)
+						);
+					})?.src || null
+				: null;
+			previewImageUrl =
+				lifestylePreferred || centeredFrontPreferred || selected[0] || null;
+			if (
+				previewImageUrl &&
+				(!returnPreviewImages || previewImageCandidates.length)
+			) {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 550));
+		}
+
+		const selectedPreviewImages = previewImageCandidates
+			.slice(0, safeMaxPreviewImages)
+			.filter(Boolean);
+
+		if (uploadPreviewImagesToCloudinary && selectedPreviewImages.length) {
+			for (const src of selectedPreviewImages) {
+				try {
+					const uploaded = await cloudinary.uploader.upload(src, {
+						folder: previewImagesCloudinaryFolder,
+						resource_type: "image",
+					});
+					if (!uploaded?.secure_url) continue;
+					uploadedPreviewImages.push({
+						url: uploaded.secure_url,
+						public_id: uploaded.public_id || "",
+						source_url: src,
+					});
+				} catch (uploadError) {
+					console.warn(
+						`[${debugId}] Failed uploading preview image to Cloudinary`,
+						{
+							status: uploadError?.response?.status || null,
+							data: uploadError?.response?.data || null,
+							message: uploadError?.message,
+						},
+					);
+				}
+			}
+		}
+
+		const effectivePreviewImageUrl =
+			uploadedPreviewImages[0]?.url ||
+			previewImageUrl ||
+			pickProductFallbackImage(product);
+		const effectivePreviewImages = uploadedPreviewImages.length
+			? uploadedPreviewImages.map((item) => item.url).filter(Boolean)
+			: selectedPreviewImages;
+
+		return {
+			previewImageUrl: effectivePreviewImageUrl,
+			previewImages: effectivePreviewImages,
+			uploadedPreviewImages,
+			previewProductId,
+			shopId,
+			variantId: normalizeVariantId(variantId),
+			occasion: safeOccasion,
+			name: safeName,
+			message,
+			designImageUrl:
+				selectedDesignImageUrl || designUpload?.secure_url || null,
+			designImagePublicId: designPublicId,
+			tokenSource: tokenInfo.source || null,
+		};
+	} finally {
+		if (cleanupPreviewProduct && previewProductId) {
+			try {
+				await deletePreviewProductById({
+					previewProductId,
+					shopIdHint: shopId,
+					printifyToken,
+					debugId: `${debugId}-cleanup-generated`,
+				});
+			} catch (cleanupError) {
+				console.warn(`[${debugId}] Failed deleting generated preview product`, {
+					previewProductId,
+					status: cleanupError?.response?.status || null,
+					data: cleanupError?.response?.data || null,
+					message: cleanupError?.message,
+				});
+			}
+		}
+		if (cleanupDesignUpload && designPublicId) {
+			try {
+				await cloudinary.uploader.destroy(designPublicId, {
+					resource_type: "image",
+				});
+			} catch (cleanupDesignError) {
+				console.warn(`[${debugId}] Failed deleting temporary design upload`, {
+					designPublicId,
+					message: cleanupDesignError?.message,
+				});
+			}
+		}
+	}
+}
 
 exports.publishPrintifyProducts = async (req, res) => {
 	try {
@@ -33,7 +2428,7 @@ exports.publishPrintifyProducts = async (req, res) => {
 				headers: {
 					Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 				},
-			}
+			},
 		);
 
 		if (!shopResponse.data || shopResponse.data.length === 0) {
@@ -41,7 +2436,7 @@ exports.publishPrintifyProducts = async (req, res) => {
 		}
 
 		const shopId = shopResponse.data[0].id; // Use the first shop ID
-		console.log(`✅ Shop ID found: ${shopId}`);
+		console.log(`âœ… Shop ID found: ${shopId}`);
 
 		// Fetch all products from the shop
 		const productsResponse = await axios.get(
@@ -50,7 +2445,7 @@ exports.publishPrintifyProducts = async (req, res) => {
 				headers: {
 					Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 				},
-			}
+			},
 		);
 
 		if (!productsResponse.data || productsResponse.data.data.length === 0) {
@@ -61,12 +2456,12 @@ exports.publishPrintifyProducts = async (req, res) => {
 
 		const printifyProducts = productsResponse.data.data;
 
-		console.log(`✅ Total products retrieved: ${printifyProducts.length}`);
+		console.log(`âœ… Total products retrieved: ${printifyProducts.length}`);
 
 		// Log product visibility and lock status
 		printifyProducts.forEach((product) => {
 			console.log(
-				`🔹 Product: ${product.title}, Visible: ${product.visible}, Locked: ${product.is_locked}, ID: ${product.id}`
+				`ðŸ”¹ Product: ${product.title}, Visible: ${product.visible}, Locked: ${product.is_locked}, ID: ${product.id}`,
 			);
 		});
 
@@ -76,11 +2471,11 @@ exports.publishPrintifyProducts = async (req, res) => {
 			.map((product) => product.id);
 
 		if (productsToPublish.length === 0) {
-			console.log("🚀 No products need publishing.");
+			console.log("ðŸš€ No products need publishing.");
 			return res.json({ message: "No products need publishing." });
 		}
 
-		console.log(`📌 Publishing ${productsToPublish.length} products...`);
+		console.log(`ðŸ“Œ Publishing ${productsToPublish.length} products...`);
 
 		// Function to publish each product
 		const publishResults = await Promise.all(
@@ -101,14 +2496,14 @@ exports.publishPrintifyProducts = async (req, res) => {
 							headers: {
 								Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 							},
-						}
+						},
 					);
-					console.log(`✅ Successfully published product: ${productId}`);
+					console.log(`âœ… Successfully published product: ${productId}`);
 					return { productId, status: "Published Successfully" };
 				} catch (error) {
 					console.error(
-						`❌ Error publishing product ${productId}:`,
-						error.response?.data || error.message
+						`âŒ Error publishing product ${productId}:`,
+						error.response?.data || error.message,
 					);
 					return {
 						productId,
@@ -116,23 +2511,23 @@ exports.publishPrintifyProducts = async (req, res) => {
 						error: error.message,
 					};
 				}
-			})
+			}),
 		);
 
 		res.json({
 			success: true,
 			total_published: publishResults.filter(
-				(p) => p.status === "Published Successfully"
+				(p) => p.status === "Published Successfully",
 			).length,
 			total_failed: publishResults.filter(
-				(p) => p.status === "Failed to Publish"
+				(p) => p.status === "Failed to Publish",
 			).length,
 			details: publishResults,
 		});
 	} catch (error) {
 		console.error(
-			"❌ Error publishing Printify products:",
-			error.response?.data || error.message
+			"âŒ Error publishing Printify products:",
+			error.response?.data || error.message,
 		);
 		res.status(500).json({ error: "Failed to publish Printify products" });
 	}
@@ -151,7 +2546,7 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 				headers: {
 					Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 				},
-			}
+			},
 		);
 
 		if (!shopResponse.data || shopResponse.data.length === 0) {
@@ -159,7 +2554,7 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 		}
 
 		const shopId = shopResponse.data[0].id; // Use the first shop ID
-		console.log(`✅ Shop ID found: ${shopId}`);
+		console.log(`âœ… Shop ID found: ${shopId}`);
 
 		// Fetch all products
 		const productsResponse = await axios.get(
@@ -168,7 +2563,7 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 				headers: {
 					Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 				},
-			}
+			},
 		);
 
 		if (!productsResponse.data || productsResponse.data.data.length === 0) {
@@ -179,7 +2574,7 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 
 		const printifyProducts = productsResponse.data.data;
 
-		console.log(`✅ Total products retrieved: ${printifyProducts.length}`);
+		console.log(`âœ… Total products retrieved: ${printifyProducts.length}`);
 
 		// Force republish all products by adding a random tag & republishing
 		const republishResults = await Promise.all(
@@ -195,10 +2590,10 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 							headers: {
 								Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 							},
-						}
+						},
 					);
 
-					console.log(`🔄 Updated product ${product.id} with new tag`);
+					console.log(`ðŸ”„ Updated product ${product.id} with new tag`);
 
 					// Now attempt to publish it
 					await axios.post(
@@ -216,15 +2611,15 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 							headers: {
 								Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 							},
-						}
+						},
 					);
 
-					console.log(`✅ Successfully republished product: ${product.id}`);
+					console.log(`âœ… Successfully republished product: ${product.id}`);
 					return { productId: product.id, status: "Republished Successfully" };
 				} catch (error) {
 					console.error(
-						`❌ Error republishing product ${product.id}:`,
-						error.response?.data || error.message
+						`âŒ Error republishing product ${product.id}:`,
+						error.response?.data || error.message,
 					);
 					return {
 						productId: product.id,
@@ -232,23 +2627,23 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 						error: error.message,
 					};
 				}
-			})
+			}),
 		);
 
 		res.json({
 			success: true,
 			total_republished: republishResults.filter(
-				(p) => p.status === "Republished Successfully"
+				(p) => p.status === "Republished Successfully",
 			).length,
 			total_failed: republishResults.filter(
-				(p) => p.status === "Failed to Republish"
+				(p) => p.status === "Failed to Republish",
 			).length,
 			details: republishResults,
 		});
 	} catch (error) {
 		console.error(
-			"❌ Error republishing Printify products:",
-			error.response?.data || error.message
+			"âŒ Error republishing Printify products:",
+			error.response?.data || error.message,
 		);
 		res.status(500).json({ error: "Failed to republish Printify products" });
 	}
@@ -263,7 +2658,7 @@ exports.printifyProducts = async (req, res) => {
 				headers: {
 					Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
 				},
-			}
+			},
 		);
 
 		// Check if there are shops in the response
@@ -277,7 +2672,7 @@ exports.printifyProducts = async (req, res) => {
 					headers: {
 						Authorization: `Bearer ${process.env.PRINTIFY_TOKEN}`,
 					},
-				}
+				},
 			);
 
 			// Check if there are products in the response
@@ -285,7 +2680,7 @@ exports.printifyProducts = async (req, res) => {
 				// Filter products to only include those with is_enabled: true
 				const enabledProducts = productsResponse.data.data
 					.filter((product) =>
-						product.variants.some((variant) => variant.is_enabled)
+						product.variants.some((variant) => variant.is_enabled),
 					)
 					.map((product) => ({
 						...product,
@@ -328,9 +2723,9 @@ exports.removeAllPrintifyProducts = async (req, res) => {
 
 const PER_PAGE = 100; // Printify page size limit
 
-/* ───────────────────────────────────────────────────────────────
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
    Helper data & utilities
-──────────────────────────────────────────────────────────────── */
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 const CANCELLABLE_P_STATUSES = new Set([
 	"pending",
@@ -340,7 +2735,7 @@ const CANCELLABLE_P_STATUSES = new Set([
 	"draft",
 ]);
 
-// Printify statuses that mean “shipped / finished”
+// Printify statuses that mean â€œshipped / finishedâ€
 const COMPLETED_P_STATUSES = new Set(["delivered", "fulfilled", "intransit"]);
 
 const normaliseStatus = (str = "") => str.toLowerCase().replace(/[\s_-]/g, "");
@@ -373,17 +2768,17 @@ async function deleteEphemeralProducts({ shopId, localOrder, authHeaders }) {
 		try {
 			await axios.delete(
 				`https://api.printify.com/v1/shops/${shopId}/products/${prodId}.json`,
-				authHeaders
+				authHeaders,
 			);
 			removed++;
 		} catch (e) {
 			if (e.response?.status === 404) {
-				removed++; // already deleted – count as success
+				removed++; // already deleted â€“ count as success
 			} else {
 				// keep running but surface the error in server logs
 				console.warn(
 					`[Printify] Unable to delete product ${prodId}:`,
-					e.response?.data || e.message
+					e.response?.data || e.message,
 				);
 			}
 		}
@@ -391,9 +2786,9 @@ async function deleteEphemeralProducts({ shopId, localOrder, authHeaders }) {
 	return removed;
 }
 
-/* ───────────────────────────────────────────────────────────────
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
    Main controller
-──────────────────────────────────────────────────────────────── */
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 exports.printifyOrders = async (req, res) => {
 	/* 0. Validate API token */
@@ -422,7 +2817,7 @@ exports.printifyOrders = async (req, res) => {
 		/* 3. Iterate over every shop owned by the token */
 		const { data: shops = [] } = await axios.get(
 			"https://api.printify.com/v1/shops.json",
-			authHeaders
+			authHeaders,
 		);
 
 		for (const { id: shopId } of shops) {
@@ -431,7 +2826,7 @@ exports.printifyOrders = async (req, res) => {
 			while (true) {
 				const { data: { data: pOrders = [] } = {} } = await axios.get(
 					`https://api.printify.com/v1/shops/${shopId}/orders.json?page=${page}&per_page=${PER_PAGE}`,
-					authHeaders
+					authHeaders,
 				);
 				if (!pOrders.length) break; // no more pages
 				page++;
@@ -443,7 +2838,7 @@ exports.printifyOrders = async (req, res) => {
 					const normLocal = normaliseStatus(localOrder.status);
 					const normPrint = normaliseStatus(pOrder.status);
 
-					/* A) Local order is Cancelled ➜ attempt cancel + delete products */
+					/* A) Local order is Cancelled âžœ attempt cancel + delete products */
 					if (normLocal === "cancelled") {
 						if (
 							normPrint !== "canceled" &&
@@ -453,13 +2848,13 @@ exports.printifyOrders = async (req, res) => {
 								await axios.post(
 									`https://api.printify.com/v1/shops/${shopId}/orders/${pOrder.id}/cancel.json`,
 									{},
-									authHeaders
+									authHeaders,
 								);
 								ordersCancelledAtPrintify++;
 							} catch (e) {
 								console.warn(
 									`[Printify] Cannot cancel ${pOrder.id}:`,
-									e.response?.data || e.message
+									e.response?.data || e.message,
 								);
 							}
 						}
@@ -484,7 +2879,7 @@ exports.printifyOrders = async (req, res) => {
 						ordersSynced++;
 					}
 
-					/* C) If Printify marks order completed (delivered/shipped) ➜ delete products */
+					/* C) If Printify marks order completed (delivered/shipped) âžœ delete products */
 					if (COMPLETED_P_STATUSES.has(normPrint)) {
 						productsDeleted += await deleteEphemeralProducts({
 							shopId,
@@ -529,7 +2924,7 @@ exports.printifyOrders = async (req, res) => {
 async function createTempDesignPreview(
 	printifyProduct,
 	limitedVariants,
-	token
+	token,
 ) {
 	//------------------------------------------------------------------
 	// Decide how to place the "Your Design" placeholder
@@ -537,7 +2932,7 @@ async function createTempDesignPreview(
 	//------------------------------------------------------------------
 	const blueprintPlacementMap = {
 		// Example: "326" => a certain Weekender Bag
-		326: { x: 0.5, y: 0.2, scale: 0.35, angle: 0 },
+		326: { x: 0.5, y: 0.16, scale: 0.64, angle: 0 },
 		// Example: "220" => a certain Pillow
 		220: { x: 0.25, y: 0.5, scale: 0.3, angle: 0 },
 		// Example mug blueprint ID, if needed:
@@ -574,7 +2969,7 @@ async function createTempDesignPreview(
 					Authorization: `Bearer ${token}`,
 					"Content-Type": "application/json",
 				},
-			}
+			},
 		);
 		if (!resp.data?.id) {
 			throw new Error("No 'id' returned from Printify for YourDesignHere.png");
@@ -582,13 +2977,13 @@ async function createTempDesignPreview(
 		printifyImageId = resp.data.id;
 	} catch (err) {
 		console.error(
-			"❌ Printify Upload Error Full:",
-			JSON.stringify(err.response?.data, null, 2)
+			"âŒ Printify Upload Error Full:",
+			JSON.stringify(err.response?.data, null, 2),
 		);
 		throw new Error(
 			`Unable to upload 'YourDesignHere.png' to Printify: ${
 				err.response?.data?.message || err.message
-			}`
+			}`,
 		);
 	}
 
@@ -603,7 +2998,7 @@ async function createTempDesignPreview(
 	const variantIdsForArea = ephemeralVariants.map((v) => v.id);
 
 	const { x, y, scale, angle } = getPlacementForBlueprint(
-		printifyProduct.blueprint_id
+		printifyProduct.blueprint_id,
 	);
 
 	const createBody = {
@@ -643,7 +3038,7 @@ async function createTempDesignPreview(
 					Authorization: `Bearer ${token}`,
 					"Content-Type": "application/json",
 				},
-			}
+			},
 		);
 		if (!createResp.data?.id) {
 			throw new Error("Printify did not return ephemeral product ID.");
@@ -651,13 +3046,13 @@ async function createTempDesignPreview(
 		ephemeralProductId = createResp.data.id;
 	} catch (err) {
 		console.error(
-			"❌ Create ephemeral product error (Full):",
-			JSON.stringify(err.response?.data, null, 2)
+			"âŒ Create ephemeral product error (Full):",
+			JSON.stringify(err.response?.data, null, 2),
 		);
 		throw new Error(
 			`Failed to create ephemeral product. Reason: ${
 				err.response?.data?.message || err.message
-			}`
+			}`,
 		);
 	}
 
@@ -668,18 +3063,18 @@ async function createTempDesignPreview(
 	try {
 		const details = await axios.get(
 			`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products/${ephemeralProductId}.json`,
-			{ headers: { Authorization: `Bearer ${token}` } }
+			{ headers: { Authorization: `Bearer ${token}` } },
 		);
 		ephemeralDetails = details.data;
 	} catch (err) {
 		console.error(
-			"❌ Fetch ephemeral product error:",
-			JSON.stringify(err.response?.data, null, 2)
+			"âŒ Fetch ephemeral product error:",
+			JSON.stringify(err.response?.data, null, 2),
 		);
 		throw new Error(
 			`Failed to fetch ephemeral product ${ephemeralProductId}: ${
 				err.response?.data?.message || err.message
-			}`
+			}`,
 		);
 	}
 
@@ -704,7 +3099,7 @@ async function createTempDesignPreview(
 				resource_type: "image",
 			});
 		} catch (err) {
-			console.error("❌ Cloudinary upload ephemeral error:", err.message);
+			console.error("âŒ Cloudinary upload ephemeral error:", err.message);
 			continue;
 		}
 
@@ -725,17 +3120,157 @@ async function createTempDesignPreview(
 	try {
 		await axios.delete(
 			`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products/${ephemeralProductId}.json`,
-			{ headers: { Authorization: `Bearer ${token}` } }
+			{ headers: { Authorization: `Bearer ${token}` } },
 		);
 	} catch (err) {
 		console.warn(
 			`Could not delete ephemeral product ${ephemeralProductId}:`,
-			err.response?.data || err.message
+			err.response?.data || err.message,
 		);
 	}
 
 	// Return the map from ephemeral variantId -> { url, public_id }
 	return variantIdToCloudImage;
+}
+
+async function generatePodDefaultDesignEntriesForSync({
+	printifyProduct,
+	enabledVariants,
+	existingProductDoc,
+	forceRegenerate = false,
+	occasionList = [],
+	debugPrefix = "pod-default-sync",
+}) {
+	const safeOccasionListRaw = Array.isArray(occasionList) ? occasionList : [];
+	const safeOccasionList = [
+		...new Set(
+			(safeOccasionListRaw.length
+				? safeOccasionListRaw
+				: POD_LIST_OCCASION_OPTIONS.map((item) => item.value)
+			)
+				.map((occasion) => normalizePodListOccasion(occasion))
+				.filter(Boolean),
+		),
+	];
+
+	const existingEntries = collectPodDefaultDesignEntriesFromProduct(
+		existingProductDoc || {},
+	);
+	const existingByOccasion = new Map(
+		existingEntries.map((entry) => [
+			String(entry?.occassion || "").toLowerCase(),
+			{
+				occassion: entry.occassion,
+				defaultDesignImages: normalizePodDefaultDesignImages(
+					entry?.defaultDesignImages,
+				).slice(0, 3),
+			},
+		]),
+	);
+
+	const previewMetaProduct = {
+		_id: existingProductDoc?._id || printifyProduct?.id || null,
+		productName: printifyProduct?.title || "",
+		thumbnailImage: Array.isArray(existingProductDoc?.thumbnailImage)
+			? existingProductDoc.thumbnailImage
+			: [],
+		productAttributes: Array.isArray(existingProductDoc?.productAttributes)
+			? existingProductDoc.productAttributes
+			: [],
+		printifyProductDetails: {
+			POD: true,
+			blueprint_id: printifyProduct?.blueprint_id,
+			print_provider_id: printifyProduct?.print_provider_id,
+			shop_id: printifyProduct?.__shopId || null,
+			variants: Array.isArray(enabledVariants) ? enabledVariants : [],
+			print_areas: Array.isArray(printifyProduct?.print_areas)
+				? printifyProduct.print_areas
+				: [],
+		},
+	};
+
+	const previewVariantId = resolvePodListVariantId(previewMetaProduct, null);
+	const results = [];
+
+	for (const safeOccasion of safeOccasionList) {
+		const occasionKey = safeOccasion.toLowerCase();
+		const existing = existingByOccasion.get(occasionKey);
+		const existingImages = normalizePodDefaultDesignImages(
+			existing?.defaultDesignImages,
+		).slice(0, 3);
+		if (!forceRegenerate && existingImages.length >= 3) {
+			results.push({
+				occassion: safeOccasion,
+				defaultDesignImages: existingImages,
+			});
+			continue;
+		}
+
+		const debugId = `${debugPrefix}-${String(printifyProduct?.id || "unknown")}-${safeOccasion
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/(^-|-$)/g, "")
+			.slice(0, 36)}`;
+
+		try {
+			const generated = await generatePodListPreview({
+				product: previewMetaProduct,
+				occasion: safeOccasion,
+				name: "",
+				variantIdInput: previewVariantId,
+				cacheKey: `sync-default:${String(printifyProduct?.id || "")}:${String(
+					previewVariantId || "",
+				)}:${safeOccasion}:noname`,
+				debugId,
+				options: {
+					returnPreviewImages: true,
+					maxPreviewImages: 3,
+					uploadPreviewImagesToCloudinary: true,
+					previewImagesCloudinaryFolder: "serene_janat/pod_default_designs",
+					cleanupPreviewProduct: true,
+					cleanupDesignUpload: true,
+				},
+			});
+
+			const generatedImages = normalizePodDefaultDesignImages(
+				generated?.uploadedPreviewImages,
+			).slice(0, 3);
+			if (generatedImages.length) {
+				results.push({
+					occassion: safeOccasion,
+					defaultDesignImages: generatedImages,
+				});
+				continue;
+			}
+
+			if (existingImages.length) {
+				results.push({
+					occassion: safeOccasion,
+					defaultDesignImages: existingImages,
+				});
+			}
+		} catch (defaultGenError) {
+			console.warn(`[${debugId}] Failed generating default POD designs`, {
+				productId: String(printifyProduct?.id || ""),
+				occasion: safeOccasion,
+				status: defaultGenError?.response?.status || null,
+				data: defaultGenError?.response?.data || null,
+				message: defaultGenError?.message,
+			});
+			if (existingImages.length) {
+				results.push({
+					occassion: safeOccasion,
+					defaultDesignImages: existingImages,
+				});
+			}
+		}
+	}
+
+	return clonePodDefaultDesignEntries(results).filter(
+		(entry) =>
+			Array.isArray(entry?.defaultDesignImages) &&
+			entry.defaultDesignImages.length > 0,
+	);
 }
 
 exports.syncPrintifyProducts = async (req, res) => {
@@ -767,6 +3302,25 @@ exports.syncPrintifyProducts = async (req, res) => {
 				.status(500)
 				.json({ error: "DESIGN_PRINTIFY_TOKEN must be set." });
 		}
+		// Always backfill default designs on sync:
+		// if missing/incomplete we generate, if complete we reuse.
+		const shouldGenerateDefaultDesigns = true;
+		const forceRegenerateDefaultDesigns = ["1", "true", "yes"].includes(
+			String(
+				req.body?.forceRegenerateDefaultDesigns ??
+					req.query?.forceRegenerateDefaultDesigns ??
+					"0",
+			)
+				.toLowerCase()
+				.trim(),
+		);
+		const defaultDesignOccasions = [
+			...new Set(
+				POD_LIST_OCCASION_OPTIONS.map((item) => item.value)
+					.map((occasion) => normalizePodListOccasion(occasion))
+					.filter(Boolean),
+			),
+		];
 
 		//-------------------------------------------------------------------
 		// 1. FETCH CATEGORIES / SUBCATEGORIES
@@ -782,25 +3336,25 @@ exports.syncPrintifyProducts = async (req, res) => {
 				"https://api.printify.com/v1/shops.json",
 				{
 					headers: { Authorization: `Bearer ${token}` },
-				}
+				},
 			);
 			if (!shopRes.data?.length) {
-				console.log(`⚠️ [${tokenName}] No shops found.`);
+				console.log(`âš ï¸ [${tokenName}] No shops found.`);
 				return [];
 			}
 			const shopId = shopRes.data[0].id;
-			console.log(`✅ [${tokenName}] Shop ID found: ${shopId}`);
+			console.log(`âœ… [${tokenName}] Shop ID found: ${shopId}`);
 
 			const productsRes = await axios.get(
 				`https://api.printify.com/v1/shops/${shopId}/products.json`,
-				{ headers: { Authorization: `Bearer ${token}` } }
+				{ headers: { Authorization: `Bearer ${token}` } },
 			);
 			if (!productsRes.data?.data?.length) {
-				console.log(`⚠️ [${tokenName}] No products found in shop ${shopId}`);
+				console.log(`âš ï¸ [${tokenName}] No products found in shop ${shopId}`);
 				return [];
 			}
 			console.log(
-				`🔹 [${tokenName}] Fetched ${productsRes.data.data.length} products`
+				`ðŸ”¹ [${tokenName}] Fetched ${productsRes.data.data.length} products`,
 			);
 
 			// Attach the shopId so we know which shop to update
@@ -810,7 +3364,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 		//-------------------------------------------------------------------
 		// 3. FETCH PRODUCTS ONLY FROM DESIGN TOKEN
 		//-------------------------------------------------------------------
-		console.log("🚀 Fetching products from Design token only...");
+		console.log("ðŸš€ Fetching products from Design token only...");
 		const designProducts = await fetchDesignProducts("DESIGN", DESIGN_TOKEN);
 		if (!designProducts.length) {
 			return res
@@ -824,7 +3378,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 		//-------------------------------------------------------------------
 		const uploadImageToCloudinaryLimited = async (
 			imagesArray = [],
-			limit = 5
+			limit = 5,
 		) => {
 			const limitedImages = imagesArray.slice(0, limit);
 			const uploadedImages = await Promise.all(
@@ -839,7 +3393,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						console.error("Cloudinary Upload Error:", err.message);
 						return null;
 					}
-				})
+				}),
 			);
 			return uploadedImages.filter(Boolean);
 		};
@@ -866,12 +3420,12 @@ exports.syncPrintifyProducts = async (req, res) => {
 		}
 
 		//-------------------------------------------------------------------
-		// 6. MASTER SYNC HANDLER (CREATE/UPDATE in Mongo; then set “Draft”)
+		// 6. MASTER SYNC HANDLER (CREATE/UPDATE in Mongo; then set â€œDraftâ€)
 		//-------------------------------------------------------------------
 		async function handleProductSync(productData, variantSKU, printifyProduct) {
 			if (!variantSKU) {
 				console.warn(
-					`❌ Variant SKU is missing for product: ${printifyProduct.title}`
+					`âŒ Variant SKU is missing for product: ${printifyProduct.title}`,
 				);
 				return;
 			}
@@ -910,45 +3464,81 @@ exports.syncPrintifyProducts = async (req, res) => {
 				}
 
 				await existingProduct.save();
-				console.log(`↺ Updated product in Mongo: ${productData.productName}`);
+				console.log(`â†º Updated product in Mongo: ${productData.productName}`);
 			} else {
 				const newProduct = new Product({
 					productSKU: variantSKU,
 					...productData,
 				});
 				await newProduct.save();
-				console.log(`➕ Added product in Mongo: ${productData.productName}`);
+				console.log(`âž• Added product in Mongo: ${productData.productName}`);
 			}
 
-			// B) Set product to “Draft” in Printify
+			// B) Set product to "Draft" in Printify
 			try {
-				const variantSettings = (printifyProduct.variants || []).map((v) => ({
+				const sourceVariants = Array.isArray(printifyProduct?.variants)
+					? printifyProduct.variants
+					: [];
+				const enabledVariantCount = sourceVariants.filter((v) =>
+					Boolean(v?.is_enabled),
+				).length;
+				const variantSettings = sourceVariants.map((v) => ({
 					...v,
-					is_enabled: true,
+					is_enabled: Boolean(v?.is_enabled),
 				}));
+				const draftPayload = {
+					title: printifyProduct.title,
+					description: printifyProduct.description,
+					visible: false, // draft/unpublished
+				};
+				if (variantSettings.length && enabledVariantCount <= 100) {
+					draftPayload.variants = variantSettings;
+				}
 
 				await axios.put(
 					`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products/${printifyProduct.id}.json`,
-					{
-						title: printifyProduct.title,
-						description: printifyProduct.description,
-						visible: false, // draft/unpublished
-						variants: variantSettings,
-					},
+					draftPayload,
 					{
 						headers: {
 							Authorization: `Bearer ${DESIGN_TOKEN}`,
 						},
-					}
+					},
 				);
 
 				console.log(
-					`✅ Set product ${printifyProduct.id} to draft (visible=false, variants enabled).`
+					`✅ Set product ${printifyProduct.id} to draft (visible=false).`,
 				);
 			} catch (draftError) {
+				if (draftError?.response?.data?.code === 8251) {
+					try {
+						await axios.put(
+							`https://api.printify.com/v1/shops/${printifyProduct.__shopId}/products/${printifyProduct.id}.json`,
+							{
+								title: printifyProduct.title,
+								description: printifyProduct.description,
+								visible: false,
+							},
+							{
+								headers: {
+									Authorization: `Bearer ${DESIGN_TOKEN}`,
+								},
+							},
+						);
+						console.warn(
+							`⚠️ Set product ${printifyProduct.id} to draft after 8251 fallback (without variants payload).`,
+						);
+						return;
+					} catch (retryDraftError) {
+						console.error(
+							`Error setting product ${printifyProduct.id} to draft after fallback:`,
+							retryDraftError.response?.data || retryDraftError.message,
+						);
+						return;
+					}
+				}
 				console.error(
 					`Error setting product ${printifyProduct.id} to draft:`,
-					draftError.response?.data || draftError.message
+					draftError.response?.data || draftError.message,
 				);
 			}
 		}
@@ -958,6 +3548,15 @@ exports.syncPrintifyProducts = async (req, res) => {
 		//-------------------------------------------------------------------
 		const failedProducts = [];
 		const processedProducts = [];
+		const defaultDesignSyncStats = {
+			enabled: shouldGenerateDefaultDesigns,
+			forceRegenerate: forceRegenerateDefaultDesigns,
+			occasionCount: defaultDesignOccasions.length,
+			productsGenerated: 0,
+			productsReused: 0,
+			productsMissing: 0,
+			productsFailed: 0,
+		};
 
 		for (const printifyProduct of combinedProducts) {
 			// Determine if product is in the POD list
@@ -975,19 +3574,20 @@ exports.syncPrintifyProducts = async (req, res) => {
 					printifyProduct.tags.some(
 						(tag) =>
 							tag.toLowerCase().includes(cat.categoryName.toLowerCase()) ||
-							tag.toLowerCase().includes(cat.categorySlug.toLowerCase())
-					)
+							tag.toLowerCase().includes(cat.categorySlug.toLowerCase()),
+					),
 				);
 				if (matchingCategory) {
 					matchingSubcategories = subcategories.filter(
-						(sc) => sc.categoryId.toString() === matchingCategory._id.toString()
+						(sc) =>
+							sc.categoryId.toString() === matchingCategory._id.toString(),
 					);
 				}
 			}
 
 			if (!matchingCategory && !isPOD) {
 				failedProducts.push(printifyProduct.title);
-				console.warn(`❌ Skipped non-POD product: ${printifyProduct.title}`);
+				console.warn(`âŒ Skipped non-POD product: ${printifyProduct.title}`);
 				continue;
 			}
 
@@ -1007,11 +3607,11 @@ exports.syncPrintifyProducts = async (req, res) => {
 
 			// Check for enabled variants
 			const enabledVariants = (printifyProduct.variants || []).filter(
-				(v) => v.is_enabled
+				(v) => v.is_enabled,
 			);
 			if (!enabledVariants.length) {
 				failedProducts.push(printifyProduct.title);
-				console.warn(`❌ No enabled variants for ${printifyProduct.title}`);
+				console.warn(`âŒ No enabled variants for ${printifyProduct.title}`);
 				continue;
 			}
 
@@ -1073,12 +3673,12 @@ exports.syncPrintifyProducts = async (req, res) => {
 				const relevantImagesForProduct = (printifyProduct.images || []).filter(
 					(img) =>
 						img.variant_ids.some((vId) =>
-							enabledVariants.some((ev) => ev.id === vId)
-						)
+							enabledVariants.some((ev) => ev.id === vId),
+						),
 				);
 				validUploadedImages = await uploadImageToCloudinaryLimited(
 					relevantImagesForProduct,
-					5
+					5,
 				);
 			} else {
 				validUploadedImages =
@@ -1168,27 +3768,27 @@ exports.syncPrintifyProducts = async (req, res) => {
 					if (existingTopLevel) {
 						// Reuse existing productImages if we have them
 						const existingAttr = existingTopLevel.productAttributes?.find(
-							(a) => a.SubSKU === variant.sku
+							(a) => a.SubSKU === variant.sku,
 						);
 						if (existingAttr) {
 							variantUploadedImages = existingAttr.productImages || [];
 						} else {
 							const vImages = (printifyProduct.images || []).filter((img) =>
-								img.variant_ids.includes(variant.id)
+								img.variant_ids.includes(variant.id),
 							);
 							variantUploadedImages = await uploadImageToCloudinaryLimited(
 								vImages,
-								5
+								5,
 							);
 						}
 					} else {
 						// no existing product => fresh upload
 						const vImages = (printifyProduct.images || []).filter((img) =>
-							img.variant_ids.includes(variant.id)
+							img.variant_ids.includes(variant.id),
 						);
 						variantUploadedImages = await uploadImageToCloudinaryLimited(
 							vImages,
-							5
+							5,
 						);
 					}
 
@@ -1207,7 +3807,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						DropShippingPrice: priceFromPrintify.toFixed(2),
 						productImages: variantUploadedImages,
 					};
-				})
+				}),
 			);
 
 			//-------------------------------------------------------------------
@@ -1216,7 +3816,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			//-------------------------------------------------------------------
 			const distinctColorVariants = getDistinctColorVariants(
 				enabledVariants,
-				optionValueMap
+				optionValueMap,
 			);
 
 			let variantIdToCloudImage = {};
@@ -1231,7 +3831,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						// for each color. For simplicity, we use distinctColorVariants
 						// as-is. (Optionally filter them if you want only the first size.)
 						distinctColorVariants,
-						DESIGN_TOKEN
+						DESIGN_TOKEN,
 					);
 				} else {
 					//------------------------------------------------
@@ -1242,13 +3842,13 @@ exports.syncPrintifyProducts = async (req, res) => {
 					variantIdToCloudImage = await createTempDesignPreview(
 						printifyProduct,
 						[singleVariant],
-						DESIGN_TOKEN
+						DESIGN_TOKEN,
 					);
 				}
 			} catch (ephemeralErr) {
 				console.error(
-					"⚠️ Failed ephemeral product for example design:",
-					ephemeralErr.message
+					"âš ï¸ Failed ephemeral product for example design:",
+					ephemeralErr.message,
 				);
 			}
 
@@ -1298,14 +3898,66 @@ exports.syncPrintifyProducts = async (req, res) => {
 			}
 
 			//-------------------------------------------------------------------
-			// 10. Finally, CREATE/UPDATE top-level product & set to draft
+			// 10. Build persisted defaultDesigns (3 images per occasion, no-name)
+			//-------------------------------------------------------------------
+			let defaultDesignEntries = collectPodDefaultDesignEntriesFromProduct(
+				existingTopLevel || {},
+			);
+			if (isPOD && shouldGenerateDefaultDesigns) {
+				try {
+					const generatedDefaultEntries =
+						await generatePodDefaultDesignEntriesForSync({
+							printifyProduct,
+							enabledVariants,
+							existingProductDoc: existingTopLevel || {},
+							forceRegenerate: forceRegenerateDefaultDesigns,
+							occasionList: defaultDesignOccasions,
+							debugPrefix: "pod-default-sync",
+						});
+					if (generatedDefaultEntries.length) {
+						defaultDesignEntries = generatedDefaultEntries;
+						defaultDesignSyncStats.productsGenerated += 1;
+					} else if (defaultDesignEntries.length) {
+						defaultDesignSyncStats.productsReused += 1;
+					} else {
+						defaultDesignSyncStats.productsMissing += 1;
+					}
+				} catch (defaultDesignSyncError) {
+					defaultDesignSyncStats.productsFailed += 1;
+					console.warn(
+						`âš ï¸ Failed generating persisted default designs for ${printifyProduct.title}`,
+						{
+							productId: printifyProduct.id,
+							status: defaultDesignSyncError?.response?.status || null,
+							data: defaultDesignSyncError?.response?.data || null,
+							message: defaultDesignSyncError?.message,
+						},
+					);
+				}
+			} else if (defaultDesignEntries.length) {
+				defaultDesignSyncStats.productsReused += 1;
+			}
+
+			const clonedDefaultDesignEntries =
+				clonePodDefaultDesignEntries(defaultDesignEntries);
+			productData.productAttributes = productData.productAttributes.map(
+				(attribute) => ({
+					...attribute,
+					defaultDesigns: clonePodDefaultDesignEntries(
+						clonedDefaultDesignEntries,
+					),
+				}),
+			);
+
+			//-------------------------------------------------------------------
+			// 11. Finally, CREATE/UPDATE top-level product & set to draft
 			//-------------------------------------------------------------------
 			await handleProductSync(productData, firstVariantSKU, printifyProduct);
 			processedProducts.push(printifyProduct.id);
 		}
 
 		//-------------------------------------------------------------------
-		// 11. FINISH + REPORT
+		// 12. FINISH + REPORT
 		//-------------------------------------------------------------------
 		const recommendations = failedProducts.map((title) => ({
 			productTitle: title,
@@ -1317,14 +3969,16 @@ exports.syncPrintifyProducts = async (req, res) => {
 				message: `Products synced with some failures. ${processedProducts.length} products processed, ${failedProducts.length} products failed.`,
 				failedProducts,
 				recommendations,
+				defaultDesignSync: defaultDesignSyncStats,
 			});
 		} else {
 			res.json({
 				message: `All Printify products synced successfully. ${processedProducts.length} products processed.`,
+				defaultDesignSync: defaultDesignSyncStats,
 			});
 		}
 	} catch (error) {
-		console.error("❌ Error syncing products:", error);
+		console.error("âŒ Error syncing products:", error);
 		res.status(500).json({ error: "Error syncing products" });
 	}
 };
@@ -1347,7 +4001,7 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 				headers: {
 					Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 				},
-			}
+			},
 		);
 
 		if (!shopResponse.data || shopResponse.data.length === 0) {
@@ -1355,7 +4009,7 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 		}
 
 		const shopId = shopResponse.data[0].id;
-		console.log(`✅ Shop ID found: ${shopId}`);
+		console.log(`âœ… Shop ID found: ${shopId}`);
 
 		// 2. Fetch ALL products from the shop
 		const productsResponse = await axios.get(
@@ -1364,7 +4018,7 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 				headers: {
 					Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 				},
-			}
+			},
 		);
 
 		if (!productsResponse.data || productsResponse.data.data.length === 0) {
@@ -1374,7 +4028,7 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 		}
 
 		let allProducts = productsResponse.data.data;
-		console.log(`✅ Total products retrieved: ${allProducts.length}`);
+		console.log(`âœ… Total products retrieved: ${allProducts.length}`);
 
 		// 3. Optional: If ?productIds=xyz,abc is provided, filter
 		const republishedProductIds = req.query.productIds
@@ -1383,13 +4037,13 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 
 		if (republishedProductIds && republishedProductIds.length > 0) {
 			console.log(
-				`Filtering only products with IDs: ${republishedProductIds.join(", ")}`
+				`Filtering only products with IDs: ${republishedProductIds.join(", ")}`,
 			);
 
 			allProducts = allProducts.filter((product) =>
-				republishedProductIds.includes(product.id)
+				republishedProductIds.includes(product.id),
 			);
-			console.log(`✅ Filtered products count: ${allProducts.length}`);
+			console.log(`âœ… Filtered products count: ${allProducts.length}`);
 		}
 
 		// 4. Map them to a simplified structure (optional)
@@ -1420,8 +4074,8 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 		});
 	} catch (error) {
 		console.error(
-			"❌ Error fetching Printify products:",
-			error.response?.data || error.message
+			"âŒ Error fetching Printify products:",
+			error.response?.data || error.message,
 		);
 		res.status(500).json({ error: "Failed to fetch Printify products" });
 	}
@@ -1450,7 +4104,7 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 			"https://api.printify.com/v1/shops.json",
 			{
 				headers: { Authorization: `Bearer ${token}` },
-			}
+			},
 		);
 
 		// 4. **Validate Shop Response**
@@ -1463,27 +4117,27 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 		}
 
 		const shopId = shopResponse.data[0].id; // Use the first shop ID
-		console.log(`✅ Shop ID found: ${shopId}`);
+		console.log(`âœ… Shop ID found: ${shopId}`);
 
 		// 5. **Fetch the Single Product from Printify**
 		const productResponse = await axios.get(
 			`https://api.printify.com/v1/shops/${shopId}/products/${product_id}.json`,
 			{
 				headers: { Authorization: `Bearer ${token}` },
-			}
+			},
 		);
 
 		const fetchedProduct = productResponse.data;
 
 		// 6. **Validate Product Data**
 		if (!fetchedProduct) {
-			console.error("❌ 'fetchedProduct' is undefined");
+			console.error("âŒ 'fetchedProduct' is undefined");
 			return res.status(404).json({ error: "Product not found in Printify" });
 		}
 
 		// 7. **Ensure 'variants' is an array**
 		if (!Array.isArray(fetchedProduct.variants)) {
-			console.error("❌ 'variants' is not an array", fetchedProduct.variants);
+			console.error("âŒ 'variants' is not an array", fetchedProduct.variants);
 			return res
 				.status(500)
 				.json({ error: "'variants' data structure is invalid" });
@@ -1491,16 +4145,16 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 
 		// 8. **Filter Variants: Only include available and enabled variants**
 		const filteredVariants = fetchedProduct.variants.filter(
-			(variant) => variant.is_available && variant.is_enabled
+			(variant) => variant.is_available && variant.is_enabled,
 		);
 		console.log(
-			`🔍 Found ${filteredVariants.length} available and enabled variants`
+			`ðŸ” Found ${filteredVariants.length} available and enabled variants`,
 		);
 
 		// 9. **Check if Any Variants Remain After Filtering**
 		if (filteredVariants.length === 0) {
 			console.error(
-				"❌ No available and enabled variants found for this product."
+				"âŒ No available and enabled variants found for this product.",
 			);
 			return res.status(404).json({
 				error: "No available and enabled variants found for this product.",
@@ -1509,7 +4163,7 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 
 		// 10. **Ensure 'options' is an array**
 		if (!Array.isArray(fetchedProduct.options)) {
-			console.error("❌ 'options' is not an array", fetchedProduct.options);
+			console.error("âŒ 'options' is not an array", fetchedProduct.options);
 			return res
 				.status(500)
 				.json({ error: "'options' data structure is invalid" });
@@ -1528,7 +4182,7 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 		const hasColorOption = colorOptionIndex !== undefined;
 
 		if (hasColorOption) {
-			console.log("🎨 'Colors' option found in product options");
+			console.log("ðŸŽ¨ 'Colors' option found in product options");
 
 			// 13. **Ensure 'variants.options' arrays are valid**
 			const availableColorIds = new Set(
@@ -1536,26 +4190,26 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 					.map((variant) => {
 						if (!Array.isArray(variant.options)) {
 							console.error(
-								`❌ 'options' array missing in variant ID: ${variant.id}`
+								`âŒ 'options' array missing in variant ID: ${variant.id}`,
 							);
 							return undefined;
 						}
 						const colorId = variant.options[colorOptionIndex];
 						if (colorId === undefined) {
-							console.error(`❌ Color ID missing in variant ID: ${variant.id}`);
+							console.error(`âŒ Color ID missing in variant ID: ${variant.id}`);
 						}
 						return colorId;
 					})
-					.filter((optId) => optId !== undefined)
+					.filter((optId) => optId !== undefined),
 			);
 
 			console.log(
-				`🎨 Available Color IDs: ${[...availableColorIds].join(", ")}`
+				`ðŸŽ¨ Available Color IDs: ${[...availableColorIds].join(", ")}`,
 			);
 
 			if (availableColorIds.size === 0) {
 				console.error(
-					"❌ No available color IDs found after filtering variants"
+					"âŒ No available color IDs found after filtering variants",
 				);
 				return res.status(500).json({
 					error: "No available color IDs found after filtering variants",
@@ -1564,10 +4218,10 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 
 			// 14. **Filter Colors in Options Based on Available Variants**
 			const colorOption = fetchedProduct.options.find(
-				(opt) => opt.name.toLowerCase() === "colors"
+				(opt) => opt.name.toLowerCase() === "colors",
 			);
 			if (!colorOption) {
-				console.error("❌ 'Colors' option not found", fetchedProduct.options);
+				console.error("âŒ 'Colors' option not found", fetchedProduct.options);
 				return res
 					.status(500)
 					.json({ error: "Colors option not found in product options" });
@@ -1575,8 +4229,8 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 
 			if (!Array.isArray(colorOption.values)) {
 				console.error(
-					"❌ 'values' is not an array in 'Colors' option",
-					colorOption
+					"âŒ 'values' is not an array in 'Colors' option",
+					colorOption,
 				);
 				return res
 					.status(500)
@@ -1584,11 +4238,11 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 			}
 
 			const filteredColorValues = colorOption.values.filter((color) =>
-				availableColorIds.has(color.id)
+				availableColorIds.has(color.id),
 			);
 
 			if (filteredColorValues.length === 0) {
-				console.warn("⚠️ No colors available after filtering");
+				console.warn("âš ï¸ No colors available after filtering");
 			}
 
 			var filteredOptions = fetchedProduct.options
@@ -1602,21 +4256,21 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 					return opt; // Keep other options unchanged
 				})
 				.filter(
-					(opt) => opt && Array.isArray(opt.values) && opt.values.length > 0
+					(opt) => opt && Array.isArray(opt.values) && opt.values.length > 0,
 				); // Remove nulls and options with no values
 		} else {
 			console.warn(
-				"⚠️ 'Colors' option not found. Proceeding without color filtering."
+				"âš ï¸ 'Colors' option not found. Proceeding without color filtering.",
 			);
 			// If there is no 'Colors' option, keep all existing options
 			var filteredOptions = fetchedProduct.options.filter(
-				(opt) => opt && Array.isArray(opt.values) && opt.values.length > 0
+				(opt) => opt && Array.isArray(opt.values) && opt.values.length > 0,
 			);
 		}
 
 		// 15. **Ensure 'images' is an array**
 		if (!Array.isArray(fetchedProduct.images)) {
-			console.error("❌ 'images' is not an array", fetchedProduct.images);
+			console.error("âŒ 'images' is not an array", fetchedProduct.images);
 			return res
 				.status(500)
 				.json({ error: "'images' data structure is invalid" });
@@ -1627,9 +4281,9 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 		const filteredImages = fetchedProduct.images.filter(
 			(image) =>
 				Array.isArray(image.variant_ids) &&
-				image.variant_ids.some((id) => filteredVariantIds.includes(id))
+				image.variant_ids.some((id) => filteredVariantIds.includes(id)),
 		);
-		console.log(`🖼️ Found ${filteredImages.length} associated images`);
+		console.log(`ðŸ–¼ï¸ Found ${filteredImages.length} associated images`);
 
 		// 17. **Remove Image Limitation**
 		const finalImages = filteredImages; // No limit on images
@@ -1637,8 +4291,8 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 		// 18. **Ensure 'print_areas' is an array**
 		if (!Array.isArray(fetchedProduct.print_areas)) {
 			console.error(
-				"❌ 'print_areas' is not an array",
-				fetchedProduct.print_areas
+				"âŒ 'print_areas' is not an array",
+				fetchedProduct.print_areas,
 			);
 			return res
 				.status(500)
@@ -1650,13 +4304,13 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 			.map((printArea) => {
 				if (!printArea || !Array.isArray(printArea.variant_ids)) {
 					console.error(
-						`❌ Invalid 'printArea' structure: ${JSON.stringify(printArea)}`
+						`âŒ Invalid 'printArea' structure: ${JSON.stringify(printArea)}`,
 					);
 					return null; // Exclude invalid print areas
 				}
 
 				const filteredVariantIdsInPrintArea = printArea.variant_ids.filter(
-					(id) => filteredVariantIds.includes(id)
+					(id) => filteredVariantIds.includes(id),
 				);
 
 				// Ensure 'placeholders' is an array
@@ -1666,9 +4320,9 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 						.map((placeholder) => {
 							if (!placeholder || !Array.isArray(placeholder.images)) {
 								console.warn(
-									`⚠️ Invalid 'placeholder' structure: ${JSON.stringify(
-										placeholder
-									)}`
+									`âš ï¸ Invalid 'placeholder' structure: ${JSON.stringify(
+										placeholder,
+									)}`,
 								);
 								return null; // Exclude invalid placeholders
 							}
@@ -1677,16 +4331,16 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 							return {
 								...placeholder,
 								images: placeholder.images.filter(
-									(img) => img !== undefined && img !== null
+									(img) => img !== undefined && img !== null,
 								),
 							};
 						})
 						.filter(
-							(placeholder) => placeholder && placeholder.images.length > 0
+							(placeholder) => placeholder && placeholder.images.length > 0,
 						);
 				} else {
 					console.warn(
-						`⚠️ 'placeholders' is not an array in printArea ID: ${printArea.id}`
+						`âš ï¸ 'placeholders' is not an array in printArea ID: ${printArea.id}`,
 					);
 				}
 
@@ -1700,13 +4354,13 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 				(printArea) =>
 					printArea &&
 					printArea.variant_ids.length > 0 &&
-					printArea.placeholders.length > 0
+					printArea.placeholders.length > 0,
 			); // Remove invalid or empty print areas
-		console.log(`🖨️ Found ${filteredPrintAreas.length} valid print areas`);
+		console.log(`ðŸ–¨ï¸ Found ${filteredPrintAreas.length} valid print areas`);
 
 		// 20. **Do Not Filter Views Based on Variant IDs**
 		const filteredViews = fetchedProduct.views; // Retain all views
-		console.log(`👁️ Found ${filteredViews.length} views`);
+		console.log(`ðŸ‘ï¸ Found ${filteredViews.length} views`);
 
 		// 21. **Construct the Modified Product Object**
 		const modifiedProduct = {
@@ -1722,9 +4376,9 @@ exports.getSinglePrintifyProductById = async (req, res) => {
 		return res.json({ success: true, product: modifiedProduct });
 	} catch (error) {
 		console.error(
-			"❌ Error fetching single Printify product:",
+			"âŒ Error fetching single Printify product:",
 			error.response?.data || error.message,
-			error.stack
+			error.stack,
 		);
 
 		// Determine appropriate status code
@@ -1745,6 +4399,12 @@ exports.getSinglePrintifyProductById = async (req, res) => {
  */
 exports.createCustomPrintifyOrder = async (req, res) => {
 	try {
+		const tokenInfo = resolvePrintifyToken();
+		if (!tokenInfo.token) {
+			return res.status(500).json({ error: tokenInfo.error });
+		}
+		const printifyToken = tokenInfo.token;
+
 		// 0) Extract your custom design data + shipping info from the request body
 		const {
 			// Product creation data:
@@ -1786,10 +4446,10 @@ exports.createCustomPrintifyOrder = async (req, res) => {
 			"https://api.printify.com/v1/shops.json",
 			{
 				headers: {
-					Authorization: `Bearer ${process.env.PRINTIFY_API_TOKEN}`,
+					Authorization: `Bearer ${printifyToken}`,
 					"User-Agent": "NodeJS-App",
 				},
-			}
+			},
 		);
 		if (!shopsResp.data?.length) {
 			return res.status(404).json({ error: "No Printify shop found." });
@@ -1848,7 +4508,7 @@ exports.createCustomPrintifyOrder = async (req, res) => {
 						([position, layers]) => ({
 							position, // e.g. "front"
 							images: layers, // an array of images or text layers
-						})
+						}),
 					),
 				},
 			],
@@ -1860,11 +4520,11 @@ exports.createCustomPrintifyOrder = async (req, res) => {
 			createProductPayload,
 			{
 				headers: {
-					Authorization: `Bearer ${process.env.PRINTIFY_API_TOKEN}`,
+					Authorization: `Bearer ${printifyToken}`,
 					"Content-Type": "application/json",
 					"User-Agent": "NodeJS-App",
 				},
-			}
+			},
 		);
 
 		if (!createProductResp.data?.id) {
@@ -1895,11 +4555,11 @@ exports.createCustomPrintifyOrder = async (req, res) => {
 			orderPayload,
 			{
 				headers: {
-					Authorization: `Bearer ${process.env.PRINTIFY_API_TOKEN}`,
+					Authorization: `Bearer ${printifyToken}`,
 					"Content-Type": "application/json",
 					"User-Agent": "NodeJS-App",
 				},
-			}
+			},
 		);
 
 		if (!orderResp.data) {
@@ -1908,24 +4568,24 @@ exports.createCustomPrintifyOrder = async (req, res) => {
 				.json({ error: "Failed to create order for the new product." });
 		}
 
-		// 5) CLEAN UP: Remove or disable the product so it doesn’t show in your store.
+		// 5) CLEAN UP: Remove or disable the product so it doesnâ€™t show in your store.
 		//    Option A: Delete the product entirely
 		try {
 			await axios.delete(
 				`https://api.printify.com/v1/shops/${shopId}/products/${newProductId}.json`,
 				{
 					headers: {
-						Authorization: `Bearer ${process.env.PRINTIFY_API_TOKEN}`,
+						Authorization: `Bearer ${printifyToken}`,
 						"User-Agent": "NodeJS-App",
 					},
-				}
+				},
 			);
 		} catch (err) {
 			console.warn(
 				"Warning: The order was created, but deleting the product failed:",
-				err.response?.data || err.message
+				err.response?.data || err.message,
 			);
-			// not a show-stopper — the order is still placed
+			// not a show-stopper â€” the order is still placed
 		}
 
 		// Option B (instead of deleting): Update the product to disable variants
@@ -1942,10 +4602,883 @@ exports.createCustomPrintifyOrder = async (req, res) => {
 	} catch (error) {
 		console.error(
 			"Error creating on-the-fly Printify product & order:",
-			error?.response?.data || error.message
+			error?.response?.data || error.message,
 		);
+		if (error?.response?.status === 401) {
+			return res.status(500).json({
+				error:
+					"Printify authentication failed. Refresh your Printify token and restart the backend.",
+			});
+		}
 		return res.status(500).json({
 			error: "Error creating on-the-fly Printify product & order",
+		});
+	}
+};
+
+exports.previewCustomPrintifyDesign = async (req, res) => {
+	let previewProductId = null;
+	let printifyToken = null;
+	let previewShopId = null;
+	let shouldCleanupPreviewProduct = true;
+	const debugId = `preview-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2, 8)}`;
+	const startedAt = Date.now();
+	try {
+		const safeHost = (urlValue) => {
+			try {
+				if (!urlValue) return null;
+				return new URL(urlValue).host;
+			} catch {
+				return "invalid-url";
+			}
+		};
+
+		const tokenInfo = resolvePrintifyToken();
+		if (!tokenInfo.token) {
+			console.error(`[${debugId}] No valid Printify token.`, {
+				error: tokenInfo.error,
+			});
+			return res.status(500).json({ error: tokenInfo.error });
+		}
+		printifyToken = tokenInfo.token;
+		const tokenExpMs = parseJwtExpiryMs(printifyToken);
+		console.log(`[${debugId}] /api/preview-custom-design started`, {
+			tokenSource: tokenInfo.source || "unknown",
+			tokenExpiresAt: tokenExpMs
+				? new Date(tokenExpMs).toISOString()
+				: "unknown",
+			origin: req.headers?.origin || null,
+			referer: req.headers?.referer || null,
+			userAgent: req.headers?.["user-agent"] || null,
+		});
+
+		const {
+			blueprint_id,
+			print_provider_id,
+			variant_id,
+			design_image_url,
+			bare_design_image_url,
+			design_covers_print_area = false,
+			design_is_full_print_area_capture = false,
+			print_areas = [],
+			title,
+		} = req.body || {};
+		console.log(`[${debugId}] Request payload summary`, {
+			blueprint_id,
+			print_provider_id,
+			variant_id,
+			title: title || null,
+			printAreasCount: Array.isArray(print_areas) ? print_areas.length : 0,
+			hasDesignImageUrl: Boolean(design_image_url),
+			designImageHost: safeHost(design_image_url),
+			hasBareDesignImageUrl: Boolean(bare_design_image_url),
+			bareDesignImageHost: safeHost(bare_design_image_url),
+			designCoversPrintArea: Boolean(design_covers_print_area),
+			designIsFullPrintAreaCapture: Boolean(design_is_full_print_area_capture),
+		});
+		const previewDesignUrl = bare_design_image_url || design_image_url;
+
+		if (
+			!blueprint_id ||
+			!print_provider_id ||
+			!variant_id ||
+			!(design_image_url || bare_design_image_url)
+		) {
+			return res.status(400).json({
+				error:
+					"Missing required fields. blueprint_id, print_provider_id, variant_id, and design image are required.",
+			});
+		}
+
+		console.log(`[${debugId}] Fetching Printify shops...`);
+		const shopsResp = await axios.get(
+			"https://api.printify.com/v1/shops.json",
+			{
+				headers: {
+					Authorization: `Bearer ${printifyToken}`,
+					"User-Agent": "NodeJS-App",
+				},
+			},
+		);
+		if (!shopsResp.data?.length) {
+			return res.status(404).json({ error: "No Printify shop found." });
+		}
+		const shopId = shopsResp.data[0].id;
+		previewShopId = shopId;
+		const normalizedVariantId = Number(variant_id) || variant_id;
+		console.log(`[${debugId}] Shop resolved`, {
+			shopCount: shopsResp.data.length,
+			shopId,
+			normalizedVariantId,
+		});
+
+		console.log(`[${debugId}] Uploading design image to Printify...`, {
+			imageSource: bare_design_image_url
+				? "bare_design_image_url"
+				: "design_image_url",
+			sourceHost: safeHost(previewDesignUrl),
+		});
+		const uploadResp = await axios.post(
+			"https://api.printify.com/v1/uploads/images.json",
+			{
+				file_name: `preview-${Date.now()}.png`,
+				url: previewDesignUrl,
+			},
+			{
+				headers: {
+					Authorization: `Bearer ${printifyToken}`,
+					"Content-Type": "application/json",
+					"User-Agent": "NodeJS-App",
+				},
+			},
+		);
+		const uploadedImageId = uploadResp?.data?.id;
+		console.log(`[${debugId}] Printify upload response`, {
+			hasUploadId: Boolean(uploadedImageId),
+			uploadId: uploadedImageId || null,
+		});
+		if (!uploadedImageId) {
+			return res.status(502).json({
+				error: "Failed to upload design image to Printify.",
+			});
+		}
+
+		const safePrintAreas = Array.isArray(print_areas) ? print_areas : [];
+		let variantPrintArea = safePrintAreas.find(
+			(area) =>
+				Array.isArray(area.variant_ids) &&
+				area.variant_ids.some((id) => String(id) === String(variant_id)),
+		);
+		if (!variantPrintArea && safePrintAreas.length > 0) {
+			variantPrintArea = safePrintAreas[0];
+		}
+		console.log(`[${debugId}] Print area selection`, {
+			safePrintAreasCount: safePrintAreas.length,
+			matchedVariantPrintArea: Boolean(variantPrintArea),
+			matchedPositionCount: Array.isArray(variantPrintArea?.placeholders)
+				? variantPrintArea.placeholders.length
+				: 0,
+		});
+
+		const sourcePlaceholders = Array.isArray(variantPrintArea?.placeholders)
+			? variantPrintArea.placeholders
+			: [];
+		const preferredPlaceholder =
+			pickBestPodListPlaceholder(sourcePlaceholders, {
+				productName: title || "Custom Design",
+			}) || sourcePlaceholders[0];
+		const preferredPosition = String(preferredPlaceholder?.position || "front");
+		const sourceImage = Array.isArray(preferredPlaceholder?.images)
+			? preferredPlaceholder.images[0]
+			: null;
+		const coversPrintArea = Boolean(design_covers_print_area);
+		const previewProductMeta = { productName: title || "Custom Design" };
+		const fullPrintAreaScale = getFullPrintAreaPreviewScale(
+			previewProductMeta,
+			preferredPosition,
+		);
+		const placementDefaults = coversPrintArea
+			? { x: 0.5, y: 0.5, scale: fullPrintAreaScale, angle: 0 }
+			: getPodListPlacementDefaults(previewProductMeta, preferredPosition);
+		const placementResult = coversPrintArea
+			? {
+					finalX: 0.5,
+					finalY: 0.5,
+					finalScale: fullPrintAreaScale,
+					finalAngle: 0,
+					hasValidSourcePlacement: false,
+					sourceNearExpectedArea: true,
+					sourcePlacementIsTooSmall: false,
+					sourcePlacementIsTooLarge: false,
+					minAcceptedScale: fullPrintAreaScale,
+					maxAcceptedScale: fullPrintAreaScale,
+					useSourcePlacement: false,
+					sourcePlacement: {
+						x: null,
+						y: null,
+						scale: null,
+						angle: null,
+					},
+				}
+			: resolvePodListPlacementFromSource({
+					sourceImage,
+					placementDefaults,
+				});
+		const previewScaleBoost = coversPrintArea
+			? 1
+			: getPodPreviewPlacementBoost(previewProductMeta, preferredPosition);
+		const boostedScale = coversPrintArea
+			? fullPrintAreaScale
+			: Math.min(
+					2.6,
+					Math.max(
+						0.28,
+						Number(
+							placementResult.finalScale || placementDefaults.scale || 0.88,
+						) * previewScaleBoost,
+					),
+				);
+		const placeholders = [];
+		if (preferredPlaceholder) {
+			placeholders.push({
+				position: preferredPosition,
+				images: [
+					{
+						type: "image/png",
+						id: uploadedImageId,
+						x: placementResult.finalX,
+						y: placementResult.finalY,
+						scale: boostedScale,
+						angle: placementResult.finalAngle,
+					},
+				],
+			});
+		}
+
+		if (!placeholders.length) {
+			placeholders.push({
+				position: "front",
+				images: [
+					{
+						type: "image/png",
+						id: uploadedImageId,
+						x: coversPrintArea ? 0.5 : placementDefaults.x || 0.5,
+						y: coversPrintArea ? 0.5 : placementDefaults.y || 0.5,
+						scale: coversPrintArea
+							? fullPrintAreaScale
+							: Math.min(
+									2.6,
+									Math.max(
+										0.28,
+										Number(placementDefaults.scale || 0.88) * previewScaleBoost,
+									),
+								),
+						angle: 0,
+					},
+				],
+			});
+		}
+		console.log(`[${debugId}] Placeholder build complete`, {
+			placeholderCount: placeholders.length,
+			positions: placeholders.map((p) => p.position),
+			placementDefaults,
+			placementResult,
+			coversPrintArea,
+			fullPrintAreaScale,
+			previewScaleBoost,
+			boostedScale,
+		});
+
+		const createPayload = {
+			title: `Preview - ${title || "Custom Design"}`,
+			description: "Temporary preview product",
+			blueprint_id,
+			print_provider_id,
+			variants: [
+				{
+					id: normalizedVariantId,
+					price: 2500,
+					is_enabled: true,
+					is_default: true,
+				},
+			],
+			print_areas: [
+				{
+					variant_ids: [normalizedVariantId],
+					placeholders,
+				},
+			],
+			visible: false,
+		};
+		console.log(`[${debugId}] Creating temporary preview product...`, {
+			shopId,
+			blueprint_id,
+			print_provider_id,
+			variantId: normalizedVariantId,
+			placeholderCount: placeholders.length,
+		});
+
+		const createResp = await axios.post(
+			`https://api.printify.com/v1/shops/${shopId}/products.json`,
+			createPayload,
+			{
+				headers: {
+					Authorization: `Bearer ${printifyToken}`,
+					"Content-Type": "application/json",
+					"User-Agent": "NodeJS-App",
+				},
+			},
+		);
+		previewProductId = createResp?.data?.id;
+		console.log(`[${debugId}] Temporary product created`, {
+			previewProductId: previewProductId || null,
+		});
+		if (!previewProductId) {
+			return res.status(502).json({
+				error: "Printify preview product creation failed.",
+			});
+		}
+
+		let previewImages = [];
+		const previewTitle = String(title || "").toLowerCase();
+		const isWearablePreview =
+			previewTitle.includes("t-shirt") ||
+			previewTitle.includes("tee") ||
+			(previewTitle.includes("shirt") &&
+				!previewTitle.includes("sweatshirt")) ||
+			previewTitle.includes("hoodie") ||
+			previewTitle.includes("sweatshirt") ||
+			previewTitle.includes("pullover");
+		const scorePreviewImage = (image = {}) => {
+			let score = 0;
+			const pos = String(
+				image.position || image.placeholder || "",
+			).toLowerCase();
+			const src = String(image.src || "").toLowerCase();
+			if (pos.includes("front")) score += 7;
+			if (pos.includes("center")) score += 3;
+			if (image.is_default) score += 2;
+			if (src.includes("front")) score += 1;
+			if (pos.includes("back") || src.includes("back")) score -= 4;
+			if (isWearablePreview) {
+				const lifestyleHint =
+					/(lifestyle|model|wear|wearing|person|people|man|woman|male|female|on-model|on_model|studio)/.test(
+						`${pos} ${src}`,
+					);
+				const flatHint = /(flat|blank|template|ghost|isolated|side)/.test(src);
+				if (lifestyleHint) score += 14;
+				if (flatHint) score -= 6;
+				if (!image.is_default) score += 3;
+				if (image.is_default) score -= 2;
+			}
+			return score;
+		};
+		for (let attempt = 0; attempt < 5; attempt++) {
+			console.log(`[${debugId}] Polling preview images`, {
+				attempt: attempt + 1,
+				previewProductId,
+			});
+			const previewProductResp = await axios.get(
+				`https://api.printify.com/v1/shops/${shopId}/products/${previewProductId}.json`,
+				{
+					headers: {
+						Authorization: `Bearer ${printifyToken}`,
+						"User-Agent": "NodeJS-App",
+					},
+				},
+			);
+			const allImages = Array.isArray(previewProductResp?.data?.images)
+				? previewProductResp.data.images
+				: [];
+			const prioritized = [...allImages]
+				.sort((a, b) => scorePreviewImage(b) - scorePreviewImage(a))
+				.map((image) => image?.src)
+				.filter(Boolean);
+			previewImages = [...new Set(prioritized)].slice(0, 3);
+			console.log(`[${debugId}] Poll result`, {
+				attempt: attempt + 1,
+				totalImages: Array.isArray(previewProductResp?.data?.images)
+					? previewProductResp.data.images.length
+					: 0,
+				returnedImages: previewImages.length,
+			});
+			if (previewImages.length > 0) break;
+			await new Promise((resolve) => setTimeout(resolve, 900));
+		}
+		console.log(`[${debugId}] Preview generation finished`, {
+			previewProductId,
+			imageCount: previewImages.length,
+			durationMs: Date.now() - startedAt,
+		});
+		shouldCleanupPreviewProduct = false;
+
+		return res.json({
+			success: true,
+			product_id: previewProductId,
+			preview_product_id: previewProductId,
+			shop_id: shopId,
+			preview_images: previewImages,
+		});
+	} catch (error) {
+		console.error(`[${debugId}] Error generating Printify preview:`, {
+			status: error?.response?.status || null,
+			data: error?.response?.data || null,
+			message: error?.message,
+			previewProductId,
+			durationMs: Date.now() - startedAt,
+		});
+		if (error?.response?.status === 401) {
+			return res.status(500).json({
+				error:
+					"Printify authentication failed. Refresh your Printify token and restart the backend.",
+			});
+		}
+		return res.status(500).json({
+			error: "Failed to generate preview on Printify.",
+		});
+	} finally {
+		if (shouldCleanupPreviewProduct && previewProductId && printifyToken) {
+			try {
+				console.log(`[${debugId}] Cleanup start`, {
+					previewProductId,
+					previewShopId,
+				});
+				const cleanupResult = await deletePreviewProductById({
+					previewProductId,
+					shopIdHint: previewShopId,
+					printifyToken,
+					debugId,
+				});
+				console.log(`[${debugId}] Cleanup result`, cleanupResult);
+			} catch (cleanupError) {
+				console.warn(`[${debugId}] Preview cleanup warning:`, {
+					status: cleanupError?.response?.status || null,
+					data: cleanupError?.response?.data || null,
+					message: cleanupError?.message,
+					previewProductId,
+				});
+			}
+		} else {
+			console.log(`[${debugId}] Cleanup skipped`, {
+				shouldCleanupPreviewProduct,
+				hasPreviewProductId: Boolean(previewProductId),
+				hasPrintifyToken: Boolean(printifyToken),
+				durationMs: Date.now() - startedAt,
+			});
+		}
+	}
+};
+
+exports.deletePreviewCustomPrintifyDesign = async (req, res) => {
+	const debugId = `preview-delete-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2, 8)}`;
+	try {
+		const { previewProductId } = req.params;
+		const shopIdHint = req.body?.shop_id || req.query?.shop_id || null;
+		if (!previewProductId) {
+			return res.status(400).json({ error: "Missing previewProductId." });
+		}
+
+		const tokenInfo = resolvePrintifyToken();
+		if (!tokenInfo.token) {
+			return res.status(500).json({ error: tokenInfo.error });
+		}
+
+		console.log(`[${debugId}] Delete preview product requested`, {
+			previewProductId,
+			shopIdHint,
+		});
+		const result = await deletePreviewProductById({
+			previewProductId,
+			shopIdHint,
+			printifyToken: tokenInfo.token,
+			debugId,
+		});
+
+		return res.json({
+			success: true,
+			previewProductId,
+			deleted: Boolean(result.deleted),
+			shopId: result.shopId || shopIdHint || null,
+			notFound: Boolean(result.notFound),
+		});
+	} catch (error) {
+		console.error(`[${debugId}] Failed deleting preview product`, {
+			status: error?.response?.status || null,
+			data: error?.response?.data || null,
+			message: error?.message,
+		});
+		return res.status(500).json({
+			error: "Failed to delete preview product from Printify.",
+		});
+	}
+};
+
+exports.getPodListingPreview = async (req, res) => {
+	const debugId = `pod-list-preview-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2, 8)}`;
+	const startedAt = Date.now();
+	try {
+		const { productId } = req.params;
+		const forceRefresh =
+			String(req.query?.force || req.body?.force || "").trim() === "1";
+		const safeOccasion = normalizePodListOccasion(
+			req.query?.occasion || req.body?.occasion,
+		);
+		const safeName = sanitizePodListName(
+			req.query?.name || req.body?.name || "",
+		);
+		const requestedVariantId =
+			req.query?.variant_id || req.body?.variant_id || null;
+
+		if (!productId) {
+			return res.status(400).json({ error: "Missing productId." });
+		}
+
+		const product = await Product.findById(productId)
+			.select(
+				"_id productName productAttributes thumbnailImage printifyProductDetails",
+			)
+			.lean();
+		if (!product) {
+			return res.status(404).json({ error: "Product not found." });
+		}
+		if (!product?.printifyProductDetails?.POD) {
+			return res.status(400).json({
+				error: "Product is not configured as a POD product.",
+			});
+		}
+		if (
+			!product?.printifyProductDetails?.blueprint_id ||
+			!product?.printifyProductDetails?.print_provider_id
+		) {
+			return res.status(400).json({
+				error: "Missing Printify blueprint/provider details on product.",
+			});
+		}
+		if (!forceRefresh && !safeName) {
+			const storedDefaultDesign = getPodStoredDefaultDesignEntry(
+				product,
+				safeOccasion,
+			);
+			const storedDefaultImages = normalizePodDefaultDesignImages(
+				storedDefaultDesign?.defaultDesignImages,
+			);
+			if (storedDefaultImages.length) {
+				return res.json({
+					success: true,
+					source: "stored-default-design",
+					product_id: productId,
+					preview_image: storedDefaultImages[0].url,
+					preview_images: storedDefaultImages.map((item) => item.url),
+					preview_product_id: null,
+					shop_id: null,
+					occasion: safeOccasion,
+					name: safeName,
+					message: buildPodListGiftMessage(safeOccasion, safeName),
+					duration_ms: Date.now() - startedAt,
+				});
+			}
+		}
+
+		const variantId = resolvePodListVariantId(product, requestedVariantId);
+		const cacheKey = makePodListPreviewCacheKey({
+			productId,
+			variantId,
+			occasion: safeOccasion,
+			name: safeName,
+		});
+
+		if (!forceRefresh) {
+			const memoryHit = getCachedPodListPreview(cacheKey);
+			if (memoryHit?.preview_image_url) {
+				return res.json({
+					success: true,
+					source: "memory-cache",
+					cache_key: cacheKey,
+					product_id: productId,
+					preview_image: memoryHit.preview_image_url,
+					preview_product_id: memoryHit.preview_product_id || null,
+					shop_id: memoryHit.shop_id || null,
+					occasion: safeOccasion,
+					name: safeName,
+					message:
+						memoryHit.message ||
+						buildPodListGiftMessage(safeOccasion, safeName),
+					duration_ms: Date.now() - startedAt,
+				});
+			}
+
+			const dbEntries = getPersistedPodListPreviews(product);
+			const dbHit = dbEntries.find((entry) => entry.key === cacheKey);
+			if (dbHit?.preview_image_url) {
+				setCachedPodListPreview(cacheKey, dbHit);
+				return res.json({
+					success: true,
+					source: "db-cache",
+					cache_key: cacheKey,
+					product_id: productId,
+					preview_image: dbHit.preview_image_url,
+					preview_product_id: dbHit.preview_product_id || null,
+					shop_id: dbHit.shop_id || null,
+					occasion: safeOccasion,
+					name: safeName,
+					message:
+						dbHit.message || buildPodListGiftMessage(safeOccasion, safeName),
+					duration_ms: Date.now() - startedAt,
+				});
+			}
+		}
+
+		if (!forceRefresh && podListPreviewInFlight.has(cacheKey)) {
+			const sharedResult = await podListPreviewInFlight.get(cacheKey);
+			return res.json({
+				success: true,
+				source: "shared-in-flight",
+				cache_key: cacheKey,
+				product_id: productId,
+				preview_image: sharedResult.preview_image_url,
+				preview_product_id: sharedResult.preview_product_id || null,
+				shop_id: sharedResult.shop_id || null,
+				occasion: safeOccasion,
+				name: safeName,
+				message:
+					sharedResult.message ||
+					buildPodListGiftMessage(safeOccasion, safeName),
+				duration_ms: Date.now() - startedAt,
+			});
+		}
+
+		const generationPromise = (async () => {
+			const generated = await generatePodListPreview({
+				product,
+				occasion: safeOccasion,
+				name: safeName,
+				variantIdInput: requestedVariantId,
+				cacheKey,
+				debugId,
+			});
+			const cacheEntry = {
+				key: cacheKey,
+				occasion: generated.occasion,
+				name: generated.name,
+				message: generated.message,
+				variant_id: generated.variantId,
+				preview_image_url: generated.previewImageUrl,
+				preview_product_id: generated.previewProductId || null,
+				shop_id: generated.shopId || null,
+				design_image_url: generated.designImageUrl || null,
+				design_image_public_id: generated.designImagePublicId || null,
+				generated_at: new Date().toISOString(),
+			};
+			const evictedPreviewsToCleanup = await persistPodListPreview({
+				product,
+				cacheEntry,
+			});
+			setCachedPodListPreview(cacheKey, cacheEntry);
+
+			if (
+				Array.isArray(evictedPreviewsToCleanup) &&
+				evictedPreviewsToCleanup.length > 0
+			) {
+				const tokenInfo = resolvePrintifyToken();
+				if (tokenInfo.token) {
+					Promise.allSettled(
+						evictedPreviewsToCleanup.map((entry) =>
+							deletePreviewProductById({
+								previewProductId: entry.preview_product_id,
+								shopIdHint: entry.shop_id || null,
+								printifyToken: tokenInfo.token,
+								debugId: `${debugId}-cleanup-evicted`,
+							}),
+						),
+					)
+						.then((results) => {
+							const deletedCount = results.filter(
+								(result) =>
+									result.status === "fulfilled" && result.value?.deleted,
+							).length;
+							const failedCount = results.filter(
+								(result) => result.status === "rejected",
+							).length;
+							console.log(`[${debugId}] Evicted POD list preview cleanup`, {
+								productId: String(product._id),
+								requested: evictedPreviewsToCleanup.length,
+								deletedCount,
+								failedCount,
+							});
+						})
+						.catch((cleanupError) => {
+							console.warn(`[${debugId}] Evicted preview cleanup warning`, {
+								productId: String(product._id),
+								status: cleanupError?.response?.status || null,
+								data: cleanupError?.response?.data || null,
+								message: cleanupError?.message,
+							});
+						});
+				}
+			}
+
+			return cacheEntry;
+		})();
+
+		podListPreviewInFlight.set(cacheKey, generationPromise);
+		let generatedEntry;
+		try {
+			generatedEntry = await generationPromise;
+		} finally {
+			podListPreviewInFlight.delete(cacheKey);
+		}
+
+		return res.json({
+			success: true,
+			source: "generated",
+			cache_key: cacheKey,
+			product_id: productId,
+			preview_image: generatedEntry.preview_image_url,
+			preview_product_id: generatedEntry.preview_product_id || null,
+			shop_id: generatedEntry.shop_id || null,
+			occasion: generatedEntry.occasion,
+			name: generatedEntry.name,
+			message: generatedEntry.message,
+			duration_ms: Date.now() - startedAt,
+		});
+	} catch (error) {
+		console.error(`[${debugId}] Failed generating POD list preview`, {
+			status: error?.response?.status || null,
+			data: error?.response?.data || null,
+			message: error?.message,
+			durationMs: Date.now() - startedAt,
+		});
+		try {
+			const fallbackProduct = await Product.findById(req.params?.productId)
+				.select("_id productAttributes thumbnailImage printifyProductDetails")
+				.lean();
+			const fallbackImage = pickProductFallbackImage(fallbackProduct);
+			if (fallbackImage) {
+				return res.json({
+					success: false,
+					source: "fallback-error",
+					product_id: req.params?.productId || null,
+					preview_image: fallbackImage,
+					error:
+						error?.response?.data?.errors?.reason ||
+						error?.response?.data?.message ||
+						error?.message ||
+						"Preview generation failed; returned fallback image.",
+				});
+			}
+		} catch (fallbackError) {
+			console.warn(`[${debugId}] Failed to resolve fallback preview image`, {
+				message: fallbackError?.message,
+			});
+		}
+		return res.status(500).json({
+			error: "Failed to generate POD list preview.",
+			details: error?.response?.data || error?.message,
+		});
+	}
+};
+
+exports.cleanupPodListPreviewSession = async (req, res) => {
+	const debugId = `pod-list-cleanup-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2, 8)}`;
+	const startedAt = Date.now();
+	try {
+		const tokenInfo = resolvePrintifyToken();
+		if (!tokenInfo.token) {
+			return res.status(500).json({ error: tokenInfo.error });
+		}
+
+		const cleanupItems = normalizePodListCleanupItems(
+			req.body?.items || req.body?.preview_products || [],
+		);
+		if (!cleanupItems.length) {
+			return res.json({
+				success: true,
+				requested: 0,
+				deleted: 0,
+				not_found: 0,
+				failed: 0,
+				duration_ms: Date.now() - startedAt,
+			});
+		}
+
+		console.log(`[${debugId}] POD list session cleanup requested`, {
+			requested: cleanupItems.length,
+			hasToken: Boolean(tokenInfo.token),
+			tokenSource: tokenInfo.source || null,
+		});
+
+		const cleanupResults = await Promise.allSettled(
+			cleanupItems.map((item) =>
+				deletePreviewProductById({
+					previewProductId: item.previewProductId,
+					shopIdHint: item.shopIdHint,
+					printifyToken: tokenInfo.token,
+					debugId,
+				}),
+			),
+		);
+
+		const failures = [];
+		let deletedCount = 0;
+		let notFoundCount = 0;
+		for (let index = 0; index < cleanupResults.length; index++) {
+			const result = cleanupResults[index];
+			const item = cleanupItems[index];
+			if (result.status === "fulfilled") {
+				if (result.value?.deleted) deletedCount += 1;
+				if (result.value?.notFound) notFoundCount += 1;
+				continue;
+			}
+			failures.push({
+				preview_product_id: item.previewProductId,
+				shop_id: item.shopIdHint || null,
+				product_id: item.productId || null,
+				status: result?.reason?.response?.status || null,
+				message: result?.reason?.message || "Unknown cleanup error",
+			});
+		}
+
+		const cleanupIdsByProductId = new Map();
+		for (const item of cleanupItems) {
+			if (!item.productId) continue;
+			const key = String(item.productId);
+			if (!cleanupIdsByProductId.has(key)) {
+				cleanupIdsByProductId.set(key, new Set());
+			}
+			cleanupIdsByProductId
+				.get(key)
+				.add(String(item.previewProductId || "").trim());
+		}
+
+		const dbCleanupSummary = [];
+		for (const [productId, previewIdSet] of cleanupIdsByProductId.entries()) {
+			const summary = await removePersistedPodListPreviewsForProduct({
+				productId,
+				previewProductIds: [...previewIdSet],
+			});
+			dbCleanupSummary.push(summary);
+		}
+
+		const updatedProducts = dbCleanupSummary.filter(
+			(entry) => entry?.updated,
+		).length;
+
+		console.log(`[${debugId}] POD list session cleanup finished`, {
+			requested: cleanupItems.length,
+			deletedCount,
+			notFoundCount,
+			failedCount: failures.length,
+			updatedProducts,
+			durationMs: Date.now() - startedAt,
+		});
+
+		return res.json({
+			success: failures.length === 0,
+			requested: cleanupItems.length,
+			deleted: deletedCount,
+			not_found: notFoundCount,
+			failed: failures.length,
+			updated_products: updatedProducts,
+			failures: failures.slice(0, 50),
+			duration_ms: Date.now() - startedAt,
+		});
+	} catch (error) {
+		console.error(`[${debugId}] POD list session cleanup failed`, {
+			status: error?.response?.status || null,
+			data: error?.response?.data || null,
+			message: error?.message,
+			durationMs: Date.now() - startedAt,
+		});
+		return res.status(500).json({
+			error: "Failed to clean POD list preview session products.",
 		});
 	}
 };
@@ -1967,7 +5500,7 @@ exports.printifyWebhook = async (req, res) => {
 				// Update the local order status
 				await Order.findOneAndUpdate(
 					{ "printifyOrderDetails.id": orderId },
-					{ "printifyOrderDetails.status": newStatus }
+					{ "printifyOrderDetails.status": newStatus },
 				);
 				break;
 			// Handle other events as needed
@@ -2012,7 +5545,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 				"https://api.printify.com/v1/uploads.json",
 				{
 					headers: { Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}` },
-				}
+				},
 			);
 			for (const libImg of uploadsRes.data?.data || []) {
 				validImageIds.add(libImg.id);
@@ -2021,7 +5554,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 			// not fatal if we can't fetch library, but we won't remove unknown images
 			console.error(
 				"Could not fetch library uploads:",
-				libErr.response?.data || libErr.message
+				libErr.response?.data || libErr.message,
 			);
 		}
 
@@ -2045,13 +5578,13 @@ exports.updatePrintifyProduct = async (req, res) => {
 				`https://api.printify.com/v1/shops/${shopId}/products/${product_id}.json`,
 				{
 					headers: { Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}` },
-				}
+				},
 			);
 			existingProduct = existingResp.data;
 		} catch (errGet) {
 			console.error(
 				"Failed to fetch existing product:",
-				errGet.response?.data || errGet.message
+				errGet.response?.data || errGet.message,
 			);
 			return res.status(500).json({
 				error: "Failed to fetch existing product before update",
@@ -2117,7 +5650,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 				// filter out any variant_ids that are not in finalVariantIds
 				// or keep them if your blueprint demands
 				const validPAIds = (pa.variant_ids || []).filter((vid) =>
-					finalVariantIds.includes(vid)
+					finalVariantIds.includes(vid),
 				);
 
 				return { ...pa, variant_ids: validPAIds };
@@ -2168,7 +5701,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 				// Not locked => fail
 				console.error(
 					"Error updating product (1st attempt):",
-					errData || firstErr.message
+					errData || firstErr.message,
 				);
 				return res.status(500).json({
 					error: "Failed to update Printify product",
@@ -2178,7 +5711,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 
 			// If locked => unlock => retry
 			console.log(
-				"Product locked. Attempting to unlock via publishing_failed..."
+				"Product locked. Attempting to unlock via publishing_failed...",
 			);
 			try {
 				await axios.post(
@@ -2189,12 +5722,12 @@ exports.updatePrintifyProduct = async (req, res) => {
 							Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 							"Content-Type": "application/json",
 						},
-					}
+					},
 				);
 			} catch (unlockErr) {
 				console.error(
 					"Failed to unlock product:",
-					unlockErr.response?.data || unlockErr.message
+					unlockErr.response?.data || unlockErr.message,
 				);
 				return res.status(500).json({
 					error: "Failed to unlock product",
@@ -2213,7 +5746,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 			} catch (secondErr) {
 				console.error(
 					"Error updating product (2nd attempt):",
-					secondErr.response?.data || secondErr.message
+					secondErr.response?.data || secondErr.message,
 				);
 				return res.status(500).json({
 					error: "Failed to update Printify product after unlocking",
@@ -2224,7 +5757,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 	} catch (outerErr) {
 		console.error(
 			"Error updating Printify product:",
-			outerErr.response?.data || outerErr.message
+			outerErr.response?.data || outerErr.message,
 		);
 		return res.status(500).json({
 			error: "Failed to update Printify product (outer catch)",
@@ -2233,7 +5766,7 @@ exports.updatePrintifyProduct = async (req, res) => {
 	}
 };
 
-// A 1×1 fully transparent PNG, Base64-encoded as a data URI
+// A 1Ã—1 fully transparent PNG, Base64-encoded as a data URI
 const TRANSPARENT_IMAGE_URL =
 	"https://res.cloudinary.com/infiniteapps/image/upload/v1738428028/AdobeStock_679343692_Preview_onatmh.png";
 
@@ -2269,14 +5802,14 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 						Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 						"Content-Type": "application/json",
 					},
-				}
+				},
 			);
 			transparentId = uploadResp.data.id; // e.g. "5e16d66791287a0006e522b2"
 			console.log("Uploaded transparent image => ID:", transparentId);
 		} catch (uploadErr) {
 			console.error(
 				"Failed to upload transparent image:",
-				uploadErr.response?.data || uploadErr.message
+				uploadErr.response?.data || uploadErr.message,
 			);
 			return res.status(400).json({
 				error: "Failed to upload transparent image to Printify",
@@ -2293,7 +5826,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 				"https://api.printify.com/v1/shops.json",
 				{
 					headers: { Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}` },
-				}
+				},
 			);
 			if (!shopRes.data?.length) {
 				return res.status(404).json({ error: "No Printify shops found." });
@@ -2302,7 +5835,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 		} catch (shopErr) {
 			console.error(
 				"Error fetching shop ID:",
-				shopErr.response?.data || shopErr.message
+				shopErr.response?.data || shopErr.message,
 			);
 			return res.status(500).json({
 				error: "Failed to fetch Printify shops",
@@ -2319,7 +5852,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 				`https://api.printify.com/v1/shops/${shopId}/products.json`,
 				{
 					headers: { Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}` },
-				}
+				},
 			);
 			products = productsRes.data?.data || [];
 			if (!products.length) {
@@ -2331,7 +5864,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 		} catch (listErr) {
 			console.error(
 				"Error fetching products list:",
-				listErr.response?.data || listErr.message
+				listErr.response?.data || listErr.message,
 			);
 			return res.status(500).json({
 				error: "Failed to fetch products from Printify",
@@ -2355,13 +5888,13 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 					`https://api.printify.com/v1/shops/${shopId}/products/${productId}.json`,
 					{
 						headers: { Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}` },
-					}
+					},
 				);
 				fullProduct = singleRes.data;
 			} catch (getErr) {
 				console.error(
 					"Failed GET product details:",
-					getErr.response?.data || getErr.message
+					getErr.response?.data || getErr.message,
 				);
 				results.push({
 					productId,
@@ -2407,9 +5940,9 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 							Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 							"Content-Type": "application/json",
 						},
-					}
+					},
 				);
-				console.log(`✅ Product ${productId}: replaced with blank design`);
+				console.log(`âœ… Product ${productId}: replaced with blank design`);
 				results.push({
 					productId,
 					status: "BlankDesignApplied",
@@ -2421,7 +5954,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 				// If locked => we do publishing_failed => re-try
 				if (errCode === 8252) {
 					console.log(
-						`Product ${productId} is locked. Attempting to unlock...`
+						`Product ${productId} is locked. Attempting to unlock...`,
 					);
 					try {
 						// i) publishing_failed
@@ -2433,7 +5966,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 									Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 									"Content-Type": "application/json",
 								},
-							}
+							},
 						);
 						// ii) Retry PUT
 						await axios.put(
@@ -2444,9 +5977,9 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 									Authorization: `Bearer ${DESIGN_PRINTIFY_TOKEN}`,
 									"Content-Type": "application/json",
 								},
-							}
+							},
 						);
-						console.log(`✅ Product ${productId} unlocked and updated`);
+						console.log(`âœ… Product ${productId} unlocked and updated`);
 						results.push({
 							productId,
 							status: "BlankDesignApplied_AfterUnlock",
@@ -2455,7 +5988,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 					} catch (unlockErr) {
 						console.error(
 							"Failed unlocking or updating product:",
-							unlockErr.response?.data || unlockErr.message
+							unlockErr.response?.data || unlockErr.message,
 						);
 						results.push({
 							productId,
@@ -2465,8 +5998,8 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 					}
 				} else {
 					console.error(
-						`❌ Validation/Other error for product ${productId}:`,
-						putErr.response?.data || putErr.message
+						`âŒ Validation/Other error for product ${productId}:`,
+						putErr.response?.data || putErr.message,
 					);
 					results.push({
 						productId,
@@ -2479,7 +6012,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 
 		// 5) SUMMARIZE RESULTS
 		const successCount = results.filter((r) =>
-			r.status.startsWith("BlankDesignApplied")
+			r.status.startsWith("BlankDesignApplied"),
 		).length;
 		const failCount = results.length - successCount;
 
@@ -2493,7 +6026,7 @@ exports.revertPrintifyProductsToBePlainNoDesign = async (req, res) => {
 	} catch (error) {
 		console.error(
 			"Error removing designs:",
-			error.response?.data || error.message
+			error.response?.data || error.message,
 		);
 		return res.status(500).json({
 			error: "Failed to revert designs on Printify products",

@@ -13,6 +13,10 @@ const {
 	forceRepublishPrintifyProducts,
 	getSinglePrintifyProductById,
 	createCustomPrintifyOrder,
+	previewCustomPrintifyDesign,
+	deletePreviewCustomPrintifyDesign,
+	getPodListingPreview,
+	cleanupPodListPreviewSession,
 	updatePrintifyProduct,
 	revertPrintifyProductsToBePlainNoDesign,
 } = require("../controllers/printify");
@@ -40,6 +44,13 @@ router.post(
 );
 
 router.post("/create-custom-order", createCustomPrintifyOrder);
+router.post("/preview-custom-design", previewCustomPrintifyDesign);
+router.delete(
+	"/preview-custom-design/:previewProductId",
+	deletePreviewCustomPrintifyDesign
+);
+router.get("/pod/list-preview/:productId", getPodListingPreview);
+router.post("/pod/list-preview/cleanup-session", cleanupPodListPreviewSession);
 
 router.param("userId", userById);
 

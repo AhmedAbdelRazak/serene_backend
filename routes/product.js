@@ -31,12 +31,14 @@ const {
 	listProductsNoFilterForSeller,
 	autoCompleteProducts,
 	createDistinctCategoriesActiveProducts,
+	listProductsForSeo,
 } = require("../controllers/product");
 
 router.post("/product/create/:userId", requireSignin, isSeller, create);
 router.put("/product/:productId/:userId", requireSignin, isSeller, update);
 
 router.get("/products", listProductsNoFilter);
+router.get("/seo/products/:page/:records", listProductsForSeo);
 router.get("/products/:storeId", listProductsNoFilterForSeller);
 router.get("/products/pod/print-on-demand-products", listPODProducts);
 router.get("/product/:productId", read);
@@ -78,6 +80,29 @@ router.put("/post/uncomment", requireSignin, uncomment);
 
 // rating
 router.put("/product/star/:productId/:userId", requireSignin, productStar);
+
+// Backward-compatible fallback:
+// Some stale clients may call /products//:page/:records (empty filters segment).
+// Route those requests to the filteredProducts handler with "all" filters.
+router.get("/products//:page/:records", (req, res, next) => {
+	const page = `${req.params.page || ""}`.trim();
+	const records = `${req.params.records || ""}`.trim();
+	if (!/^\d+$/.test(page) || !/^\d+$/.test(records)) {
+		return next();
+	}
+	req.params.filters = "all";
+	return filteredProducts(req, res, next);
+});
+
+router.get("/products/:page/:records", (req, res, next) => {
+	const page = `${req.params.page || ""}`.trim();
+	const records = `${req.params.records || ""}`.trim();
+	if (!/^\d+$/.test(page) || !/^\d+$/.test(records)) {
+		return next();
+	}
+	req.params.filters = "all";
+	return filteredProducts(req, res, next);
+});
 
 router.get("/products/:filters/:page/:records", filteredProducts);
 
