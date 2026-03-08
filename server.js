@@ -41,7 +41,7 @@ app.use(cors());
 app.use(
 	compression({
 		threshold: 1024,
-	})
+	}),
 );
 app.use(express.json({ limit: "50mb" }));
 
