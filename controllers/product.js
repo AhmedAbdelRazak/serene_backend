@@ -778,7 +778,8 @@ exports.gettingSpecificSetOfProducts = async (req, res) => {
 			records,
 		} = req.params; // from path
 
-		const { skip, storeId } = req.query; // from query
+		const { skip, storeId, lite } = req.query; // from query
+		const useLitePayload = String(lite || "").trim() === "1";
 
 		// Convert them to numbers if needed
 		const limitNumber = parseInt(records, 10) || 5;
@@ -943,6 +944,112 @@ exports.gettingSpecificSetOfProducts = async (req, res) => {
 			products = fallback;
 		}
 
+		const slimImageObject = (image) => {
+			if (!image) return image;
+			if (typeof image === "string") return image;
+			if (typeof image !== "object") return image;
+			const slim = {};
+			if (image.url) slim.url = image.url;
+			if (image.src) slim.src = image.src;
+			if (image.public_id) slim.public_id = image.public_id;
+			if (image.cloudinary_url) slim.cloudinary_url = image.cloudinary_url;
+			if (image.cloudinary_public_id) {
+				slim.cloudinary_public_id = image.cloudinary_public_id;
+			}
+			return Object.keys(slim).length ? slim : image;
+		};
+
+		const slimPrintifyImage = (image) => {
+			if (!image || typeof image !== "object") return null;
+			return {
+				src: image.src || image.url || "",
+				position: image.position || image.placeholder || "",
+				is_default: Boolean(image.is_default),
+			};
+		};
+
+		const slimProductAttribute = (attribute, index) => {
+			if (!attribute || typeof attribute !== "object") return null;
+			const slimAttribute = {
+				PK: attribute.PK || "",
+				size: attribute.size || "",
+				color: attribute.color || "",
+				scent: attribute.scent || "",
+				quantity: Number(attribute.quantity || 0),
+			};
+
+			if (index === 0) {
+				slimAttribute.price = Number(attribute.price || 0);
+				slimAttribute.priceAfterDiscount = Number(
+					attribute.priceAfterDiscount || 0
+				);
+				slimAttribute.productImages = Array.isArray(attribute.productImages)
+					? attribute.productImages.slice(0, 1).map(slimImageObject)
+					: [];
+			}
+
+			if (attribute.exampleDesignImage) {
+				slimAttribute.exampleDesignImage = slimImageObject(
+					attribute.exampleDesignImage
+				);
+			}
+
+			return slimAttribute;
+		};
+
+		const slimProductForHome = (product) => {
+			const rawAttributes = Array.isArray(product?.productAttributes)
+				? product.productAttributes
+				: [];
+			const productAttributes = Array.isArray(product?.productAttributes)
+				? rawAttributes
+						.map((attr, index) => slimProductAttribute(attr, index))
+						.filter(Boolean)
+				: [];
+			const printifyImages = Array.isArray(product?.printifyProductDetails?.images)
+				? product.printifyProductDetails.images
+						.slice(0, 1)
+						.map(slimPrintifyImage)
+						.filter(Boolean)
+				: [];
+			const thumbnailImage = Array.isArray(product?.thumbnailImage)
+				? product.thumbnailImage.slice(0, 1).map((thumb) => ({
+						images: Array.isArray(thumb?.images)
+							? thumb.images.slice(0, 1).map(slimImageObject)
+							: [],
+					}))
+				: [];
+			return {
+				_id: product?._id,
+				productName: product?.productName || "",
+				slug: product?.slug || "",
+				description: `${product?.description || ""}`.slice(0, 400),
+				price: Number(product?.price || 0),
+				priceAfterDiscount: Number(product?.priceAfterDiscount || 0),
+				quantity: Number(product?.quantity || 0),
+				isPrintifyProduct: Boolean(product?.isPrintifyProduct),
+				createdAt: product?.createdAt || null,
+				updatedAt: product?.updatedAt || null,
+				category: product?.category
+					? {
+							_id: product.category._id,
+							categoryName: product.category.categoryName || "",
+							categorySlug: product.category.categorySlug || "",
+						}
+					: null,
+				thumbnailImage,
+				productAttributes,
+				printifyProductDetails: product?.printifyProductDetails
+					? {
+							POD: Boolean(product.printifyProductDetails.POD),
+							id: product.printifyProductDetails.id || "",
+							title: product.printifyProductDetails.title || "",
+							images: printifyImages,
+						}
+					: null,
+			};
+		};
+
 		// (J) Group each product by color
 		const processedProducts = products
 			.map((product) => {
@@ -965,6 +1072,14 @@ exports.gettingSpecificSetOfProducts = async (req, res) => {
 				return [product];
 			})
 			.flat();
+
+		if (useLitePayload) {
+			res.set(
+				"Cache-Control",
+				"public, max-age=120, s-maxage=300, stale-while-revalidate=600"
+			);
+			return res.json(processedProducts.map(slimProductForHome));
+		}
 
 		return res.json(processedProducts);
 	} catch (err) {

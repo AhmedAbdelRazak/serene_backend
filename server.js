@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 require("dotenv").config();
 const morgan = require("morgan");
 const cors = require("cors");
+const compression = require("compression");
 const { readdirSync } = require("fs");
 
 const http = require("http");
@@ -37,6 +38,11 @@ mongoose
 // middlewares
 app.use(morgan("dev"));
 app.use(cors());
+app.use(
+	compression({
+		threshold: 1024,
+	})
+);
 app.use(express.json({ limit: "50mb" }));
 
 app.get("/", (req, res) => {
