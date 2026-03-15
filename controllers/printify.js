@@ -1585,13 +1585,21 @@ function normalizePodDefaultDesignImages(images = []) {
 	const dedupe = new Set();
 	const normalized = [];
 	for (const image of safeImages) {
+		const cloudinaryUrl = String(
+			image?.cloudinary_url || image?.cloudinaryUrl || "",
+		).trim();
 		const url = String(image?.url || image?.src || "").trim();
-		if (!url) continue;
-		if (dedupe.has(url)) continue;
-		dedupe.add(url);
+		const preferredUrl = cloudinaryUrl || url;
+		if (!preferredUrl) continue;
+		if (dedupe.has(preferredUrl)) continue;
+		dedupe.add(preferredUrl);
 		normalized.push({
 			url,
 			public_id: String(image?.public_id || image?.publicId || "").trim(),
+			cloudinary_url: cloudinaryUrl,
+			cloudinary_public_id: String(
+				image?.cloudinary_public_id || image?.cloudinaryPublicId || "",
+			).trim(),
 		});
 	}
 	return normalized;
@@ -5153,8 +5161,11 @@ exports.getPodListingPreview = async (req, res) => {
 					success: true,
 					source: "stored-default-design",
 					product_id: productId,
-					preview_image: storedDefaultImages[0].url,
-					preview_images: storedDefaultImages.map((item) => item.url),
+					preview_image:
+						storedDefaultImages[0].cloudinary_url || storedDefaultImages[0].url,
+					preview_images: storedDefaultImages.map(
+						(item) => item.cloudinary_url || item.url,
+					),
 					preview_product_id: null,
 					shop_id: null,
 					occasion: safeOccasion,
