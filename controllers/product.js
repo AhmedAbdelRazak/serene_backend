@@ -143,31 +143,48 @@ exports.listPODProducts = async (req, res) => {
 	let order = req.query.order ? req.query.order : "desc";
 	let sortBy = req.query.sortBy ? req.query.sortBy : "viewsCount";
 	let limit = req.query.limit ? parseInt(req.query.limit) : 200;
+	const useLitePayload = `${req.query.lite || ""}` === "1";
 
 	try {
-		const products = await Product.find({
+		let query = Product.find({
 			"printifyProductDetails.POD": true,
 		})
-			.populate(
-				"category",
-				"_id categoryName categorySlug thumbnail categoryName_Arabic"
-			)
-			.populate(
-				"subcategory",
-				"_id SubcategoryName SubcategorySlug thumbnail SubcategoryName_Arabic"
-			)
-			.populate("gender", "_id genderName thumbnail")
-			.populate("addedByEmployee", "_id name role")
-			.populate("updatedByEmployee", "_id name role")
-			.populate({
-				path: "relatedProducts",
-				populate: {
-					path: "category",
-					select: "_id categoryName categorySlug thumbnail categoryName_Arabic",
-				},
-			})
 			.sort([[sortBy, order]])
 			.limit(limit);
+
+		if (useLitePayload) {
+			query = query
+				.select(
+					"_id productName slug price priceAfterDiscount quantity category thumbnailImage printifyProductDetails"
+				)
+				.populate(
+					"category",
+					"_id categoryName categorySlug thumbnail categoryName_Arabic"
+				)
+				.lean();
+		} else {
+			query = query
+				.populate(
+					"category",
+					"_id categoryName categorySlug thumbnail categoryName_Arabic"
+				)
+				.populate(
+					"subcategory",
+					"_id SubcategoryName SubcategorySlug thumbnail SubcategoryName_Arabic"
+				)
+				.populate("gender", "_id genderName thumbnail")
+				.populate("addedByEmployee", "_id name role")
+				.populate("updatedByEmployee", "_id name role")
+				.populate({
+					path: "relatedProducts",
+					populate: {
+						path: "category",
+						select: "_id categoryName categorySlug thumbnail categoryName_Arabic",
+					},
+				});
+		}
+
+		const products = await query;
 
 		res.json(products);
 	} catch (error) {
