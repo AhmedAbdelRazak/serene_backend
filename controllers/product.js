@@ -2074,13 +2074,47 @@ exports.listProductsForSeo = async (req, res) => {
 			const safePrintify = product?.printifyProductDetails
 				? {
 						POD: product.printifyProductDetails.POD,
+						id: product.printifyProductDetails.id,
 						title: product.printifyProductDetails.title,
 						description: product.printifyProductDetails.description,
 						options: Array.isArray(product.printifyProductDetails.options)
 							? product.printifyProductDetails.options.map((opt) => ({
 									name: opt?.name,
-									values: Array.isArray(opt?.values) ? opt.values : [],
+									type: opt?.type,
+									values: Array.isArray(opt?.values)
+										? opt.values.map((value) => ({
+												id: value?.id,
+												title: value?.title,
+												colors: Array.isArray(value?.colors)
+													? value.colors
+													: [],
+										  }))
+										: [],
 								}))
+							: [],
+						variants: Array.isArray(product.printifyProductDetails.variants)
+							? product.printifyProductDetails.variants.map((variant) => ({
+									id: variant?.id,
+									sku: variant?.sku,
+									price: variant?.price,
+									is_default: Boolean(variant?.is_default),
+									is_enabled: variant?.is_enabled !== false,
+									options: Array.isArray(variant?.options)
+										? variant.options
+										: [],
+							  }))
+							: [],
+						images: Array.isArray(product.printifyProductDetails.images)
+							? product.printifyProductDetails.images
+									.slice(0, 24)
+									.map((image) => ({
+										src: image?.src || image?.url || "",
+										variant_ids: Array.isArray(image?.variant_ids)
+											? image.variant_ids
+											: [],
+										is_default: Boolean(image?.is_default),
+										position: image?.position || image?.placeholder || "",
+									}))
 							: [],
 					}
 				: {};
@@ -2088,6 +2122,7 @@ exports.listProductsForSeo = async (req, res) => {
 			const safeProductAttributes = Array.isArray(product?.productAttributes)
 				? product.productAttributes.map((attr) => ({
 						PK: attr?.PK,
+						SubSKU: attr?.SubSKU,
 						size: attr?.size,
 						color: attr?.color,
 						scent: attr?.scent,
