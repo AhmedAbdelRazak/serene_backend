@@ -16,8 +16,8 @@ const axios = require("axios");
 exports.productById = async (req, res, next, id) => {
 	try {
 		const product = await Product.findById(id)
-			.populate("ratings.ratedBy", "_id name email")
-			.populate("comments.postedBy", "_id name email")
+			.populate("ratings.ratedBy", "_id name")
+			.populate("comments.postedBy", "_id name")
 			.populate(
 				"subcategory",
 				"_id SubcategoryName SubcategorySlug subCategoryStatus"
@@ -432,7 +432,7 @@ exports.list = (req, res) => {
 			"_id categoryName categorySlug thumbnail categoryName_Arabic"
 		)
 		.populate("comments", "text created")
-		.populate("comments.postedBy", "_id name email")
+		.populate("comments.postedBy", "_id name")
 		.populate(
 			"subcategory",
 			"_id SubcategoryName SubcategorySlug subCategoryStatus"
@@ -497,7 +497,7 @@ exports.comment = async (req, res) => {
 			{ $push: { comments: comment } },
 			{ new: true }
 		)
-			.populate("comments.postedBy", "_id name email")
+			.populate("comments.postedBy", "_id name")
 			// .populate("postedBy", "_id name email")
 			.exec();
 
@@ -516,7 +516,7 @@ exports.uncomment = async (req, res) => {
 			{ $pull: { comments: { _id: comment._id } } },
 			{ new: true }
 		)
-			.populate("comments.postedBy", "_id name email")
+			.populate("comments.postedBy", "_id name")
 			// .populate("postedBy", "_id name email")
 			.exec();
 
@@ -1119,8 +1119,8 @@ exports.readSingleProduct = async (req, res, next) => {
 				"subcategory",
 				"SubcategoryName SubcategorySlug subCategoryStatus"
 			)
-			.populate("ratings.ratedBy", "_id name email")
-			.populate("comments.postedBy", "_id name email")
+			.populate("ratings.ratedBy", "_id name")
+			.populate("comments.postedBy", "_id name")
 			.populate("gender", "_id genderName thumbnail")
 			.populate("addedByEmployee", "_id name role")
 			.populate("updatedByEmployee", "_id name role")
