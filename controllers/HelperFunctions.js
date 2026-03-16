@@ -202,6 +202,90 @@ function findMatchingPodVariantForItem(item = {}) {
 	);
 }
 
+function isLikelyMongoId(value = "") {
+	return /^[a-f0-9]{24}$/i.test(`${value || ""}`.trim());
+}
+
+function getCartProductId(item = {}) {
+	const raw = item?.productId || item?._id || item?.id || "";
+	const normalized = `${raw || ""}`.trim();
+	return normalized || null;
+}
+
+function isPodCartItem(item = {}) {
+	return Boolean(
+		item?.isPrintifyProduct &&
+			(item?.printifyProductDetails?.POD === true || item?.customDesign)
+	);
+}
+
+function isAvailablePrintifyVariant(variant = null) {
+	return Boolean(variant) && variant?.is_enabled !== false && variant?.is_available !== false;
+}
+
+async function hydratePrintifyItemFromCatalog(item = {}) {
+	if (!item?.isPrintifyProduct) return item;
+
+	const currentDetails = item?.printifyProductDetails || {};
+	const hasVariants =
+		Array.isArray(currentDetails?.variants) && currentDetails.variants.length > 0;
+	const hasOptions =
+		Array.isArray(currentDetails?.options) && currentDetails.options.length > 0;
+
+	if (hasVariants && hasOptions && (currentDetails?.POD === true || !item?.customDesign)) {
+		return item;
+	}
+
+	const productId = getCartProductId(item);
+	if (!isLikelyMongoId(productId)) {
+		return item;
+	}
+
+	try {
+		const productDoc = await Product.findById(productId)
+			.select("productName isPrintifyProduct printifyProductDetails")
+			.lean();
+		if (!productDoc?.printifyProductDetails) {
+			return item;
+		}
+
+		const catalogDetails = productDoc.printifyProductDetails || {};
+		return {
+			...item,
+			name: item?.name || productDoc.productName || "",
+			isPrintifyProduct:
+				item?.isPrintifyProduct ?? productDoc.isPrintifyProduct ?? false,
+			printifyProductDetails: {
+				...catalogDetails,
+				...currentDetails,
+				POD: currentDetails?.POD === true || catalogDetails?.POD === true,
+				variants: hasVariants
+					? currentDetails.variants
+					: Array.isArray(catalogDetails?.variants)
+						? catalogDetails.variants
+						: [],
+				options: hasOptions
+					? currentDetails.options
+					: Array.isArray(catalogDetails?.options)
+						? catalogDetails.options
+						: [],
+				images:
+					Array.isArray(currentDetails?.images) && currentDetails.images.length > 0
+						? currentDetails.images
+						: Array.isArray(catalogDetails?.images)
+							? catalogDetails.images
+							: [],
+			},
+		};
+	} catch (error) {
+		console.warn(
+			`Failed to hydrate Printify product details for ${productId}:`,
+			error?.message || error
+		);
+		return item;
+	}
+}
+
 function getPodVariantTitleParts(item = {}) {
 	return `${item?.customDesign?.variantTitle || ""}`
 		.split("/")
@@ -276,13 +360,14 @@ const checkStockAvailability = async (order) => {
 	// ─────────────  A) Simple (no‑variable) products  ─────────────
 	for (const item of order.productsNoVariable) {
 		console.log("      checking simple item ->", item.name);
-		if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
+		if (isPodCartItem(item)) {
 			/* POD – check variant availability inside printifyProductDetails */
-			const matchedVariant = findMatchingPodVariantForItem(item);
+			const hydratedItem = await hydratePrintifyItemFromCatalog(item);
+			const matchedVariant = findMatchingPodVariantForItem(hydratedItem);
 
 			if (!matchedVariant)
 				return `No matching POD variant found for product ${item.name}.`;
-			if (!matchedVariant.is_available)
+			if (!isAvailablePrintifyVariant(matchedVariant))
 				return `Variant is not available for product ${item.name}.`;
 		} else {
 			/* Local stock */
@@ -296,12 +381,13 @@ const checkStockAvailability = async (order) => {
 	// ─────────────  B) Variable products  ─────────────
 	for (const item of order.chosenProductQtyWithVariables) {
 		console.log("      checking variant item ->", item.name);
-		if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true) {
-			const matchedVariant = findMatchingPodVariantForItem(item);
+		if (isPodCartItem(item)) {
+			const hydratedItem = await hydratePrintifyItemFromCatalog(item);
+			const matchedVariant = findMatchingPodVariantForItem(hydratedItem);
 
 			if (!matchedVariant)
 				return `No matching POD variant found for product ${item.name}.`;
-			if (!matchedVariant.is_available)
+			if (!isAvailablePrintifyVariant(matchedVariant))
 				return `Variant is not available for product ${item.name}.`;
 		} else {
 			const product = await Product.findById(item.productId);
@@ -331,7 +417,7 @@ const updateStock = async (order) => {
 
 		// ───────── simple items
 		for (const item of order.productsNoVariable) {
-			if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true)
+			if (isPodCartItem(item))
 				continue; // POD handled by Printify
 			bulkOps.push({
 				updateOne: {
@@ -344,7 +430,7 @@ const updateStock = async (order) => {
 
 		// ───────── variable items
 		for (const item of order.chosenProductQtyWithVariables) {
-			if (item.isPrintifyProduct && item.printifyProductDetails?.POD === true)
+			if (isPodCartItem(item))
 				continue;
 			const product = await Product.findById(item.productId);
 			if (!product)
@@ -500,12 +586,13 @@ function buildPodFulfillmentRecord({
 /* ----------  for POD items with custom design (ephemeral product) ---------- */
 async function createOnTheFlyPOD(item, order, token) {
 	try {
-		const shopId = item.printifyProductDetails?.shop_id;
+		const hydratedItem = await hydratePrintifyItemFromCatalog(item);
+		const shopId = hydratedItem.printifyProductDetails?.shop_id;
 		if (!shopId) throw new Error("No Printify shop_id found for POD item");
 		const recipient = splitRecipientName(order);
 
 		/* 1) locate correct variant ID */
-		const matchedVariant = findMatchingPodVariantForItem(item);
+		const matchedVariant = findMatchingPodVariantForItem(hydratedItem);
 
 		if (!matchedVariant)
 			throw new Error("No real variant found for chosen color/size");
@@ -513,11 +600,11 @@ async function createOnTheFlyPOD(item, order, token) {
 		const realVariantId = matchedVariant.id;
 
 		/* 2) upload bare screenshot */
-		if (!item?.customDesign?.bareScreenshotUrl)
+		if (!hydratedItem?.customDesign?.bareScreenshotUrl)
 			throw new Error("No bareScreenshotUrl found for custom design");
 
 		const uploadedId = await uploadIfNeeded(
-			item.customDesign.bareScreenshotUrl,
+			hydratedItem.customDesign.bareScreenshotUrl,
 			token
 		);
 		if (!uploadedId) throw new Error("Design upload failed");
@@ -528,18 +615,18 @@ async function createOnTheFlyPOD(item, order, token) {
 			y = 0.5,
 			scale = 1,
 			angle = 0,
-		} = item.customDesign?.placementParams || {};
+		} = hydratedItem.customDesign?.placementParams || {};
 
 		/* 4) create temporary product */
 		const productPayload = {
-			title: "Custom One‑Time Product",
-			description: "User‑personalised product",
-			blueprint_id: item.printifyProductDetails.blueprint_id,
-			print_provider_id: item.printifyProductDetails.print_provider_id,
+			title: "Custom One‐Time Product",
+			description: "User‐personalised product",
+			blueprint_id: hydratedItem.printifyProductDetails.blueprint_id,
+			print_provider_id: hydratedItem.printifyProductDetails.print_provider_id,
 			variants: [
 				{
 					id: realVariantId,
-					price: Math.round(item.price * 100),
+					price: Math.round(hydratedItem.price * 100),
 					is_enabled: true,
 					is_default: true,
 				},
@@ -576,7 +663,7 @@ async function createOnTheFlyPOD(item, order, token) {
 				{
 					product_id: newProductId,
 					variant_id: realVariantId,
-					quantity: item.ordered_quantity,
+					quantity: hydratedItem.ordered_quantity,
 				},
 			],
 			shipping_method: 1,
@@ -613,7 +700,7 @@ async function createOnTheFlyPOD(item, order, token) {
 
 		/* 7) persist POD info */
 		const podFulfillmentRecord = buildPodFulfillmentRecord({
-			item,
+			item: hydratedItem,
 			order,
 			shopId,
 			matchedVariant,
@@ -649,7 +736,7 @@ const postOrderToPrintify = async (order) => {
 		const recipient = splitRecipientName(order);
 
 		/* POD with user design → create temporary product */
-		if (item.printifyProductDetails?.POD === true && item.customDesign) {
+		if (isPodCartItem(item) && item.customDesign) {
 			await createOnTheFlyPOD(item, order, designToken);
 			continue;
 		}
