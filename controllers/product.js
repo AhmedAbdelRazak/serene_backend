@@ -13,7 +13,175 @@ const mongoose = require("mongoose");
 const ObjectId = mongoose.Types.ObjectId;
 const axios = require("axios");
 
+const EXCLUDED_CATEGORY_ID = "6691981f25cf79d0a7dca70e";
+const DEFAULT_ACTIVE_CATEGORY_RESPONSE = {
+	categories: [],
+	subcategories: [],
+	genders: [],
+	chosenSeasons: [],
+};
+const ALLOWED_PRODUCT_SORT_FIELDS = new Set([
+	"viewsCount",
+	"createdAt",
+	"updatedAt",
+	"price",
+	"priceAfterDiscount",
+	"sold",
+	"productName",
+]);
+
+function toTrimmedString(value = "") {
+	return `${value || ""}`.trim();
+}
+
+function isValidObjectId(value = "") {
+	return mongoose.Types.ObjectId.isValid(toTrimmedString(value));
+}
+
+function toObjectId(value = "") {
+	return new mongoose.Types.ObjectId(toTrimmedString(value));
+}
+
+function clampPositiveInteger(value, fallback, { min = 1, max = 200 } = {}) {
+	const parsed = Number.parseInt(value, 10);
+	if (!Number.isFinite(parsed)) return fallback;
+	return Math.min(max, Math.max(min, parsed));
+}
+
+function sanitizeSortOrder(value = "", fallback = "desc") {
+	const safeValue = toTrimmedString(value).toLowerCase();
+	return safeValue === "asc" || safeValue === "desc" ? safeValue : fallback;
+}
+
+function sanitizeSortField(value = "", fallback = "viewsCount") {
+	const safeValue = toTrimmedString(value);
+	return ALLOWED_PRODUCT_SORT_FIELDS.has(safeValue) ? safeValue : fallback;
+}
+
+function uniqueValidObjectIds(values = []) {
+	return Array.from(
+		new Set(
+			(Array.isArray(values) ? values : [values])
+				.map((value) => toTrimmedString(value))
+				.filter((value) => isValidObjectId(value))
+		)
+	).map((value) => toObjectId(value));
+}
+
+function normalizeActiveCategoriesSnapshot(snapshot = {}) {
+	return {
+		categories: Array.isArray(snapshot?.categories)
+			? snapshot.categories
+			: DEFAULT_ACTIVE_CATEGORY_RESPONSE.categories,
+		subcategories: Array.isArray(snapshot?.subcategories)
+			? snapshot.subcategories
+			: DEFAULT_ACTIVE_CATEGORY_RESPONSE.subcategories,
+		genders: Array.isArray(snapshot?.genders)
+			? snapshot.genders
+			: DEFAULT_ACTIVE_CATEGORY_RESPONSE.genders,
+		chosenSeasons: Array.isArray(snapshot?.chosenSeasons)
+			? snapshot.chosenSeasons.filter(Boolean)
+			: DEFAULT_ACTIVE_CATEGORY_RESPONSE.chosenSeasons,
+	};
+}
+
+async function buildActiveCategoriesSnapshot({
+	featured = "0",
+	newArrivals = "0",
+	customDesigns = "0",
+	storeId = "",
+} = {}) {
+	const activeStoreDocs = await StoreManagement.find({
+		activeStoreByAdmin: true,
+		activeStoreBySeller: true,
+	})
+		.select("_id")
+		.lean();
+	const activeStoreIds = uniqueValidObjectIds(
+		activeStoreDocs.map((entry) => `${entry?._id || ""}`)
+	);
+
+	const match = {
+		activeProduct: true,
+		activeProductBySeller: { $ne: false },
+	};
+
+	if (activeStoreIds.length > 0) {
+		match.store = { $in: activeStoreIds };
+	}
+
+	if (storeId) {
+		if (!isValidObjectId(storeId)) {
+			const error = new Error("Invalid storeId param");
+			error.statusCode = 400;
+			throw error;
+		}
+		match.store = toObjectId(storeId);
+	}
+
+	if (customDesigns === "1") {
+		match["printifyProductDetails.POD"] = true;
+	}
+
+	if (featured === "1") {
+		match.featuredProduct = true;
+		match["printifyProductDetails.POD"] = { $ne: true };
+	}
+
+	if (newArrivals === "1") {
+		match["printifyProductDetails.POD"] = { $ne: true };
+	}
+
+	const [categoryIds, subcategoryIds, genderIds, chosenSeasons] = await Promise.all([
+		Product.distinct("category", match),
+		Product.distinct("subcategory", match),
+		Product.distinct("gender", match),
+		Product.distinct("chosenSeason", match),
+	]);
+
+	const [categories, subcategories, genders] = await Promise.all([
+		Category.find({
+			_id: {
+				$in: uniqueValidObjectIds(categoryIds).filter(
+					(value) => `${value}` !== EXCLUDED_CATEGORY_ID
+				),
+			},
+			categoryStatus: true,
+		})
+			.select("_id categoryName categorySlug thumbnail categoryName_Arabic")
+			.sort({ categoryName: 1 })
+			.lean(),
+		Subcategory.find({
+			_id: { $in: uniqueValidObjectIds(subcategoryIds) },
+			subCategoryStatus: true,
+		})
+			.select(
+				"_id SubcategoryName SubcategorySlug thumbnail SubcategoryName_Arabic categoryId"
+			)
+			.sort({ SubcategoryName: 1 })
+			.lean(),
+		Gender.find({
+			_id: { $in: uniqueValidObjectIds(genderIds) },
+			genderNameStatus: true,
+		})
+			.select("_id genderName thumbnail genderName_Arabic")
+			.sort({ genderName: 1 })
+			.lean(),
+	]);
+
+	return normalizeActiveCategoriesSnapshot({
+		categories,
+		subcategories,
+		genders,
+		chosenSeasons,
+	});
+}
+
 exports.productById = async (req, res, next, id) => {
+	if (!isValidObjectId(id)) {
+		return res.status(404).json({ error: "Product not found" });
+	}
+
 	try {
 		const product = await Product.findById(id)
 			.populate("ratings.ratedBy", "_id name")
@@ -38,7 +206,7 @@ exports.productById = async (req, res, next, id) => {
 			});
 
 		if (!product) {
-			return res.status(400).json({
+			return res.status(404).json({
 				error: "Product not found",
 			});
 		}
@@ -46,11 +214,14 @@ exports.productById = async (req, res, next, id) => {
 		req.product = product;
 		next();
 	} catch (err) {
-		res.status(400).json({ error: "Product not found" });
+		res.status(404).json({ error: "Product not found" });
 	}
 };
 
 exports.read = (req, res) => {
+	if (!req.product) {
+		return res.status(404).json({ error: "Product not found" });
+	}
 	return res.json(req.product);
 };
 
@@ -66,9 +237,9 @@ exports.create = async (req, res) => {
 };
 
 exports.listProductsNoFilter = async (req, res) => {
-	let order = req.query.order ? req.query.order : "desc";
-	let sortBy = req.query.sortBy ? req.query.sortBy : "viewsCount";
-	let limit = req.query.limit ? parseInt(req.query.limit) : 200;
+	let order = sanitizeSortOrder(req.query.order, "desc");
+	let sortBy = sanitizeSortField(req.query.sortBy, "viewsCount");
+	let limit = clampPositiveInteger(req.query.limit, 200, { min: 1, max: 500 });
 
 	try {
 		const products = await Product.find({
@@ -140,9 +311,9 @@ exports.listProductsNoFilterForSeller = async (req, res) => {
 };
 
 exports.listPODProducts = async (req, res) => {
-	let order = req.query.order ? req.query.order : "desc";
-	let sortBy = req.query.sortBy ? req.query.sortBy : "viewsCount";
-	let limit = req.query.limit ? parseInt(req.query.limit) : 200;
+	let order = sanitizeSortOrder(req.query.order, "desc");
+	let sortBy = sanitizeSortField(req.query.sortBy, "viewsCount");
+	let limit = clampPositiveInteger(req.query.limit, 200, { min: 1, max: 500 });
 	const useLitePayload = `${req.query.lite || ""}` === "1";
 
 	try {
@@ -585,157 +756,22 @@ exports.remove = (req, res) => {
 exports.createDistinctCategoriesActiveProducts = async (req, res) => {
 	try {
 		const { featured, newArrivals, customDesigns, storeId } = req.query;
-
-		// 1) Build baseMatch
-		let baseMatch = { activeProduct: true };
-
-		if (storeId) {
-			baseMatch.store = new ObjectId(storeId);
-		}
-		if (customDesigns === "1") {
-			baseMatch["printifyProductDetails.POD"] = true;
-		}
-		if (featured === "1") {
-			baseMatch.featuredProduct = true;
-			baseMatch["printifyProductDetails.POD"] = { $ne: true };
-		}
-
-		let pipeline = [];
-
-		// (A) Match base
-		pipeline.push({ $match: baseMatch });
-
-		// (B) Lookup store + ensure store is active
-		pipeline.push(
-			{
-				$lookup: {
-					from: "storemanagements", // Adjust if your store collection is named differently
-					localField: "store",
-					foreignField: "_id",
-					as: "storeDetails",
-				},
-			},
-			{ $unwind: "$storeDetails" },
-			{
-				$match: {
-					"storeDetails.activeStoreByAdmin": true,
-					"storeDetails.activeStoreBySeller": true,
-				},
-			}
-		);
-
-		// If newArrivals=1 => exclude POD
-		if (newArrivals === "1") {
-			pipeline.push({
-				$match: {
-					"printifyProductDetails.POD": { $ne: true },
-				},
-			});
-		}
-
-		// (C) Category / Subcategory / Gender lookups
-		pipeline.push(
-			{
-				$lookup: {
-					from: Category.collection.name,
-					localField: "category",
-					foreignField: "_id",
-					as: "categoryDetails",
-				},
-			},
-			{ $unwind: "$categoryDetails" },
-			{
-				$match: {
-					"categoryDetails.categoryStatus": true,
-					// Exclude category "6691981f25cf79d0a7dca70e"
-					"categoryDetails._id": {
-						$ne: new ObjectId("6691981f25cf79d0a7dca70e"),
-					},
-				},
-			},
-			{
-				$lookup: {
-					from: Subcategory.collection.name,
-					localField: "subcategory",
-					foreignField: "_id",
-					as: "subcategoryDetails",
-				},
-			},
-			{ $unwind: "$subcategoryDetails" },
-			{
-				$match: {
-					"subcategoryDetails.subCategoryStatus": true,
-				},
-			},
-			{
-				$lookup: {
-					from: Gender.collection.name,
-					localField: "gender",
-					foreignField: "_id",
-					as: "genderDetails",
-				},
-			},
-			{ $unwind: "$genderDetails" },
-			{
-				$match: {
-					"genderDetails.genderNameStatus": true,
-				},
-			}
-		);
-
-		// (D) Exclude out-of-stock => totalQuantity > 0
-		pipeline.push(
-			{
-				$addFields: {
-					totalQuantity: {
-						$cond: {
-							if: { $gt: [{ $size: "$productAttributes" }, 0] },
-							then: { $sum: "$productAttributes.quantity" },
-							else: "$quantity",
-						},
-					},
-				},
-			},
-			{
-				$match: { totalQuantity: { $gt: 0 } },
-			}
-		);
-
-		// (E) Group
-		pipeline.push({
-			$group: {
-				_id: null,
-				categories: { $addToSet: "$categoryDetails" },
-				subcategories: { $addToSet: "$subcategoryDetails" },
-				genders: { $addToSet: "$genderDetails" },
-				chosenSeasons: { $addToSet: "$chosenSeason" },
-			},
+		const snapshot = await buildActiveCategoriesSnapshot({
+			featured,
+			newArrivals,
+			customDesigns,
+			storeId,
 		});
-
-		const results = await Product.aggregate(pipeline);
-
-		let categories = [];
-		let subcategories = [];
-		let genders = [];
-		let chosenSeasons = [];
-
-		if (results && results.length > 0) {
-			const data = results[0];
-			categories = data.categories;
-			subcategories = data.subcategories;
-			genders = data.genders;
-			chosenSeasons = data.chosenSeasons.filter((season) => season); // filter out null/undefined
-		}
 
 		// 2) Delete any existing docs in ActiveCategories
 		await ActiveCategories.deleteMany({});
 
 		// 3) Create a new doc
 		const doc = new ActiveCategories({
-			categories,
-			subcategories,
-			genders,
-			chosenSeasons,
+			categories: snapshot.categories,
+			subcategories: snapshot.subcategories,
+			genders: snapshot.genders,
+			chosenSeasons: snapshot.chosenSeasons,
 		});
 
 		await doc.save();
@@ -747,40 +783,45 @@ exports.createDistinctCategoriesActiveProducts = async (req, res) => {
 		});
 	} catch (error) {
 		console.error("Error in createDistinctCategoriesActiveProducts:", error);
-		res.status(500).json({
-			error: "There was an error creating/updating active categories.",
+		const statusCode = Number(error?.statusCode || 0) || 500;
+		res.status(statusCode).json({
+			error:
+				statusCode === 400
+					? error.message || "Invalid request"
+					: "There was an error creating/updating active categories.",
 		});
 	}
 };
 
 exports.getDistinctCategoriesActiveProducts = async (req, res) => {
 	try {
-		// If you only store one doc, you can do findOne() without sorting.
-		// Or if you want the latest updated doc, we can sort descending by createdAt.
-		const doc = await ActiveCategories.findOne().sort({ createdAt: -1 });
+		const doc = await ActiveCategories.findOne()
+			.sort({ createdAt: -1 })
+			.lean();
 
-		if (!doc) {
-			// No doc found, return empty arrays
-			return res.json({
-				categories: [],
-				subcategories: [],
-				genders: [],
-				chosenSeasons: [],
-			});
+		const cachedSnapshot = normalizeActiveCategoriesSnapshot(doc);
+		if (
+			cachedSnapshot.categories.length > 0 ||
+			cachedSnapshot.subcategories.length > 0 ||
+			cachedSnapshot.genders.length > 0 ||
+			cachedSnapshot.chosenSeasons.length > 0
+		) {
+			return res.json(cachedSnapshot);
 		}
 
-		// Return the arrays from the stored doc
-		return res.json({
-			categories: doc.categories || [],
-			subcategories: doc.subcategories || [],
-			genders: doc.genders || [],
-			chosenSeasons: doc.chosenSeasons || [],
-		});
+		const freshSnapshot = await buildActiveCategoriesSnapshot(req.query || {});
+		return res.json(freshSnapshot);
 	} catch (error) {
 		console.error("Error in getDistinctCategoriesActiveProducts:", error);
+		const statusCode = Number(error?.statusCode || 0) || 500;
 		return res
-			.status(500)
-			.json({ error: "There was an error retrieving active categories." });
+			.status(statusCode)
+			.json({
+				error:
+					statusCode === 400
+						? error.message || "Invalid request"
+						: "There was an error retrieving active categories.",
+			});
 	}
 };
 
@@ -799,15 +840,18 @@ exports.gettingSpecificSetOfProducts = async (req, res) => {
 		const useLitePayload = String(lite || "").trim() === "1";
 
 		// Convert them to numbers if needed
-		const limitNumber = parseInt(records, 10) || 5;
-		const skipNumber = parseInt(skip, 10) || 0;
+		const limitNumber = clampPositiveInteger(records, 5, { min: 1, max: 60 });
+		const skipNumber = Math.max(0, Number.parseInt(skip, 10) || 0);
 
 		// 1) Base match
 		let baseMatch = { activeProduct: true };
 
 		// 2) If storeId is provided, match that store
 		if (storeId) {
-			baseMatch.store = new ObjectId(storeId);
+			if (!isValidObjectId(storeId)) {
+				return res.status(400).json({ error: "Invalid storeId query value" });
+			}
+			baseMatch.store = toObjectId(storeId);
 		}
 
 		// 3) customDesigns => only POD
@@ -884,7 +928,7 @@ exports.gettingSpecificSetOfProducts = async (req, res) => {
 		// Exclude category= "6691981f25cf79d0a7dca70e"
 		pipeline.push({
 			$match: {
-				"category._id": { $ne: new ObjectId("6691981f25cf79d0a7dca70e") },
+				"category._id": { $ne: new ObjectId(EXCLUDED_CATEGORY_ID) },
 			},
 		});
 
@@ -1107,14 +1151,18 @@ exports.gettingSpecificSetOfProducts = async (req, res) => {
 
 exports.readSingleProduct = async (req, res, next) => {
 	const { slug, categorySlug, productId } = req.params;
+	const safeProductId = toTrimmedString(productId);
+
+	if (!isValidObjectId(safeProductId)) {
+		return res.status(404).json({ error: "Product not found" });
+	}
 
 	try {
-		const product = await Product.findOne({ _id: productId, slug: slug })
-			.populate({
-				path: "category",
-				match: { categorySlug: categorySlug },
-				select: "categoryName categorySlug thumbnail categoryName_Arabic",
-			})
+		const product = await Product.findById(safeProductId)
+			.populate(
+				"category",
+				"categoryName categorySlug thumbnail categoryName_Arabic"
+			)
 			.populate(
 				"subcategory",
 				"SubcategoryName SubcategorySlug subCategoryStatus"
@@ -1133,90 +1181,20 @@ exports.readSingleProduct = async (req, res, next) => {
 			});
 
 		if (!product) {
-			return res.status(400).json({
+			return res.status(404).json({
 				error: "Product not found",
 			});
 		}
 
 		res.json(product);
 	} catch (err) {
-		res.status(400).json({ error: "Product not found" });
+		console.error(
+			"Error in readSingleProduct:",
+			err?.message || err,
+			{ slug, categorySlug, productId: safeProductId }
+		);
+		res.status(404).json({ error: "Product not found" });
 	}
-};
-
-exports.getDistinctCategoriesActiveProducts = (req, res, next) => {
-	Product.aggregate([
-		{ $match: { activeProduct: true } }, // Match only active products
-
-		// Join with the Category collection
-		{
-			$lookup: {
-				from: Category.collection.name,
-				localField: "category",
-				foreignField: "_id",
-				as: "categoryDetails",
-			},
-		},
-		{ $unwind: "$categoryDetails" },
-		{ $match: { "categoryDetails.categoryStatus": true } }, // Ensure the category is active
-
-		// Join with the Subcategory collection
-		{
-			$lookup: {
-				from: Subcategory.collection.name,
-				localField: "subcategory",
-				foreignField: "_id",
-				as: "subcategoryDetails",
-			},
-		},
-		{ $unwind: "$subcategoryDetails" },
-		{ $match: { "subcategoryDetails.subCategoryStatus": true } }, // Ensure the subcategory is active
-
-		// Join with the Gender collection
-		{
-			$lookup: {
-				from: Gender.collection.name,
-				localField: "gender",
-				foreignField: "_id",
-				as: "genderDetails",
-			},
-		},
-		{ $unwind: "$genderDetails" },
-		{ $match: { "genderDetails.genderNameStatus": true } }, // Ensure the gender is active
-
-		// Grouping to get distinct values
-		{
-			$group: {
-				_id: null,
-				categories: { $addToSet: "$categoryDetails" },
-				subcategories: { $addToSet: "$subcategoryDetails" },
-				genders: { $addToSet: "$genderDetails" },
-				chosenSeasons: { $addToSet: "$chosenSeason" },
-			},
-		},
-	])
-		.then((result) => {
-			if (result && result.length > 0) {
-				res.json({
-					categories: result[0].categories,
-					subcategories: result[0].subcategories,
-					genders: result[0].genders,
-					chosenSeasons: result[0].chosenSeasons.filter((season) => season), // Filter to remove any null or undefined seasons
-				});
-			} else {
-				res.json({
-					categories: [],
-					subcategories: [],
-					genders: [],
-					chosenSeasons: [],
-				});
-			}
-		})
-		.catch((error) => {
-			res
-				.status(500)
-				.json({ error: "There was an error processing your request." });
-		});
 };
 
 exports.filteredProducts = async (req, res, next) => {
@@ -1328,7 +1306,7 @@ exports.filteredProducts = async (req, res, next) => {
 	const validGenderId = mongoose.Types.ObjectId.isValid(normalizedGenderInput)
 		? new mongoose.Types.ObjectId(normalizedGenderInput)
 		: null;
-	searchTerm = decodeFilterValue(searchTerm);
+	searchTerm = decodeFilterValue(searchTerm).slice(0, 120);
 	const parsedMinPrice = Number(priceMin);
 	const parsedMaxPrice = Number(priceMax);
 	const hasMinPriceFilter = Number.isFinite(parsedMinPrice) && parsedMinPrice > 0;
@@ -1397,7 +1375,7 @@ exports.filteredProducts = async (req, res, next) => {
 
 		const conditionByKey = {};
 
-		if (offers === "jannatoffers") {
+		if (toTrimmedString(offers).toLowerCase() === "jannatoffers") {
 			console.log("Jannat Offers Was Triggered");
 			conditionByKey.offers = {
 				$or: [
@@ -1515,8 +1493,8 @@ exports.filteredProducts = async (req, res, next) => {
 		const mainQuery = buildMatchQuery();
 
 	// Pagination
-	const pageNumber = parseInt(page, 10) || 1;
-	const recordsPerPage = parseInt(records, 10) || 10;
+	const pageNumber = clampPositiveInteger(page, 1, { min: 1, max: 10000 });
+	const recordsPerPage = clampPositiveInteger(records, 10, { min: 1, max: 60 });
 	const skip = (pageNumber - 1) * recordsPerPage;
 
 	// Build the initial aggregation pipeline
@@ -1555,9 +1533,24 @@ exports.filteredProducts = async (req, res, next) => {
 
 	// Unwind
 	pipeline.push(
-		{ $unwind: "$category" },
-		{ $unwind: "$subcategory" },
-		{ $unwind: "$gender" }
+		{
+			$unwind: {
+				path: "$category",
+				preserveNullAndEmptyArrays: false,
+			},
+		},
+		{
+			$unwind: {
+				path: "$subcategory",
+				preserveNullAndEmptyArrays: true,
+			},
+		},
+		{
+			$unwind: {
+				path: "$gender",
+				preserveNullAndEmptyArrays: true,
+			},
+		}
 	);
 
 	try {

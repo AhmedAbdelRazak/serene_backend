@@ -66,6 +66,38 @@ global.io = io;
 // routes middlewares
 readdirSync("./routes").map((r) => app.use("/api", require(`./routes/${r}`)));
 
+app.use((err, req, res, next) => {
+	console.error("Unhandled API error:", {
+		method: req?.method,
+		path: req?.originalUrl,
+		message: err?.message || err,
+		stack: err?.stack || null,
+	});
+
+	if (res.headersSent) {
+		return next(err);
+	}
+
+	const statusCode =
+		Number.isInteger(err?.statusCode) && err.statusCode >= 400
+			? err.statusCode
+			: 500;
+	return res.status(statusCode).json({
+		error:
+			statusCode >= 500
+				? "Internal server error"
+				: err?.message || "Request failed",
+	});
+});
+
+process.on("unhandledRejection", (reason) => {
+	console.error("Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+	console.error("Uncaught exception:", error);
+});
+
 // ========== CRON JOBS ==========
 
 // Existing Printify sync (every ~59 minutes)
