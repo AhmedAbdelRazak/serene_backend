@@ -52,9 +52,19 @@ const OrderSchema = new mongoose.Schema(
 		totalAmountAfterExchange: Number,
 
 		printifyOrderDetails: {
+			type: mongoose.Schema.Types.Mixed,
+			default: [],
+		},
+		podFulfillment: {
+			type: Array,
+			default: [],
+		},
+		checkoutFunnel: {
 			type: Object,
 			default: {},
 		},
+		paymentProvider: String,
+		paymentEnvironment: String,
 
 		returnedItems: {
 			type: Array,

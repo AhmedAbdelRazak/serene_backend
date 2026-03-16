@@ -49,6 +49,7 @@ const orderSchema = Joi.object({
 		phone: Joi.string()
 			.pattern(/^\+?\d{10,15}$/)
 			.required(),
+		shipToName: Joi.string().min(2).optional().allow(""),
 		address: Joi.string().required(),
 		city: Joi.string().required(),
 		state: Joi.string().required(),
@@ -74,6 +75,9 @@ const orderSchema = Joi.object({
 /* ───────────────────────── 4. Utility fns ──────────────────────────────── */
 const safeClone = (o) => JSON.parse(JSON.stringify(o));
 
+const getShippingFullName = (data = {}) =>
+	data?.customerDetails?.shipToName || data?.customerDetails?.name || "Customer";
+
 const buildPU = (data, invoice) => ({
 	reference_id: `tmp-${invoice}`,
 	invoice_id: invoice,
@@ -83,7 +87,7 @@ const buildPU = (data, invoice) => ({
 		value: Number(data.totalAmountAfterDiscount ?? data.totalAmount).toFixed(2),
 	},
 	shipping: {
-		name: { full_name: data.customerDetails.name },
+		name: { full_name: getShippingFullName(data) },
 		address: {
 			address_line_1: data.customerDetails.address,
 			admin_area_2: data.customerDetails.city,
@@ -116,7 +120,12 @@ exports.generateClientToken = async (_req, res) => {
 	try {
 		/* ➊ serve from cache */
 		if (cachedClientToken && Date.now() < cachedClientTokenExp) {
-			return res.json({ clientToken: cachedClientToken, cached: true });
+			return res.json({
+				clientToken: cachedClientToken,
+				clientId,
+				environment: IS_PROD ? "live" : "sandbox",
+				cached: true,
+			});
 		}
 
 		/* ➋ fetch a fresh one */
@@ -136,7 +145,11 @@ exports.generateClientToken = async (_req, res) => {
 		/* ➌ cache & return (PayPal tokens last ±9 h) */
 		cachedClientToken = data.client_token;
 		cachedClientTokenExp = Date.now() + 1000 * 60 * 60 * 8; // 8 h
-		res.json({ clientToken: cachedClientToken });
+		res.json({
+			clientToken: cachedClientToken,
+			clientId,
+			environment: IS_PROD ? "live" : "sandbox",
+		});
 	} catch (e) {
 		console.error("PayPal client‑token error:", e);
 		res.status(503).json({
@@ -259,6 +272,7 @@ exports.captureOrder = async (req, res) => {
 		paypalOrderId,
 		status: "In Process",
 		paymentStatus: "Paid",
+		paymentEnvironment: IS_PROD ? "live" : "sandbox",
 		paymentDetails: safeClone(result),
 		sellerProtection: capture.seller_protection?.status ?? "UNKNOWN",
 		createdVia:

@@ -569,6 +569,69 @@ async function uploadIfNeeded(imageUrl, token) {
 	}
 }
 
+function splitRecipientName(order = {}) {
+	const fullName =
+		order?.customerDetails?.shipToName || order?.customerDetails?.name || "Customer";
+	const tokens = `${fullName}`.trim().split(/\s+/).filter(Boolean);
+	return {
+		fullName,
+		firstName: tokens[0] || "Customer",
+		lastName: tokens.slice(1).join(" ") || "Customer",
+	};
+}
+
+function buildPodFulfillmentRecord({
+	item,
+	order,
+	shopId,
+	matchedVariant,
+	realVariantId,
+	uploadedId,
+	newProductId,
+	orderResponse,
+}) {
+	return {
+		type: "ephemeral_pod",
+		productId: item.productId || item._id || null,
+		productName: item.name || "",
+		invoiceNumber: order.invoiceNumber || "",
+		shopId,
+		originalPrintifyProductId: item.printifyProductDetails?.id || null,
+		previewProductId: item.customDesign?.previewProductId || null,
+		previewShopId: item.customDesign?.previewShopId || null,
+		uploadedArtworkId: uploadedId,
+		ephemeralProductId: newProductId,
+		matchedVariantId: realVariantId,
+		matchedVariantTitle: matchedVariant?.title || "",
+		quantity: item.ordered_quantity || 1,
+		placementParams: item.customDesign?.placementParams || {
+			x: 0.5,
+			y: 0.5,
+			scale: 1,
+			angle: 0,
+		},
+		customDesign: {
+			occasion: item.customDesign?.occasion || "",
+			giftName: item.customDesign?.giftName || "",
+			giftMessage: item.customDesign?.giftMessage || "",
+			printArea: item.customDesign?.printArea || "front",
+			screenshots: {
+				bare: item.customDesign?.bareScreenshotUrl || "",
+				final: item.customDesign?.finalScreenshotUrl || "",
+				original: item.customDesign?.originalPrintifyImageURL || "",
+			},
+			variants: item.customDesign?.variants || {},
+			customizations: item.customDesign?.customizations || {
+				texts: [],
+				images: [],
+			},
+			elements: item.customDesign?.elements || [],
+		},
+		ephemeralOrder: orderResponse,
+		createdAt: new Date(),
+	};
+}
+
 // ========================================================
 // === For ephemeral POD item => create custom product, order, then DISABLE
 async function createOnTheFlyPOD(item, order, token) {
@@ -577,6 +640,7 @@ async function createOnTheFlyPOD(item, order, token) {
 		if (!shopId) {
 			throw new Error("No Printify shop_id found for POD item");
 		}
+		const recipient = splitRecipientName(order);
 
 		// 1) Normalize chosen color & size
 		const cartColor = (item.chosenAttributes.color || "").toLowerCase();
@@ -707,8 +771,8 @@ async function createOnTheFlyPOD(item, order, token) {
 			shipping_method: 1, // standard shipping
 			send_shipping_notification: false,
 			address_to: {
-				first_name: order.customerDetails.name.split(" ")[0],
-				last_name: order.customerDetails.name.split(" ").slice(1).join(" "),
+				first_name: recipient.firstName,
+				last_name: recipient.lastName,
 				email: order.customerDetails.email,
 				phone: order.customerDetails.phone,
 				country: "US",
@@ -752,12 +816,20 @@ async function createOnTheFlyPOD(item, order, token) {
 		}
 
 		// 8) Save ephemeral order details in DB
+		const podFulfillmentRecord = buildPodFulfillmentRecord({
+			item,
+			order,
+			shopId,
+			matchedVariant: matchedVariantObj,
+			realVariantId,
+			uploadedId,
+			newProductId,
+			orderResponse: orderResp.data,
+		});
 		await Order.findByIdAndUpdate(order._id, {
 			$push: {
-				printifyOrderDetails: {
-					ephemeralProductId: newProductId,
-					ephemeralOrder: orderResp.data,
-				},
+				printifyOrderDetails: podFulfillmentRecord,
+				podFulfillment: podFulfillmentRecord,
 			},
 		});
 	} catch (err) {
@@ -783,6 +855,7 @@ const postOrderToPrintify = async (order) => {
 		if (!item.isPrintifyProduct) {
 			continue;
 		}
+		const recipient = splitRecipientName(order);
 
 		// If it's a "pure POD" with custom design => ephemeral approach
 		if (item.printifyProductDetails?.POD === true && item.customDesign) {
@@ -823,8 +896,8 @@ const postOrderToPrintify = async (order) => {
 					},
 				],
 				address_to: {
-					first_name: order.customerDetails.name.split(" ")[0],
-					last_name: order.customerDetails.name.split(" ").slice(1).join(" "),
+					first_name: recipient.firstName,
+					last_name: recipient.lastName,
 					email: order.customerDetails.email,
 					phone: order.customerDetails.phone,
 					country: "US",
@@ -852,8 +925,17 @@ const postOrderToPrintify = async (order) => {
 
 				// Save normal printify order details
 				await Order.findByIdAndUpdate(order._id, {
-					$set: {
-						printifyOrderDetails: response.data,
+					$push: {
+						printifyOrderDetails: {
+							type: "catalog_item",
+							productId: item.productId || item._id || null,
+							productName: item.name || "",
+							shopId: item.printifyProductDetails?.shop_id || null,
+							printifyProductId: item.printifyProductDetails?.id || null,
+							variantId,
+							order: response.data,
+							createdAt: new Date(),
+						},
 					},
 				});
 				console.log(`Printify order details saved for order: ${order._id}`);
