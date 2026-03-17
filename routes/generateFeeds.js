@@ -217,9 +217,23 @@ function getProductLink(product, color, size, scent) {
 		return url;
 	}
 	// Normal link for non-POD
-	return `https://serenejannat.com/single-product/${escapeXml(
+	let url = `https://serenejannat.com/single-product/${escapeXml(
 		product.slug
 	)}/${escapeXml(product.category.categorySlug)}/${product._id}`;
+	const queryParams = [];
+	if (color && color.toLowerCase() !== "unspecified") {
+		queryParams.push(`color=${encodeURIComponent(color)}`);
+	}
+	if (size && size.toLowerCase() !== "unspecified") {
+		queryParams.push(`size=${encodeURIComponent(size)}`);
+	}
+	if (scent && scent.toLowerCase() !== "unspecified") {
+		queryParams.push(`scent=${encodeURIComponent(scent)}`);
+	}
+	if (queryParams.length > 0) {
+		url += `?${queryParams.join("&")}`;
+	}
+	return url;
 }
 
 // If price >= 100 and integer => treat as cents
@@ -738,7 +752,12 @@ router.get("/generate-feeds", async (req, res) => {
 						);
 
 						// Normal link for non-POD
-						const finalLink = getProductLink(product);
+						const finalLink = getProductLink(
+							product,
+							resolvedVariantColor,
+							variantSize,
+							variant.scent || ""
+						);
 
 						const variantTitle = `${capitalizeWords(
 							product.productName
