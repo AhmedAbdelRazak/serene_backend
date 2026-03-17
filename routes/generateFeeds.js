@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { createWriteStream } = require("fs");
 const { resolve } = require("path");
+const slugify = require("slugify");
 require("dotenv").config();
 
 // Import the Product and Colors models
@@ -104,24 +105,60 @@ function extractFirstNumber(value) {
 	return match ? parseFloat(match[0]) : "Not available";
 }
 
+function normalizeUrl(value) {
+	const raw = `${value || ""}`.trim();
+	if (!raw) return "";
+	if (raw.startsWith("//")) return `https:${raw}`;
+	return raw.replace(/^http:\/\//i, "https://");
+}
+
+function resolveImageUrl(imageLike) {
+	if (!imageLike) return "";
+	if (typeof imageLike === "string") return normalizeUrl(imageLike);
+	if (Array.isArray(imageLike)) {
+		return imageLike.map((entry) => resolveImageUrl(entry)).find(Boolean) || "";
+	}
+	if (Array.isArray(imageLike?.images) && imageLike.images.length > 0) {
+		return resolveImageUrl(imageLike.images);
+	}
+	const direct =
+		imageLike.cloudinary_url ||
+		imageLike.cloudinaryUrl ||
+		imageLike.cloudinaryURL ||
+		imageLike.secure_url ||
+		imageLike.url ||
+		imageLike.src;
+	return normalizeUrl(direct);
+}
+
+function uniqueImageUrls(images = []) {
+	return Array.from(
+		new Set(images.map((image) => resolveImageUrl(image)).filter(Boolean))
+	);
+}
+
 function generateImageLinks(product) {
 	let images = [];
 	// If product has variant attributes w/images
 	if (product.productAttributes && product.productAttributes.length > 0) {
 		product.productAttributes.forEach((attr) => {
+			const exampleDesignUrl = resolveImageUrl(attr.exampleDesignImage);
+			if (exampleDesignUrl) {
+				images.push(exampleDesignUrl);
+			}
 			if (attr.productImages && attr.productImages.length > 0) {
-				images.push(...attr.productImages.map((img) => escapeXml(img.url)));
+				images.push(...attr.productImages.map((img) => resolveImageUrl(img)));
 			}
 		});
 	}
 	// Otherwise fallback to thumbnail images
 	else if (product.thumbnailImage && product.thumbnailImage.length > 0) {
 		images.push(
-			...product.thumbnailImage[0].images.map((img) => escapeXml(img.url))
+			...product.thumbnailImage[0].images.map((img) => resolveImageUrl(img))
 		);
 	}
-	const validImages = images.filter((img) =>
-		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)$/i.test(img)
+	const validImages = uniqueImageUrls(images).filter((img) =>
+		/\.(jpg|jpeg|png|gif|webp|bmp|tiff)(\?|$)/i.test(img)
 	);
 	if (validImages.length === 0) {
 		validImages.push(
@@ -151,7 +188,7 @@ async function resolveColorName(hexCode) {
 
 /**
  * If product is POD, build a URL like:
- *   https://serenejannat.com/custom-gifts/PRODUCT_ID?color=xxx&size=yyy&scent=zzz
+ *   https://serenejannat.com/custom-gifts/product-slug/PRODUCT_ID?color=xxx&size=yyy&scent=zzz
  * Otherwise:
  *   https://serenejannat.com/single-product/<slug>/<categorySlug>/<product_id>
  */
@@ -160,7 +197,9 @@ function getProductLink(product, color, size, scent) {
 		product.printifyProductDetails?.POD === true &&
 		product.printifyProductDetails?.id
 	) {
-		let url = `https://serenejannat.com/custom-gifts/${product._id}`;
+		let url = `https://serenejannat.com/custom-gifts/${getPodProductSlug(
+			product
+		)}/${product._id}`;
 		const queryParams = [];
 		if (color && color.toLowerCase() !== "unspecified") {
 			queryParams.push(`color=${encodeURIComponent(color)}`);
@@ -203,7 +242,7 @@ function validateGender(gender) {
 
 // Build Google image tags (with g:)
 function buildGoogleImageTags(imageArray) {
-	const upTo3 = imageArray.slice(0, 3);
+	const upTo3 = uniqueImageUrls(imageArray).slice(0, 3);
 	if (!upTo3.length) {
 		upTo3.push(
 			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
@@ -225,7 +264,7 @@ function buildGoogleImageTags(imageArray) {
 
 // Build Facebook image tags (no g:)
 function buildFacebookImageTags(imageArray) {
-	const upTo3 = imageArray.slice(0, 3);
+	const upTo3 = uniqueImageUrls(imageArray).slice(0, 3);
 	if (!upTo3.length) {
 		upTo3.push(
 			"https://res.cloudinary.com/infiniteapps/image/upload/v1723694291/janat/default-image.jpg"
@@ -290,6 +329,35 @@ function getVariantNamesFromPrintifyMap(variant, optionValueMap) {
 		// If you have other possible "type" values, handle them here
 	}
 	return { colorVal, sizeVal, scentVal };
+}
+
+function getGoogleAvailability(quantity) {
+	return Number(quantity) > 0 ? "in_stock" : "out_of_stock";
+}
+
+function getFacebookAvailability(quantity) {
+	return Number(quantity) > 0 ? "in stock" : "out of stock";
+}
+
+function getCatalogInventory(quantity, fallback = 9999) {
+	const parsed = Number(quantity);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function getPodProductSlug(product) {
+	const candidate =
+		product?.title ||
+		product?.productName ||
+		product?.printifyProductDetails?.title ||
+		product?.slug ||
+		"custom-gift";
+	return (
+		slugify(candidate, {
+			lower: true,
+			strict: true,
+			trim: true,
+		}) || "custom-gift"
+	);
 }
 
 // ----------------------
@@ -379,16 +447,21 @@ router.get("/generate-feeds", async (req, res) => {
 							);
 						}
 						let facebookInventory = 9999;
-						let googleAvailability = "in stock";
+						let googleAvailability = getGoogleAvailability(
+							matchedAttr?.quantity
+						);
 						if (matchedAttr && matchedAttr.quantity != null) {
-							facebookInventory = matchedAttr.quantity;
-							googleAvailability =
-								matchedAttr.quantity > 0 ? "in stock" : "out_of_stock";
+							facebookInventory = getCatalogInventory(matchedAttr.quantity);
 						} else {
 							// fallback to variant.quantity or default
-							facebookInventory = variant.quantity || 9999;
+							facebookInventory = getCatalogInventory(variant.quantity);
+							googleAvailability = getGoogleAvailability(
+								facebookInventory
+							);
 						}
-						const facebookAvailability = googleAvailability;
+						const facebookAvailability = getFacebookAvailability(
+							facebookInventory
+						);
 
 						// 3) Build variant images
 						let variantImages = [];
@@ -403,9 +476,11 @@ router.get("/generate-feeds", async (req, res) => {
 						if (
 							matchedAttr &&
 							matchedAttr.exampleDesignImage &&
-							matchedAttr.exampleDesignImage.url
+							resolveImageUrl(matchedAttr.exampleDesignImage)
 						) {
-							variantImages.unshift(matchedAttr.exampleDesignImage.url);
+							variantImages.unshift(
+								resolveImageUrl(matchedAttr.exampleDesignImage)
+							);
 						}
 						// <<<< END NEW
 
@@ -505,15 +580,18 @@ router.get("/generate-feeds", async (req, res) => {
 						);
 					}
 					let facebookInventory = 9999;
-					let googleAvailability = "in stock";
+					let googleAvailability = getGoogleAvailability(matchedAttr?.quantity);
 					if (matchedAttr && matchedAttr.quantity != null) {
-						facebookInventory = matchedAttr.quantity;
-						googleAvailability =
-							matchedAttr.quantity > 0 ? "in stock" : "out_of_stock";
+						facebookInventory = getCatalogInventory(matchedAttr.quantity);
 					} else {
-						facebookInventory = singleVar.quantity || 9999;
+						facebookInventory = getCatalogInventory(singleVar.quantity);
+						googleAvailability = getGoogleAvailability(
+							facebookInventory
+						);
 					}
-					const facebookAvailability = googleAvailability;
+					const facebookAvailability = getFacebookAvailability(
+						facebookInventory
+					);
 
 					// images
 					let variantImages = [];
@@ -528,9 +606,9 @@ router.get("/generate-feeds", async (req, res) => {
 					if (
 						matchedAttr &&
 						matchedAttr.exampleDesignImage &&
-						matchedAttr.exampleDesignImage.url
+						resolveImageUrl(matchedAttr.exampleDesignImage)
 					) {
-						variantImages.unshift(matchedAttr.exampleDesignImage.url);
+						variantImages.unshift(resolveImageUrl(matchedAttr.exampleDesignImage));
 					}
 					// <<<< END NEW
 
@@ -636,10 +714,11 @@ router.get("/generate-feeds", async (req, res) => {
 						);
 						const variantSize = variant.size || "";
 
-						const googleAvailability =
-							variant.quantity > 0 ? "in stock" : "out_of_stock";
-						const facebookAvailability = googleAvailability;
-						const facebookInventory = variant.quantity || 9999;
+						const facebookInventory = getCatalogInventory(variant.quantity);
+						const googleAvailability = getGoogleAvailability(facebookInventory);
+						const facebookAvailability = getFacebookAvailability(
+							facebookInventory
+						);
 
 						const variantWeight = validateDimension(
 							variant.weight || product.geodata?.weight,
@@ -745,10 +824,9 @@ router.get("/generate-feeds", async (req, res) => {
 					const googleImageXML = buildGoogleImageTags(fallbackImages);
 					const facebookImageXML = buildFacebookImageTags(fallbackImages);
 
-					const googleAvailability =
-						product.quantity > 0 ? "in stock" : "out_of_stock";
-					const facebookAvailability = googleAvailability;
-					const facebookInventory = product.quantity || 9999;
+					const facebookInventory = getCatalogInventory(product.quantity);
+					const googleAvailability = getGoogleAvailability(facebookInventory);
+					const facebookAvailability = getFacebookAvailability(facebookInventory);
 
 					const priceVal = parseFloat(
 						product.priceAfterDiscount || product.price || 0
