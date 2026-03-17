@@ -16,6 +16,7 @@ const {
 	previewCustomPrintifyDesign,
 	deletePreviewCustomPrintifyDesign,
 	getPodListingPreview,
+	getPodPrintAreaLayout,
 	cleanupPodListPreviewSession,
 	updatePrintifyProduct,
 	revertPrintifyProductsToBePlainNoDesign,
@@ -49,6 +50,7 @@ router.delete(
 	"/preview-custom-design/:previewProductId",
 	deletePreviewCustomPrintifyDesign
 );
+router.get("/pod/layout/:productId", getPodPrintAreaLayout);
 router.get("/pod/list-preview/:productId", getPodListingPreview);
 router.post("/pod/list-preview/cleanup-session", cleanupPodListPreviewSession);
 

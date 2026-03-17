@@ -199,6 +199,46 @@ function isLikelyMongoId(value = "") {
 	return /^[a-f0-9]{24}$/i.test(`${value || ""}`.trim());
 }
 
+function normalizePodPrintAreaPosition(value = "") {
+	return `${value || ""}`
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, "_");
+}
+
+function getPodProductKindForPlacement(item = {}) {
+	const normalizedName = `${item?.name || item?.productName || item?.printifyProductDetails?.title || ""}`
+		.toLowerCase();
+	if (
+		normalizedName.includes("t-shirt") ||
+		normalizedName.includes("tee") ||
+		(normalizedName.includes("shirt") &&
+			!normalizedName.includes("sweatshirt"))
+	) {
+		return "apparel";
+	}
+	if (
+		normalizedName.includes("hoodie") ||
+		normalizedName.includes("sweatshirt") ||
+		normalizedName.includes("pullover")
+	) {
+		return "hoodie";
+	}
+	if (normalizedName.includes("tote")) return "tote";
+	if (normalizedName.includes("weekender") || normalizedName.includes("bag")) {
+		return "bag";
+	}
+	if (normalizedName.includes("mug")) return "mug";
+	if (normalizedName.includes("pillow")) return "pillow";
+	if (normalizedName.includes("magnet")) return "magnet";
+	if (normalizedName.includes("candle")) return "candle";
+	return "default";
+}
+
+function getFullPrintAreaScaleForOrder(item = {}, positionInput = "") {
+	return 1;
+}
+
 function getCartProductId(item = {}) {
 	const raw = item?.productId || item?._id || item?.id || "";
 	const normalized = `${raw || ""}`.trim();
@@ -974,25 +1014,54 @@ async function createOnTheFlyPOD(item, order, token) {
 			);
 		}
 
-		// 4) Extract user-specified placement (x,y,scale,angle) if available
-		//    Or fallback to defaults
+		const requestedPrintArea = normalizePodPrintAreaPosition(
+			hydratedItem.customDesign?.printArea || "front"
+		);
+		const availablePlaceholders = Array.isArray(
+			hydratedItem?.printifyProductDetails?.print_areas?.[0]?.placeholders
+		)
+			? hydratedItem.printifyProductDetails.print_areas[0].placeholders
+			: [];
+		const supportedPositions = new Set(
+			availablePlaceholders
+				.map((placeholder) =>
+					normalizePodPrintAreaPosition(placeholder?.position || "")
+				)
+				.filter(Boolean)
+		);
+		const finalPrintArea = supportedPositions.has(requestedPrintArea)
+			? requestedPrintArea
+			: supportedPositions.has("front")
+				? "front"
+				: requestedPrintArea || "front";
+		const fullPrintAreaScale = getFullPrintAreaScaleForOrder(
+			hydratedItem,
+			finalPrintArea
+		);
+		const shouldUseFullPrintAreaScale =
+			hydratedItem?.customDesign?.isFullPrintAreaCapture !== false;
 		const {
 			x = 0.5,
 			y = 0.5,
-			scale = 1,
+			scale = fullPrintAreaScale,
 			angle = 0,
 		} = hydratedItem.customDesign?.placementParams || {};
+		const resolvedScale = shouldUseFullPrintAreaScale
+			? fullPrintAreaScale
+			: Number.isFinite(Number(scale))
+				? Number(scale)
+				: fullPrintAreaScale;
 
 		const placeholders = [
 			{
-				position: "front",
+				position: finalPrintArea || "front",
 				images: [
 					{
 						id: uploadedId,
 						type: "image/png", // or image/jpeg if needed
 						x,
 						y,
-						scale,
+						scale: resolvedScale,
 						angle,
 					},
 				],

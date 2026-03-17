@@ -167,6 +167,7 @@ const POD_LIST_PREVIEW_STALE_CLEANUP_MAX_DELETES = 240;
 
 const podListPreviewMemoryCache = new Map();
 const podListPreviewInFlight = new Map();
+const podCatalogLayoutCache = new Map();
 const podListPreviewShopCache = {
 	expiresAt: 0,
 	shopIds: [],
@@ -177,6 +178,7 @@ const podListStaleCleanupState = {
 	lastSummary: null,
 };
 let podListStaleCleanupTimer = null;
+const POD_CATALOG_LAYOUT_CACHE_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
 
 const POD_LIST_DEFAULT_OCCASION = "Birthday";
 const POD_LIST_OCCASION_OPTIONS = [
@@ -714,6 +716,76 @@ function getPodListProductKind(product = {}) {
 	return "default";
 }
 
+function normalizePrintAreaPosition(value = "") {
+	return String(value || "")
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, "_");
+}
+
+function formatCatalogPlaceholder(placeholder = {}) {
+	const width = Number(placeholder?.width);
+	const height = Number(placeholder?.height);
+	return {
+		position: normalizePrintAreaPosition(placeholder?.position || ""),
+		decoration_method: String(placeholder?.decoration_method || "").trim(),
+		width: Number.isFinite(width) ? width : null,
+		height: Number.isFinite(height) ? height : null,
+		aspect_ratio:
+			Number.isFinite(width) && Number.isFinite(height) && height > 0
+				? width / height
+				: null,
+	};
+}
+
+function getMockupCameraLabel(image = {}) {
+	const explicit = String(
+		image?.camera_label || image?.cameraLabel || "",
+	).trim();
+	if (explicit) return explicit.toLowerCase();
+	const src = String(image?.src || "");
+	try {
+		const url = new URL(src);
+		const queryLabel = String(
+			url.searchParams.get("camera_label") || "",
+		).trim();
+		if (queryLabel) return queryLabel.toLowerCase();
+	} catch {}
+	const fallbackMatch = src.toLowerCase().match(/camera_label=([a-z0-9_-]+)/i);
+	return fallbackMatch?.[1] || "";
+}
+
+function getPreferredPreviewCameraLabels(product = {}, positionInput = "") {
+	const kind = getPodListProductKind(product);
+	const position = normalizePrintAreaPosition(positionInput);
+
+	if (position.includes("back")) return ["back"];
+	if (position.includes("left_sleeve"))
+		return ["left", "left-front", "left-back"];
+	if (position.includes("right_sleeve"))
+		return ["right", "right-front", "right-back"];
+	if (position.includes("neck")) return ["front"];
+
+	if (kind === "mug") {
+		return ["front", "right", "left", "angled-1", "angled-2"];
+	}
+	if (kind === "bag") {
+		return ["front"];
+	}
+	if (kind === "tote") {
+		return position.includes("back") ? ["back"] : ["front"];
+	}
+	if (kind === "pillow" || kind === "magnet" || kind === "candle") {
+		return ["front"];
+	}
+	if (kind === "apparel" || kind === "hoodie") {
+		return position.includes("back")
+			? ["back"]
+			: ["front", "lifestyle", "model", "wearing"];
+	}
+	return ["front"];
+}
+
 function scorePodListPlaceholder(placeholder = {}, product = {}) {
 	const position = String(placeholder?.position || "").toLowerCase();
 	const hasImage =
@@ -899,33 +971,14 @@ function getPodListOccasionScaleBoost(occasion = "", product = {}) {
 }
 
 function getFullPrintAreaPreviewScale(product = {}, positionInput = "") {
-	const kind = getPodListProductKind(product);
-	const position = String(positionInput || "").toLowerCase();
-	let scale = 1.45;
-
-	if (kind === "apparel") scale = 1.72;
-	else if (kind === "hoodie") scale = 1.66;
-	else if (kind === "tote") scale = 1.38;
-	else if (kind === "bag") scale = 1.34;
-	else if (kind === "mug") scale = 1.24;
-	else if (kind === "pillow" || kind === "magnet") scale = 1.2;
-	else if (kind === "candle") scale = 1.86;
-
-	if (
-		position.includes("left_chest") ||
-		position.includes("right_chest") ||
-		position.includes("sleeve")
-	) {
-		scale *= 0.84;
-	}
-	if (position.includes("back")) {
-		scale *= 0.92;
-	}
-
-	return Math.max(1.08, Math.min(2.2, scale));
+	return 1;
 }
 
-function resolvePodListPlacementFromSource({ sourceImage, placementDefaults }) {
+function resolvePodListPlacementFromSource({
+	sourceImage,
+	placementDefaults,
+	forceSourcePlacement = false,
+}) {
 	const sourceX = Number(sourceImage?.x);
 	const sourceY = Number(sourceImage?.y);
 	const sourceScale = Number(sourceImage?.scale);
@@ -942,11 +995,16 @@ function resolvePodListPlacementFromSource({ sourceImage, placementDefaults }) {
 		sourceScale <= 2.6;
 	const baseScale = Number(placementDefaults.scale || 0.88);
 	const sourceNearExpectedArea =
-		hasValidSourcePlacement &&
-		Math.abs(sourceX - Number(placementDefaults.x || 0.5)) <= 0.2 &&
-		Math.abs(sourceY - Number(placementDefaults.y || 0.5)) <= 0.22;
-	const minAcceptedScale = Math.max(0.42, baseScale * 0.9);
-	const maxAcceptedScale = Math.max(1.26, baseScale * 1.16);
+		forceSourcePlacement ||
+		(hasValidSourcePlacement &&
+			Math.abs(sourceX - Number(placementDefaults.x || 0.5)) <= 0.2 &&
+			Math.abs(sourceY - Number(placementDefaults.y || 0.5)) <= 0.22);
+	const minAcceptedScale = forceSourcePlacement
+		? 0.18
+		: Math.max(0.42, baseScale * 0.9);
+	const maxAcceptedScale = forceSourcePlacement
+		? 2.6
+		: Math.max(1.26, baseScale * 1.16);
 	const sourcePlacementIsTooSmall =
 		hasValidSourcePlacement && sourceScale < minAcceptedScale;
 	const sourcePlacementIsTooLarge =
@@ -1672,6 +1730,76 @@ function getPodStoredDefaultDesignEntry(product = {}, occasion = "") {
 				entry.defaultDesignImages.length > 0,
 		) || null
 	);
+}
+
+async function fetchPodCatalogVariantLayouts({
+	blueprintId,
+	printProviderId,
+	variantIds = [],
+}) {
+	const normalizedBlueprintId = String(blueprintId || "").trim();
+	const normalizedPrintProviderId = String(printProviderId || "").trim();
+	if (!normalizedBlueprintId || !normalizedPrintProviderId) {
+		throw new Error(
+			"Missing blueprint or print provider for POD catalog layout.",
+		);
+	}
+
+	const cacheKey = `${normalizedBlueprintId}:${normalizedPrintProviderId}`;
+	const cached = podCatalogLayoutCache.get(cacheKey);
+	if (cached?.data && Number(cached.expiresAt || 0) > Date.now()) {
+		return cached.data;
+	}
+
+	const tokenInfo = resolvePrintifyToken();
+	if (!tokenInfo.token) {
+		throw new Error(tokenInfo.error || "No valid Printify token.");
+	}
+
+	const response = await axios.get(
+		`https://api.printify.com/v1/catalog/blueprints/${normalizedBlueprintId}/print_providers/${normalizedPrintProviderId}/variants.json?show-out-of-stock=1`,
+		{
+			headers: {
+				Authorization: `Bearer ${tokenInfo.token}`,
+				"User-Agent": "NodeJS-App",
+			},
+		},
+	);
+
+	const allowedVariantIdSet = new Set(
+		(Array.isArray(variantIds) ? variantIds : [])
+			.map((id) => String(id || "").trim())
+			.filter(Boolean),
+	);
+	const sourceVariants = Array.isArray(response?.data?.variants)
+		? response.data.variants
+		: [];
+	const filteredVariants = allowedVariantIdSet.size
+		? sourceVariants.filter((variant) =>
+				allowedVariantIdSet.has(String(variant?.id || "").trim()),
+			)
+		: sourceVariants;
+	const data = {
+		blueprint_id: Number(normalizedBlueprintId) || normalizedBlueprintId,
+		print_provider_id:
+			Number(normalizedPrintProviderId) || normalizedPrintProviderId,
+		variants: filteredVariants.map((variant) => ({
+			id: variant?.id ?? null,
+			title: String(variant?.title || "").trim(),
+			placeholders: (Array.isArray(variant?.placeholders)
+				? variant.placeholders
+				: []
+			)
+				.map(formatCatalogPlaceholder)
+				.filter((placeholder) => placeholder.position),
+		})),
+	};
+
+	podCatalogLayoutCache.set(cacheKey, {
+		expiresAt: Date.now() + POD_CATALOG_LAYOUT_CACHE_TTL_MS,
+		data,
+	});
+	return data;
 }
 
 async function getPrintifyShopIdsCached(printifyToken) {
@@ -4670,14 +4798,20 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 			bare_design_image_url,
 			design_covers_print_area = false,
 			design_is_full_print_area_capture = false,
+			force_source_placement = false,
 			print_areas = [],
 			title,
+			preferred_position,
 		} = req.body || {};
+		const requestedPosition = normalizePrintAreaPosition(
+			preferred_position || "front",
+		);
 		console.log(`[${debugId}] Request payload summary`, {
 			blueprint_id,
 			print_provider_id,
 			variant_id,
 			title: title || null,
+			preferredPosition: requestedPosition || null,
 			printAreasCount: Array.isArray(print_areas) ? print_areas.length : 0,
 			hasDesignImageUrl: Boolean(design_image_url),
 			designImageHost: safeHost(design_image_url),
@@ -4685,6 +4819,7 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 			bareDesignImageHost: safeHost(bare_design_image_url),
 			designCoversPrintArea: Boolean(design_covers_print_area),
 			designIsFullPrintAreaCapture: Boolean(design_is_full_print_area_capture),
+			forceSourcePlacement: Boolean(force_source_placement),
 		});
 		const previewDesignUrl = bare_design_image_url || design_image_url;
 
@@ -4773,11 +4908,21 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 		const sourcePlaceholders = Array.isArray(variantPrintArea?.placeholders)
 			? variantPrintArea.placeholders
 			: [];
+		const requestedPlaceholder =
+			sourcePlaceholders.find(
+				(placeholder) =>
+					normalizePrintAreaPosition(placeholder?.position || "") ===
+					requestedPosition,
+			) || null;
 		const preferredPlaceholder =
+			requestedPlaceholder ||
 			pickBestPodListPlaceholder(sourcePlaceholders, {
 				productName: title || "Custom Design",
-			}) || sourcePlaceholders[0];
-		const preferredPosition = String(preferredPlaceholder?.position || "front");
+			}) ||
+			sourcePlaceholders[0];
+		const preferredPosition = normalizePrintAreaPosition(
+			preferredPlaceholder?.position || requestedPosition || "front",
+		);
 		const sourceImage = Array.isArray(preferredPlaceholder?.images)
 			? preferredPlaceholder.images[0]
 			: null;
@@ -4813,10 +4958,13 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 			: resolvePodListPlacementFromSource({
 					sourceImage,
 					placementDefaults,
+					forceSourcePlacement: Boolean(force_source_placement),
 				});
 		const previewScaleBoost = coversPrintArea
 			? 1
-			: getPodPreviewPlacementBoost(previewProductMeta, preferredPosition);
+			: force_source_placement
+				? 1
+				: getPodPreviewPlacementBoost(previewProductMeta, preferredPosition);
 		const boostedScale = coversPrintArea
 			? fullPrintAreaScale
 			: Math.min(
@@ -4939,17 +5087,41 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 			previewTitle.includes("hoodie") ||
 			previewTitle.includes("sweatshirt") ||
 			previewTitle.includes("pullover");
+		const preferredCameraLabels = getPreferredPreviewCameraLabels(
+			previewProductMeta,
+			preferredPosition,
+		);
 		const scorePreviewImage = (image = {}) => {
 			let score = 0;
 			const pos = String(
 				image.position || image.placeholder || "",
 			).toLowerCase();
 			const src = String(image.src || "").toLowerCase();
+			const cameraLabel = getMockupCameraLabel(image);
 			if (pos.includes("front")) score += 7;
 			if (pos.includes("center")) score += 3;
 			if (image.is_default) score += 2;
 			if (src.includes("front")) score += 1;
 			if (pos.includes("back") || src.includes("back")) score -= 4;
+			if (preferredCameraLabels.includes(cameraLabel)) score += 18;
+			if (
+				preferredPosition.includes("front") &&
+				/(bottom|inside|open)/.test(cameraLabel)
+			) {
+				score -= 10;
+			}
+			if (previewProductMeta?.productName?.toLowerCase().includes("pillow")) {
+				if (
+					/(zipper|closeup|close-up|detail|corner|side|profile)/.test(
+						`${pos} ${src} ${cameraLabel}`,
+					)
+				) {
+					score -= 20;
+				}
+				if (cameraLabel === "front") score += 10;
+				if (image.is_default) score += 6;
+				if (/(front|main|default)/.test(`${pos} ${src}`)) score += 6;
+			}
 			if (isWearablePreview) {
 				const lifestyleHint =
 					/(lifestyle|model|wear|wearing|person|people|man|woman|male|female|on-model|on_model|studio)/.test(
@@ -4992,7 +5164,7 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 					: 0,
 				returnedImages: previewImages.length,
 			});
-			if (previewImages.length > 0) break;
+			if (previewImages.length >= 3) break;
 			await new Promise((resolve) => setTimeout(resolve, 900));
 		}
 		console.log(`[${debugId}] Preview generation finished`, {
@@ -5101,6 +5273,73 @@ exports.deletePreviewCustomPrintifyDesign = async (req, res) => {
 		});
 		return res.status(500).json({
 			error: "Failed to delete preview product from Printify.",
+		});
+	}
+};
+
+exports.getPodPrintAreaLayout = async (req, res) => {
+	try {
+		const { productId } = req.params;
+		if (!productId) {
+			return res.status(400).json({ error: "Missing productId." });
+		}
+
+		const product = await Product.findById(productId)
+			.select("_id productName printifyProductDetails")
+			.lean();
+		if (!product) {
+			return res.status(404).json({ error: "Product not found." });
+		}
+
+		const blueprintId = product?.printifyProductDetails?.blueprint_id;
+		const printProviderId = product?.printifyProductDetails?.print_provider_id;
+		const productVariants = Array.isArray(
+			product?.printifyProductDetails?.variants,
+		)
+			? product.printifyProductDetails.variants
+			: [];
+		if (!blueprintId || !printProviderId || !productVariants.length) {
+			return res.status(400).json({
+				error: "Missing Printify blueprint/provider/variant data on product.",
+			});
+		}
+
+		const catalogLayout = await fetchPodCatalogVariantLayouts({
+			blueprintId,
+			printProviderId,
+			variantIds: productVariants.map((variant) => variant?.id).filter(Boolean),
+		});
+		const variants = catalogLayout.variants.map((variant) => ({
+			id: variant.id,
+			title: variant.title,
+			placeholders: variant.placeholders,
+			placeholderMap: variant.placeholders.reduce(
+				(accumulator, placeholder) => {
+					if (placeholder?.position) {
+						accumulator[placeholder.position] = placeholder;
+					}
+					return accumulator;
+				},
+				{},
+			),
+		}));
+
+		return res.json({
+			success: true,
+			productId,
+			productName: product.productName || "",
+			blueprint_id: catalogLayout.blueprint_id,
+			print_provider_id: catalogLayout.print_provider_id,
+			variants,
+		});
+	} catch (error) {
+		console.error("Failed loading POD print area layout:", {
+			status: error?.response?.status || null,
+			data: error?.response?.data || null,
+			message: error?.message,
+		});
+		return res.status(500).json({
+			error: "Failed to load POD print area layout.",
 		});
 	}
 };

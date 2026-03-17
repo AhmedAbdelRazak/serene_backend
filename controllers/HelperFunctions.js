@@ -206,6 +206,46 @@ function isLikelyMongoId(value = "") {
 	return /^[a-f0-9]{24}$/i.test(`${value || ""}`.trim());
 }
 
+function normalizePodPrintAreaPosition(value = "") {
+	return `${value || ""}`
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, "_");
+}
+
+function getPodProductKindForPlacement(item = {}) {
+	const normalizedName = `${item?.name || item?.productName || item?.printifyProductDetails?.title || ""}`
+		.toLowerCase();
+	if (
+		normalizedName.includes("t-shirt") ||
+		normalizedName.includes("tee") ||
+		(normalizedName.includes("shirt") &&
+			!normalizedName.includes("sweatshirt"))
+	) {
+		return "apparel";
+	}
+	if (
+		normalizedName.includes("hoodie") ||
+		normalizedName.includes("sweatshirt") ||
+		normalizedName.includes("pullover")
+	) {
+		return "hoodie";
+	}
+	if (normalizedName.includes("tote")) return "tote";
+	if (normalizedName.includes("weekender") || normalizedName.includes("bag")) {
+		return "bag";
+	}
+	if (normalizedName.includes("mug")) return "mug";
+	if (normalizedName.includes("pillow")) return "pillow";
+	if (normalizedName.includes("magnet")) return "magnet";
+	if (normalizedName.includes("candle")) return "candle";
+	return "default";
+}
+
+function getFullPrintAreaScaleForOrder(item = {}, positionInput = "") {
+	return 1;
+}
+
 function getCartProductId(item = {}) {
 	const raw = item?.productId || item?._id || item?.id || "";
 	const normalized = `${raw || ""}`.trim();
@@ -588,36 +628,86 @@ async function createOnTheFlyPOD(item, order, token) {
 	try {
 		const hydratedItem = await hydratePrintifyItemFromCatalog(item);
 		const shopId = hydratedItem.printifyProductDetails?.shop_id;
-		if (!shopId) throw new Error("No Printify shop_id found for POD item");
+		if (!shopId) {
+			throw new Error("No Printify shop_id found for POD item");
+		}
 		const recipient = splitRecipientName(order);
 
-		/* 1) locate correct variant ID */
 		const matchedVariant = findMatchingPodVariantForItem(hydratedItem);
-
-		if (!matchedVariant)
+		if (!matchedVariant) {
 			throw new Error("No real variant found for chosen color/size");
+		}
 
 		const realVariantId = matchedVariant.id;
 
-		/* 2) upload bare screenshot */
-		if (!hydratedItem?.customDesign?.bareScreenshotUrl)
-			throw new Error("No bareScreenshotUrl found for custom design");
+		let uploadedId = null;
+		if (hydratedItem?.customDesign?.bareScreenshotUrl) {
+			uploadedId = await uploadIfNeeded(
+				hydratedItem.customDesign.bareScreenshotUrl,
+				token
+			);
+			if (!uploadedId) {
+				throw new Error("Cannot proceed ephemeral. uploadIfNeeded is null");
+			}
+		} else {
+			throw new Error("No bareScreenshotUrl found. Skipping ephemeral creation.");
+		}
 
-		const uploadedId = await uploadIfNeeded(
-			hydratedItem.customDesign.bareScreenshotUrl,
-			token
+		const requestedPrintArea = normalizePodPrintAreaPosition(
+			hydratedItem.customDesign?.printArea || "front"
 		);
-		if (!uploadedId) throw new Error("Design upload failed");
-
-		/* 3) placement params */
+		const availablePlaceholders = Array.isArray(
+			hydratedItem?.printifyProductDetails?.print_areas?.[0]?.placeholders
+		)
+			? hydratedItem.printifyProductDetails.print_areas[0].placeholders
+			: [];
+		const supportedPositions = new Set(
+			availablePlaceholders
+				.map((placeholder) =>
+					normalizePodPrintAreaPosition(placeholder?.position || "")
+				)
+				.filter(Boolean)
+		);
+		const finalPrintArea = supportedPositions.has(requestedPrintArea)
+			? requestedPrintArea
+			: supportedPositions.has("front")
+				? "front"
+				: requestedPrintArea || "front";
+		const fullPrintAreaScale = getFullPrintAreaScaleForOrder(
+			hydratedItem,
+			finalPrintArea
+		);
+		const shouldUseFullPrintAreaScale =
+			hydratedItem?.customDesign?.isFullPrintAreaCapture !== false;
 		const {
 			x = 0.5,
 			y = 0.5,
-			scale = 1,
+			scale = fullPrintAreaScale,
 			angle = 0,
 		} = hydratedItem.customDesign?.placementParams || {};
+		const resolvedScale = shouldUseFullPrintAreaScale
+			? fullPrintAreaScale
+			: Number.isFinite(Number(scale))
+				? Number(scale)
+				: fullPrintAreaScale;
 
 		/* 4) create temporary product */
+		const placeholders = [
+			{
+				position: finalPrintArea || "front",
+				images: [
+					{
+						id: uploadedId,
+						type: "image/png",
+						x,
+						y,
+						scale: resolvedScale,
+						angle,
+					},
+				],
+			},
+		];
+
 		const productPayload = {
 			title: "Custom One‐Time Product",
 			description: "User‐personalised product",
@@ -634,14 +724,7 @@ async function createOnTheFlyPOD(item, order, token) {
 			print_areas: [
 				{
 					variant_ids: [realVariantId],
-					placeholders: [
-						{
-							position: "front",
-							images: [
-								{ id: uploadedId, type: "image/png", x, y, scale, angle },
-							],
-						},
-					],
+					placeholders,
 				},
 			],
 		};
