@@ -2124,6 +2124,8 @@ exports.listProductsForSeo = async (req, res) => {
 											: [],
 										is_default: Boolean(image?.is_default),
 										position: image?.position || image?.placeholder || "",
+										camera_label:
+											image?.camera_label || image?.cameraLabel || "",
 									}))
 							: [],
 					}

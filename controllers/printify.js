@@ -1663,6 +1663,12 @@ function normalizePodDefaultDesignImages(images = []) {
 	return normalized;
 }
 
+function collectPodDefaultDesignEntriesFromAttribute(attribute = {}) {
+	return clonePodDefaultDesignEntries(
+		Array.isArray(attribute?.defaultDesigns) ? attribute.defaultDesigns : [],
+	);
+}
+
 function clonePodDefaultDesignEntries(entries = []) {
 	const safeEntries = Array.isArray(entries) ? entries : [];
 	return safeEntries
@@ -1716,6 +1722,325 @@ function collectPodDefaultDesignEntriesFromProduct(product = {}) {
 	return POD_LIST_OCCASION_OPTIONS.map((option) =>
 		byOccasion.get(option.value.toLowerCase()),
 	).filter(Boolean);
+}
+
+function buildPodDefaultDesignEntrySignature(entries = []) {
+	const safeEntries = clonePodDefaultDesignEntries(entries);
+	return safeEntries
+		.map((entry) => {
+			const occasion = String(entry?.occassion || "")
+				.trim()
+				.toLowerCase();
+			const urls = normalizePodDefaultDesignImages(entry?.defaultDesignImages)
+				.map((image) =>
+					String(
+						image?.cloudinary_url ||
+							image?.cloudinaryUrl ||
+							image?.url ||
+							image?.src ||
+							"",
+					).trim(),
+				)
+				.filter(Boolean)
+				.join("|");
+			return occasion && urls ? `${occasion}:${urls}` : "";
+		})
+		.filter(Boolean)
+		.join("||");
+}
+
+function normalizePodSyncToken(value = "") {
+	return String(value ?? "")
+		.trim()
+		.toLowerCase();
+}
+
+function buildPrintifyOptionValueMap(options = []) {
+	const map = {};
+	for (const option of Array.isArray(options) ? options : []) {
+		for (const value of Array.isArray(option?.values) ? option.values : []) {
+			map[value.id] = {
+				type: String(option?.type || option?.name || "")
+					.trim()
+					.toLowerCase(),
+				title: String(value?.title || "").trim(),
+				colors: Array.isArray(value?.colors) ? value.colors : [],
+			};
+		}
+	}
+	return map;
+}
+
+function getVariantOptionSummary(variant = {}, optionValueMap = {}) {
+	let color = "";
+	let size = "";
+	let scent = "";
+
+	for (const valueId of Array.isArray(variant?.options)
+		? variant.options
+		: []) {
+		const option = optionValueMap[valueId];
+		if (!option) continue;
+		if (!color && option.type.includes("color")) {
+			color = String(option?.colors?.[0] || option?.title || "").trim();
+			continue;
+		}
+		if (!size && option.type.includes("size")) {
+			size = String(option?.title || "").trim();
+			continue;
+		}
+		if (!scent && option.type.includes("scent")) {
+			scent = String(option?.title || "").trim();
+		}
+	}
+
+	return { color, size, scent };
+}
+
+function buildPodVisualGroupKey(
+	product = {},
+	{ color = "", size = "", scent = "" } = {},
+) {
+	const productKind = getPodListProductKind(product);
+	const colorToken = normalizePodSyncToken(color);
+	const sizeToken = normalizePodSyncToken(size);
+	const scentToken = normalizePodSyncToken(scent);
+
+	if (colorToken) {
+		if (["mug", "magnet"].includes(productKind) && sizeToken) {
+			return `color:${colorToken}|size:${sizeToken}`;
+		}
+		return `color:${colorToken}`;
+	}
+	if (scentToken) return `scent:${scentToken}`;
+	if (sizeToken) return `size:${sizeToken}`;
+	return "default";
+}
+
+function buildPodVisualGroupKeyFromAttribute(product = {}, attribute = {}) {
+	return buildPodVisualGroupKey(product, {
+		color: attribute?.color,
+		size: attribute?.size,
+		scent: attribute?.scent,
+	});
+}
+
+function buildPodDefaultDesignEntryMapByVisualGroup(
+	product = {},
+	sourceProduct = {},
+) {
+	const attributes = Array.isArray(product?.productAttributes)
+		? product.productAttributes
+		: [];
+	const byVisualGroup = new Map();
+	for (const attribute of attributes) {
+		const key = buildPodVisualGroupKeyFromAttribute(sourceProduct, attribute);
+		const entries = collectPodDefaultDesignEntriesFromAttribute(attribute);
+		if (!entries.length) continue;
+		const existing = byVisualGroup.get(key);
+		if (
+			!existing ||
+			entries.reduce(
+				(total, entry) =>
+					total + Number(entry?.defaultDesignImages?.length || 0),
+				0,
+			) >
+				existing.reduce(
+					(total, entry) =>
+						total + Number(entry?.defaultDesignImages?.length || 0),
+					0,
+				)
+		) {
+			byVisualGroup.set(key, entries);
+		}
+	}
+	return byVisualGroup;
+}
+
+function hasDistinctPodDefaultDesignVisualGroups(
+	product = {},
+	sourceProduct = {},
+) {
+	const signaturesByGroup = new Map();
+	const attributes = Array.isArray(product?.productAttributes)
+		? product.productAttributes
+		: [];
+	for (const attribute of attributes) {
+		const key = buildPodVisualGroupKeyFromAttribute(sourceProduct, attribute);
+		const signature = buildPodDefaultDesignEntrySignature(
+			collectPodDefaultDesignEntriesFromAttribute(attribute),
+		);
+		if (!signature) continue;
+		if (!signaturesByGroup.has(key)) {
+			signaturesByGroup.set(key, signature);
+		}
+	}
+
+	if (signaturesByGroup.size <= 1) {
+		return true;
+	}
+
+	return new Set([...signaturesByGroup.values()]).size > 1;
+}
+
+function buildVariantImageViewKey(image = {}) {
+	const cameraLabel = getMockupCameraLabel(image);
+	const position = normalizePrintAreaPosition(
+		image?.position || image?.placeholder || "",
+	);
+	const combined = `${cameraLabel} ${position}`.trim();
+	if (
+		/(lifestyle|model|wear|wearing|person|people|studio|on-model|on_model)/.test(
+			combined,
+		)
+	) {
+		return "lifestyle";
+	}
+	if (/(front|center|main|default|hero|primary|straight|full)/.test(combined)) {
+		return "front";
+	}
+	if (/back/.test(combined)) return "back";
+	if (/left/.test(combined)) return "left";
+	if (/right/.test(combined)) return "right";
+	return (
+		combined ||
+		String(image?.src || "")
+			.trim()
+			.toLowerCase()
+	);
+}
+
+function scorePrintifyVariantImage(
+	image = {},
+	product = {},
+	{ preferredCameraLabels = [] } = {},
+) {
+	let score = scorePreviewImageForList(image, product);
+	const cameraLabel = getMockupCameraLabel(image);
+	const metadata = `${cameraLabel} ${String(
+		image?.position || image?.placeholder || "",
+	).toLowerCase()} ${String(image?.src || "").toLowerCase()}`;
+
+	if (preferredCameraLabels.includes(cameraLabel)) score += 12;
+	if (cameraLabel === "front") score += 8;
+	if (
+		/(lifestyle|model|wear|wearing|person|people|studio|on-model|on_model)/.test(
+			metadata,
+		)
+	) {
+		score += 6;
+	}
+	if (/(detail|closeup|close-up|zoom|crop)/.test(metadata)) score -= 6;
+	return score;
+}
+
+function selectBestPrintifyVariantImages({
+	printifyProduct = {},
+	variant = {},
+	optionValueMap = {},
+	limit = 3,
+}) {
+	const allImages = Array.isArray(printifyProduct?.images)
+		? printifyProduct.images
+		: [];
+	if (!allImages.length) return [];
+
+	const productVariants = Array.isArray(printifyProduct?.variants)
+		? printifyProduct.variants
+		: [];
+	const variantId = String(variant?.id || "").trim();
+	const selection = getVariantOptionSummary(variant, optionValueMap);
+	const visualGroupKey = buildPodVisualGroupKey(printifyProduct, selection);
+	const relatedVariantIds = new Set(
+		productVariants
+			.filter((candidate) => {
+				if (candidate?.is_enabled === false) return false;
+				return (
+					buildPodVisualGroupKey(
+						printifyProduct,
+						getVariantOptionSummary(candidate, optionValueMap),
+					) === visualGroupKey
+				);
+			})
+			.map((candidate) => String(candidate?.id || "").trim())
+			.filter(Boolean),
+	);
+	if (variantId) {
+		relatedVariantIds.add(variantId);
+	}
+
+	const exactMatches = allImages.filter((image) =>
+		Array.isArray(image?.variant_ids)
+			? image.variant_ids.some((id) => String(id) === variantId)
+			: false,
+	);
+	const visualMatches = allImages.filter((image) =>
+		Array.isArray(image?.variant_ids)
+			? image.variant_ids.some((id) =>
+					relatedVariantIds.has(String(id || "").trim()),
+				)
+			: false,
+	);
+	const preferredCameraLabels = getPreferredPreviewCameraLabels(
+		printifyProduct,
+		"front",
+	);
+
+	const chooseFromPool = (pool = [], selected = [], seenUrls = new Set()) => {
+		const ranked = [...pool]
+			.filter((image) => {
+				const src = String(image?.src || "").trim();
+				return src && !seenUrls.has(src);
+			})
+			.map((image, index) => ({
+				image,
+				index,
+				score: scorePrintifyVariantImage(image, printifyProduct, {
+					preferredCameraLabels,
+				}),
+				viewKey: buildVariantImageViewKey(image),
+			}))
+			.sort(
+				(a, b) =>
+					b.score - a.score ||
+					a.index - b.index ||
+					String(a.image?.src || "").localeCompare(String(b.image?.src || "")),
+			);
+
+		const viewKeys = new Set(
+			selected.map((image) => buildVariantImageViewKey(image)).filter(Boolean),
+		);
+
+		for (const candidate of ranked) {
+			if (selected.length >= limit) break;
+			if (candidate.viewKey && viewKeys.has(candidate.viewKey)) continue;
+			selected.push(candidate.image);
+			viewKeys.add(candidate.viewKey);
+			seenUrls.add(String(candidate.image?.src || "").trim());
+		}
+
+		for (const candidate of ranked) {
+			if (selected.length >= limit) break;
+			const src = String(candidate.image?.src || "").trim();
+			if (!src || seenUrls.has(src)) continue;
+			selected.push(candidate.image);
+			seenUrls.add(src);
+		}
+
+		return selected;
+	};
+
+	const selected = [];
+	const seenUrls = new Set();
+	chooseFromPool(exactMatches, selected, seenUrls);
+	if (selected.length < limit) {
+		chooseFromPool(visualMatches, selected, seenUrls);
+	}
+	if (selected.length < limit) {
+		chooseFromPool(allImages, selected, seenUrls);
+	}
+
+	return selected.slice(0, limit);
 }
 
 function getPodStoredDefaultDesignEntry(product = {}, occasion = "") {
@@ -3273,6 +3598,8 @@ async function generatePodDefaultDesignEntriesForSync({
 	printifyProduct,
 	enabledVariants,
 	existingProductDoc,
+	existingDefaultDesignEntries = [],
+	previewVariantId = null,
 	forceRegenerate = false,
 	occasionList = [],
 	debugPrefix = "pod-default-sync",
@@ -3289,8 +3616,10 @@ async function generatePodDefaultDesignEntriesForSync({
 		),
 	];
 
-	const existingEntries = collectPodDefaultDesignEntriesFromProduct(
-		existingProductDoc || {},
+	const existingEntries = clonePodDefaultDesignEntries(
+		existingDefaultDesignEntries?.length
+			? existingDefaultDesignEntries
+			: collectPodDefaultDesignEntriesFromProduct(existingProductDoc || {}),
 	);
 	const existingByOccasion = new Map(
 		existingEntries.map((entry) => [
@@ -3325,8 +3654,13 @@ async function generatePodDefaultDesignEntriesForSync({
 		},
 	};
 
-	const previewVariantId = resolvePodListVariantId(previewMetaProduct, null);
+	const resolvedPreviewVariantId = resolvePodListVariantId(
+		previewMetaProduct,
+		previewVariantId,
+	);
 	const results = [];
+	let generatedCount = 0;
+	let reusedCount = 0;
 
 	for (const safeOccasion of safeOccasionList) {
 		const occasionKey = safeOccasion.toLowerCase();
@@ -3339,6 +3673,7 @@ async function generatePodDefaultDesignEntriesForSync({
 				occassion: safeOccasion,
 				defaultDesignImages: existingImages,
 			});
+			reusedCount += 1;
 			continue;
 		}
 
@@ -3353,9 +3688,9 @@ async function generatePodDefaultDesignEntriesForSync({
 				product: previewMetaProduct,
 				occasion: safeOccasion,
 				name: "",
-				variantIdInput: previewVariantId,
+				variantIdInput: resolvedPreviewVariantId,
 				cacheKey: `sync-default:${String(printifyProduct?.id || "")}:${String(
-					previewVariantId || "",
+					resolvedPreviewVariantId || "",
 				)}:${safeOccasion}:noname`,
 				debugId,
 				options: {
@@ -3376,6 +3711,7 @@ async function generatePodDefaultDesignEntriesForSync({
 					occassion: safeOccasion,
 					defaultDesignImages: generatedImages,
 				});
+				generatedCount += 1;
 				continue;
 			}
 
@@ -3384,6 +3720,7 @@ async function generatePodDefaultDesignEntriesForSync({
 					occassion: safeOccasion,
 					defaultDesignImages: existingImages,
 				});
+				reusedCount += 1;
 			}
 		} catch (defaultGenError) {
 			console.warn(`[${debugId}] Failed generating default POD designs`, {
@@ -3398,15 +3735,20 @@ async function generatePodDefaultDesignEntriesForSync({
 					occassion: safeOccasion,
 					defaultDesignImages: existingImages,
 				});
+				reusedCount += 1;
 			}
 		}
 	}
 
-	return clonePodDefaultDesignEntries(results).filter(
-		(entry) =>
-			Array.isArray(entry?.defaultDesignImages) &&
-			entry.defaultDesignImages.length > 0,
-	);
+	return {
+		entries: clonePodDefaultDesignEntries(results).filter(
+			(entry) =>
+				Array.isArray(entry?.defaultDesignImages) &&
+				entry.defaultDesignImages.length > 0,
+		),
+		generatedCount,
+		reusedCount,
+	};
 }
 
 exports.syncPrintifyProducts = async (req, res) => {
@@ -3510,11 +3852,11 @@ exports.syncPrintifyProducts = async (req, res) => {
 		const combinedProducts = designProducts;
 
 		//-------------------------------------------------------------------
-		// 4. IMAGE UPLOAD HELPER (LIMIT TO 5)
+		// 4. IMAGE UPLOAD HELPER (LIMIT TO 3)
 		//-------------------------------------------------------------------
 		const uploadImageToCloudinaryLimited = async (
 			imagesArray = [],
-			limit = 5,
+			limit = 3,
 		) => {
 			const limitedImages = imagesArray.slice(0, limit);
 			const uploadedImages = await Promise.all(
@@ -3542,7 +3884,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			for (const v of variants) {
 				let colorVal = "";
 				for (let valId of v.options || []) {
-					if (optionValueMap[valId]?.type === "color") {
+					if (optionValueMap[valId]?.type?.includes("color")) {
 						colorVal =
 							optionValueMap[valId].colors?.[0] || optionValueMap[valId].title;
 					}
@@ -3752,16 +4094,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 			}
 
 			// Build an optionValueMap => { valueId: { type, title, colors? } }
-			const optionValueMap = {};
-			(printifyProduct.options || []).forEach((option) => {
-				(option.values || []).forEach((val) => {
-					optionValueMap[val.id] = {
-						type: option.type,
-						title: val.title,
-						colors: val.colors || [],
-					};
-				});
-			});
+			const optionValueMap = buildPrintifyOptionValueMap(
+				printifyProduct.options || [],
+			);
 
 			// Sort by size if a size option is present
 			const sizeOrdering = [
@@ -3779,7 +4114,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 			enabledVariants.sort((a, b) => {
 				const getSizeTitle = (v) => {
 					for (let valId of v.options || []) {
-						if (optionValueMap[valId]?.type === "size") {
+						if (optionValueMap[valId]?.type?.includes("size")) {
 							return optionValueMap[valId].title;
 						}
 					}
@@ -3800,25 +4135,33 @@ exports.syncPrintifyProducts = async (req, res) => {
 			const existingTopLevel = await Product.findOne({
 				productSKU: firstVariantSKU,
 			});
+			const distinctColorVariants = getDistinctColorVariants(
+				enabledVariants,
+				optionValueMap,
+			);
+			const representativeGalleryVariant =
+				distinctColorVariants[0] || enabledVariants[0];
 
 			//-------------------------------------------------------------------
-			// Upload up to 5 images for the top-level
+			// Upload up to 3 ranked images for the top-level
 			//-------------------------------------------------------------------
-			let validUploadedImages = [];
-			if (!existingTopLevel) {
-				const relevantImagesForProduct = (printifyProduct.images || []).filter(
-					(img) =>
-						img.variant_ids.some((vId) =>
-							enabledVariants.some((ev) => ev.id === vId),
-						),
-				);
-				validUploadedImages = await uploadImageToCloudinaryLimited(
-					relevantImagesForProduct,
-					5,
-				);
-			} else {
-				validUploadedImages =
-					existingTopLevel.thumbnailImage?.[0]?.images || [];
+			const topLevelVariantImages = selectBestPrintifyVariantImages({
+				printifyProduct,
+				variant: representativeGalleryVariant,
+				optionValueMap,
+				limit: 3,
+			});
+			let validUploadedImages = await uploadImageToCloudinaryLimited(
+				topLevelVariantImages,
+				3,
+			);
+			if (
+				!validUploadedImages.length &&
+				Array.isArray(existingTopLevel?.thumbnailImage?.[0]?.images)
+			) {
+				validUploadedImages = existingTopLevel.thumbnailImage[0].images
+					.filter((image) => image?.url || image?.src)
+					.slice(0, 3);
 			}
 
 			//-------------------------------------------------------------------
@@ -3876,23 +4219,13 @@ exports.syncPrintifyProducts = async (req, res) => {
 			//-------------------------------------------------------------------
 			// Build productAttributes array
 			//-------------------------------------------------------------------
-			productData.productAttributes = await Promise.all(
+			const attributeMetas = await Promise.all(
 				enabledVariants.map(async (variant) => {
-					let colorVal = "";
-					let sizeVal = "";
-					let scentVal = "";
-
-					for (let valId of variant.options || []) {
-						const foundOption = optionValueMap[valId];
-						if (!foundOption) continue;
-						if (foundOption.type === "color") {
-							colorVal = foundOption.colors?.[0] || foundOption.title || "";
-						} else if (foundOption.type === "size") {
-							sizeVal = foundOption.title;
-						} else if (foundOption.type === "scent") {
-							scentVal = foundOption.title;
-						}
-					}
+					const {
+						color: colorVal,
+						size: sizeVal,
+						scent: scentVal,
+					} = getVariantOptionSummary(variant, optionValueMap);
 
 					const pkParts = [];
 					if (sizeVal) pkParts.push(sizeVal);
@@ -3900,61 +4233,60 @@ exports.syncPrintifyProducts = async (req, res) => {
 					if (scentVal) pkParts.push(scentVal);
 					const PK = pkParts.length ? pkParts.join("#") : variant.sku;
 
-					let variantUploadedImages = [];
-					if (existingTopLevel) {
-						// Reuse existing productImages if we have them
+					const selectedVariantImages = selectBestPrintifyVariantImages({
+						printifyProduct,
+						variant,
+						optionValueMap,
+						limit: 3,
+					});
+					let variantUploadedImages = await uploadImageToCloudinaryLimited(
+						selectedVariantImages,
+						3,
+					);
+					if (!variantUploadedImages.length && existingTopLevel) {
 						const existingAttr = existingTopLevel.productAttributes?.find(
 							(a) => a.SubSKU === variant.sku,
 						);
-						if (existingAttr) {
-							variantUploadedImages = existingAttr.productImages || [];
-						} else {
-							const vImages = (printifyProduct.images || []).filter((img) =>
-								img.variant_ids.includes(variant.id),
-							);
-							variantUploadedImages = await uploadImageToCloudinaryLimited(
-								vImages,
-								5,
-							);
+						if (existingAttr?.productImages?.length) {
+							variantUploadedImages = existingAttr.productImages
+								.filter((image) => image?.url || image?.src)
+								.slice(0, 3);
 						}
-					} else {
-						// no existing product => fresh upload
-						const vImages = (printifyProduct.images || []).filter((img) =>
-							img.variant_ids.includes(variant.id),
-						);
-						variantUploadedImages = await uploadImageToCloudinaryLimited(
-							vImages,
-							5,
-						);
 					}
 
 					const priceFromPrintify = variant.price / 100;
 					return {
-						PK,
-						color: colorVal,
-						size: sizeVal,
-						scent: scentVal,
-						SubSKU: variant.sku,
-						quantity: 20,
-						price: priceFromPrintify.toFixed(2),
-						priceAfterDiscount: priceFromPrintify.toFixed(2),
-						MSRP: priceFromPrintify.toFixed(2),
-						WholeSalePrice: priceFromPrintify.toFixed(2),
-						DropShippingPrice: priceFromPrintify.toFixed(2),
-						productImages: variantUploadedImages,
+						variant,
+						visualGroupKey: buildPodVisualGroupKey(printifyProduct, {
+							color: colorVal,
+							size: sizeVal,
+							scent: scentVal,
+						}),
+						attribute: {
+							PK,
+							color: colorVal,
+							size: sizeVal,
+							scent: scentVal,
+							SubSKU: variant.sku,
+							quantity: 20,
+							price: priceFromPrintify.toFixed(2),
+							priceAfterDiscount: priceFromPrintify.toFixed(2),
+							MSRP: priceFromPrintify.toFixed(2),
+							WholeSalePrice: priceFromPrintify.toFixed(2),
+							DropShippingPrice: priceFromPrintify.toFixed(2),
+							productImages: variantUploadedImages,
+						},
 					};
 				}),
+			);
+			productData.productAttributes = attributeMetas.map(
+				(entry) => entry.attribute,
 			);
 
 			//-------------------------------------------------------------------
 			// 8. If product has multiple colors => ephemeral per color
 			//    Otherwise => just ephemeral for a single variant.
 			//-------------------------------------------------------------------
-			const distinctColorVariants = getDistinctColorVariants(
-				enabledVariants,
-				optionValueMap,
-			);
-
 			let variantIdToCloudImage = {};
 			try {
 				if (distinctColorVariants.length > 1) {
@@ -4002,7 +4334,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 						// get dv's color
 						let dvColorVal = "";
 						for (let valId of dv.options || []) {
-							if (optionValueMap[valId]?.type === "color") {
+							if (optionValueMap[valId]?.type?.includes("color")) {
 								dvColorVal =
 									optionValueMap[valId].colors?.[0] ||
 									optionValueMap[valId].title;
@@ -4040,24 +4372,84 @@ exports.syncPrintifyProducts = async (req, res) => {
 				existingTopLevel || {},
 			);
 			if (isPOD && shouldGenerateDefaultDesigns) {
-				try {
-					const generatedDefaultEntries =
-						await generatePodDefaultDesignEntriesForSync({
+				const canReuseExistingDesigns =
+					!forceRegenerateDefaultDesigns &&
+					hasDistinctPodDefaultDesignVisualGroups(
+						existingTopLevel || {},
+						printifyProduct,
+					);
+				const existingDefaultDesignsByVisualGroup = canReuseExistingDesigns
+					? buildPodDefaultDesignEntryMapByVisualGroup(
+							existingTopLevel || {},
 							printifyProduct,
-							enabledVariants,
-							existingProductDoc: existingTopLevel || {},
-							forceRegenerate: forceRegenerateDefaultDesigns,
-							occasionList: defaultDesignOccasions,
-							debugPrefix: "pod-default-sync",
-						});
-					if (generatedDefaultEntries.length) {
-						defaultDesignEntries = generatedDefaultEntries;
+						)
+					: new Map();
+				const defaultDesignsByVisualGroup = new Map();
+				let generatedVisualGroups = 0;
+				let reusedVisualGroups = 0;
+				try {
+					for (const attributeMeta of attributeMetas) {
+						const visualGroupKey = attributeMeta.visualGroupKey || "default";
+						if (defaultDesignsByVisualGroup.has(visualGroupKey)) {
+							continue;
+						}
+						const existingEntriesForGroup =
+							existingDefaultDesignsByVisualGroup.get(visualGroupKey) || [];
+						const defaultDesignSync =
+							await generatePodDefaultDesignEntriesForSync({
+								printifyProduct,
+								enabledVariants,
+								existingProductDoc: existingTopLevel || {},
+								existingDefaultDesignEntries: existingEntriesForGroup,
+								previewVariantId: attributeMeta.variant?.id || null,
+								forceRegenerate: forceRegenerateDefaultDesigns,
+								occasionList: defaultDesignOccasions,
+								debugPrefix: `pod-default-sync-${visualGroupKey
+									.replace(/[^a-z0-9|:-]+/gi, "-")
+									.slice(0, 36)}`,
+							});
+						defaultDesignsByVisualGroup.set(
+							visualGroupKey,
+							defaultDesignSync.entries,
+						);
+						if (defaultDesignSync.generatedCount > 0) {
+							generatedVisualGroups += 1;
+						} else if (defaultDesignSync.reusedCount > 0) {
+							reusedVisualGroups += 1;
+						}
+					}
+					const mergedEntries = [];
+					for (const entries of defaultDesignsByVisualGroup.values()) {
+						mergedEntries.push(...clonePodDefaultDesignEntries(entries));
+					}
+					defaultDesignEntries = collectPodDefaultDesignEntriesFromProduct({
+						productAttributes: [...productData.productAttributes].map(
+							(attribute, index) => ({
+								...attribute,
+								defaultDesigns:
+									defaultDesignsByVisualGroup.get(
+										attributeMetas[index]?.visualGroupKey || "default",
+									) || [],
+							}),
+						),
+					});
+					if (generatedVisualGroups > 0) {
 						defaultDesignSyncStats.productsGenerated += 1;
-					} else if (defaultDesignEntries.length) {
+					} else if (reusedVisualGroups > 0 || mergedEntries.length > 0) {
 						defaultDesignSyncStats.productsReused += 1;
 					} else {
 						defaultDesignSyncStats.productsMissing += 1;
 					}
+					productData.productAttributes = productData.productAttributes.map(
+						(attribute, index) => ({
+							...attribute,
+							defaultDesigns: clonePodDefaultDesignEntries(
+								defaultDesignsByVisualGroup.get(
+									attributeMetas[index]?.visualGroupKey || "default",
+								) || [],
+							),
+						}),
+					);
 				} catch (defaultDesignSyncError) {
 					defaultDesignSyncStats.productsFailed += 1;
 					console.warn(
@@ -4074,16 +4466,24 @@ exports.syncPrintifyProducts = async (req, res) => {
 				defaultDesignSyncStats.productsReused += 1;
 			}
 
-			const clonedDefaultDesignEntries =
-				clonePodDefaultDesignEntries(defaultDesignEntries);
-			productData.productAttributes = productData.productAttributes.map(
-				(attribute) => ({
-					...attribute,
-					defaultDesigns: clonePodDefaultDesignEntries(
-						clonedDefaultDesignEntries,
-					),
-				}),
-			);
+			if (
+				!productData.productAttributes.some(
+					(attribute) =>
+						Array.isArray(attribute?.defaultDesigns) &&
+						attribute.defaultDesigns.length > 0,
+				)
+			) {
+				const clonedDefaultDesignEntries =
+					clonePodDefaultDesignEntries(defaultDesignEntries);
+				productData.productAttributes = productData.productAttributes.map(
+					(attribute) => ({
+						...attribute,
+						defaultDesigns: clonePodDefaultDesignEntries(
+							clonedDefaultDesignEntries,
+						),
+					}),
+				);
+			}
 
 			//-------------------------------------------------------------------
 			// 11. Finally, CREATE/UPDATE top-level product & set to draft
