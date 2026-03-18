@@ -634,6 +634,10 @@ const POD_LIST_PRESETS = {
 	},
 };
 
+const POD_LIST_EMOJI_ICON_CACHE = new Map();
+const POD_LIST_TWEMOJI_BASE_URL =
+	"https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg";
+
 function normalizePodListOccasion(value) {
 	if (!value || typeof value !== "string") return POD_LIST_DEFAULT_OCCASION;
 	let decoded = String(value);
@@ -714,6 +718,502 @@ function getPodListProductKind(product = {}) {
 	if (isMagnet) return "magnet";
 	if (isCandle) return "candle";
 	return "default";
+}
+
+function shouldUseFrontendSyncedPodListAsset(product = {}) {
+	const kind = getPodListProductKind(product);
+	return kind === "pillow" || kind === "magnet" || kind === "candle";
+}
+
+function getPodListEditorSurfaceConfig(product = {}, positionInput = "") {
+	const kind = getPodListProductKind(product);
+	const position = normalizePrintAreaPosition(positionInput || "front");
+	const byKind = {
+		pillow: {
+			front: { widthRatio: 42, heightRatio: 42, clampInset: 2 },
+		},
+		magnet: {
+			front: { widthRatio: 76, heightRatio: 76, clampInset: 1 },
+		},
+		candle: {
+			front: { widthRatio: 40, heightRatio: 44, clampInset: 2 },
+		},
+		default: {
+			front: { widthRatio: 60, heightRatio: 75, clampInset: 3 },
+		},
+	};
+	const kindConfig = byKind[kind] || byKind.default;
+	return kindConfig[position] || kindConfig.front || byKind.default.front;
+}
+
+function resolvePodListSafeBounds(
+	containerWidth,
+	containerHeight,
+	insetPercent = 0,
+) {
+	const width = Math.max(0, Number(containerWidth) || 0);
+	const height = Math.max(0, Number(containerHeight) || 0);
+	const safeInsetPercent = Math.max(
+		0,
+		Math.min(45, Number(insetPercent) || 0),
+	);
+	const insetX = (width * safeInsetPercent) / 100;
+	const insetY = (height * safeInsetPercent) / 100;
+	return {
+		minX: insetX,
+		minY: insetY,
+		maxX: Math.max(insetX, width - insetX),
+		maxY: Math.max(insetY, height - insetY),
+	};
+}
+
+function clampPodListElementPositionWithinBounds(
+	x,
+	y,
+	width,
+	height,
+	bounds,
+) {
+	const safeWidth = Math.max(24, Number(width) || 0);
+	const safeHeight = Math.max(24, Number(height) || 0);
+	const minX = Number(bounds?.minX) || 0;
+	const minY = Number(bounds?.minY) || 0;
+	const maxX = Math.max(minX, (Number(bounds?.maxX) || 0) - safeWidth);
+	const maxY = Math.max(minY, (Number(bounds?.maxY) || 0) - safeHeight);
+	return {
+		x: Math.max(minX, Math.min(maxX, Number(x) || 0)),
+		y: Math.max(minY, Math.min(maxY, Number(y) || 0)),
+	};
+}
+
+function clampPodListElementRectWithinBounds(rect = {}, bounds) {
+	const minX = Number(bounds?.minX) || 0;
+	const minY = Number(bounds?.minY) || 0;
+	const maxX = Number(bounds?.maxX) || minX;
+	const maxY = Number(bounds?.maxY) || minY;
+	const limitWidth = Math.max(24, maxX - minX);
+	const limitHeight = Math.max(24, maxY - minY);
+	const width = Math.max(
+		24,
+		Math.min(limitWidth, Math.max(24, Number(rect.width) || 24)),
+	);
+	const height = Math.max(
+		24,
+		Math.min(limitHeight, Math.max(24, Number(rect.height) || 24)),
+	);
+	const point = clampPodListElementPositionWithinBounds(
+		rect.x,
+		rect.y,
+		width,
+		height,
+		bounds,
+	);
+	return {
+		x: point.x,
+		y: point.y,
+		width,
+		height,
+	};
+}
+
+function resolvePodListAutoDesignGeometry(product = {}, preset = {}) {
+	const kind = getPodListProductKind(product);
+	const baseByKind = {
+		pillow: {
+			messageWidthRatio: 0.96,
+			messageHeightRatio: 0.95,
+			iconSizeRatio: 0.112,
+			iconOverlapPx: 44,
+			maxMessageHeight: 360,
+			maxIconSize: 60,
+		},
+		magnet: {
+			messageWidthRatio: 0.985,
+			messageHeightRatio: 0.955,
+			iconSizeRatio: 0.138,
+			iconOverlapPx: 22,
+			maxMessageHeight: 560,
+			maxIconSize: 68,
+		},
+		candle: {
+			messageWidthRatio: 0.98,
+			messageHeightRatio: 0.9,
+			iconSizeRatio: 0.13,
+			iconOverlapPx: 34,
+			maxMessageHeight: 284,
+			maxIconSize: 58,
+		},
+		default: {
+			messageWidthRatio: 0.52,
+			messageHeightRatio: 0.2,
+			iconSizeRatio: 0.076,
+			iconOverlapPx: 6,
+			maxMessageHeight: 92,
+			maxIconSize: 48,
+		},
+	};
+	const geometryOverrides =
+		preset && typeof preset === "object" && preset.geometryOverrides
+			? preset.geometryOverrides
+			: {};
+	const base = baseByKind[kind] || baseByKind.default;
+	const numberOrFallback = (value, fallback) => {
+		const num = Number(value);
+		return Number.isFinite(num) ? num : fallback;
+	};
+	return {
+		kind,
+		messageWidthRatio: Math.max(
+			0.34,
+			Math.min(
+				kind === "candle" ? 0.98 : kind === "magnet" ? 0.99 : 0.95,
+				numberOrFallback(
+					geometryOverrides.messageWidthRatio,
+					base.messageWidthRatio,
+				),
+			),
+		),
+		messageHeightRatio: Math.max(
+			0.1,
+			Math.min(
+				kind === "candle" ? 0.92 : kind === "magnet" ? 0.97 : 0.84,
+				numberOrFallback(
+					geometryOverrides.messageHeightRatio,
+					base.messageHeightRatio,
+				),
+			),
+		),
+		iconSizeRatio: Math.max(
+			0.05,
+			Math.min(
+				0.16,
+				numberOrFallback(geometryOverrides.iconSizeRatio, base.iconSizeRatio),
+			),
+		),
+		iconOverlapPx: numberOrFallback(
+			geometryOverrides.iconOverlapPx,
+			base.iconOverlapPx,
+		),
+		maxMessageHeight: Math.max(
+			74,
+			Math.min(
+				kind === "candle" ? 300 : kind === "magnet" ? 560 : 320,
+				numberOrFallback(
+					geometryOverrides.maxMessageHeight,
+					base.maxMessageHeight,
+				),
+			),
+		),
+		maxIconSize: Math.max(
+			44,
+			Math.min(
+				84,
+				numberOrFallback(geometryOverrides.maxIconSize, base.maxIconSize),
+			),
+		),
+	};
+}
+
+function getPodListCaptureProjection(product = {}, positionInput = "") {
+	const kind = getPodListProductKind(product);
+	const position = normalizePrintAreaPosition(positionInput || "front");
+	if (kind === "pillow" && position === "front") {
+		return {
+			x: 0.25,
+			y: 0.5,
+			scale: 0.56,
+		};
+	}
+	return null;
+}
+
+function getPodListPlaceholderAspectRatio(placeholder = null) {
+	const explicitRatio = Number(placeholder?.aspect_ratio || 0);
+	if (explicitRatio > 0) return explicitRatio;
+	const width = Number(placeholder?.width || 0);
+	const height = Number(placeholder?.height || 0);
+	if (width > 0 && height > 0) {
+		return width / height;
+	}
+	return 0;
+}
+
+function getPodListApproxTextWidthPx(text = "", fontSizePx = 16, fontFamily = "") {
+	const family = String(fontFamily || "").toLowerCase();
+	const baseFactor = family.includes("great vibes")
+		? 0.64
+		: family.includes("dancing script")
+			? 0.62
+			: family.includes("lobster")
+				? 0.68
+				: family.includes("poppins")
+					? 0.56
+					: family.includes("playfair") || family.includes("cormorant")
+						? 0.58
+						: 0.55;
+	let total = 0;
+	for (const char of String(text || "")) {
+		if (char === " ") {
+			total += fontSizePx * 0.28;
+			continue;
+		}
+		if (/[A-Z]/.test(char)) {
+			total += fontSizePx * (baseFactor + 0.08);
+			continue;
+		}
+		if (/[.,!?'’:-]/.test(char)) {
+			total += fontSizePx * 0.24;
+			continue;
+		}
+		total += fontSizePx * baseFactor;
+	}
+	return total;
+}
+
+function wrapPodListMessageToWidth({
+	message = "",
+	maxWidthPx = 280,
+	fontSizePx = 32,
+	fontFamily = "",
+	maxLines = 3,
+}) {
+	const words = String(message || "")
+		.trim()
+		.split(/\s+/)
+		.filter(Boolean);
+	if (!words.length) return ["Made with love"];
+	const safeMaxLines = Math.max(1, Number(maxLines) || 3);
+	const lines = [];
+	let current = "";
+
+	for (const word of words) {
+		const tentative = current ? `${current} ${word}` : word;
+		if (
+			!current ||
+			getPodListApproxTextWidthPx(tentative, fontSizePx, fontFamily) <=
+				maxWidthPx
+		) {
+			current = tentative;
+			continue;
+		}
+		lines.push(current);
+		current = word;
+	}
+	if (current) lines.push(current);
+	if (lines.length <= safeMaxLines) return lines;
+
+	const merged = lines.slice(0, safeMaxLines);
+	merged[safeMaxLines - 1] = lines.slice(safeMaxLines - 1).join(" ");
+	return merged;
+}
+
+function getPodListCombinedBounds(elements = []) {
+	const safeElements = Array.isArray(elements) ? elements.filter(Boolean) : [];
+	if (!safeElements.length) return null;
+	const minX = Math.min(...safeElements.map((item) => Number(item.x) || 0));
+	const minY = Math.min(...safeElements.map((item) => Number(item.y) || 0));
+	const maxX = Math.max(
+		...safeElements.map(
+			(item) => (Number(item.x) || 0) + Math.max(0, Number(item.width) || 0),
+		),
+	);
+	const maxY = Math.max(
+		...safeElements.map(
+			(item) => (Number(item.y) || 0) + Math.max(0, Number(item.height) || 0),
+		),
+	);
+	return {
+		x: minX,
+		y: minY,
+		width: Math.max(0, maxX - minX),
+		height: Math.max(0, maxY - minY),
+	};
+}
+
+function getPodListNormalizedContentBounds(
+	elements = [],
+	containerWidth = 0,
+	containerHeight = 0,
+) {
+	const safeWidth = Math.max(1, Number(containerWidth) || 1);
+	const safeHeight = Math.max(1, Number(containerHeight) || 1);
+	const combinedBounds = getPodListCombinedBounds(elements);
+	if (!(combinedBounds?.width > 0) || !(combinedBounds?.height > 0)) return null;
+	const padX = Math.max(2, Math.round(combinedBounds.width * 0.02));
+	const padY = Math.max(2, Math.round(combinedBounds.height * 0.04));
+	const x = Math.max(
+		0,
+		Math.min(safeWidth - 1, Math.round(combinedBounds.x - padX)),
+	);
+	const y = Math.max(
+		0,
+		Math.min(safeHeight - 1, Math.round(combinedBounds.y - padY)),
+	);
+	const right = Math.max(
+		x + 1,
+		Math.min(safeWidth, Math.round(combinedBounds.x + combinedBounds.width + padX)),
+	);
+	const bottom = Math.max(
+		y + 1,
+		Math.min(
+			safeHeight,
+			Math.round(combinedBounds.y + combinedBounds.height + padY),
+		),
+	);
+	return {
+		x: x / safeWidth,
+		y: y / safeHeight,
+		width: Math.max(1, right - x) / safeWidth,
+		height: Math.max(1, bottom - y) / safeHeight,
+		pixelBounds: {
+			x,
+			y,
+			width: Math.max(1, right - x),
+			height: Math.max(1, bottom - y),
+		},
+	};
+}
+
+function getPodListProjectedPanelRect({
+	sourceWidth = 0,
+	sourceHeight = 0,
+	targetAspectRatio = 0,
+	projection = null,
+} = {}) {
+	const safeSourceWidth = Math.max(1, Number(sourceWidth) || 1);
+	const safeSourceHeight = Math.max(1, Number(sourceHeight) || 1);
+	const safeTargetAspectRatio = Number(targetAspectRatio) || 0;
+	const safeProjectionScale = Math.max(0.08, Number(projection?.scale) || 0);
+	if (!projection || !(safeTargetAspectRatio > 0) || !(safeProjectionScale > 0)) {
+		return {
+			left: 0,
+			top: 0,
+			width: 1,
+			height: 1,
+		};
+	}
+	const sourceAspectRatio = safeSourceWidth / safeSourceHeight;
+	const width = safeProjectionScale;
+	const height =
+		(width * safeTargetAspectRatio) / Math.max(0.08, sourceAspectRatio);
+	return {
+		left: Number(projection?.x || 0.5) - width / 2,
+		top: Number(projection?.y || 0.5) - height / 2,
+		width,
+		height,
+	};
+}
+
+function buildPodListPlacementAssetFromBounds({
+	normalizedBounds = null,
+	canvasWidth = 0,
+	canvasHeight = 0,
+	placementMode = "direct-wrap",
+	targetAspectRatio = 0,
+	projection = null,
+} = {}) {
+	if (
+		!normalizedBounds ||
+		!(Number(normalizedBounds.width) > 0) ||
+		!(Number(normalizedBounds.height) > 0)
+	) {
+		return null;
+	}
+	const bounds = {
+		x: Math.max(0, Math.min(1, Number(normalizedBounds.x) || 0)),
+		y: Math.max(0, Math.min(1, Number(normalizedBounds.y) || 0)),
+		width: Math.max(0, Math.min(1, Number(normalizedBounds.width) || 0)),
+		height: Math.max(0, Math.min(1, Number(normalizedBounds.height) || 0)),
+	};
+	if (placementMode === "direct-wrap") {
+		return {
+			placementParams: {
+				x: Math.max(0, Math.min(1, bounds.x + bounds.width / 2)),
+				y: Math.max(0, Math.min(1, bounds.y + bounds.height / 2)),
+				scale: Math.max(0.18, Math.min(2.6, bounds.width)),
+				angle: 0,
+			},
+			designCoversPrintArea: false,
+			isFullPrintAreaCapture: false,
+			forceSourcePlacement: true,
+		};
+	}
+	const panelRect = getPodListProjectedPanelRect({
+		sourceWidth: canvasWidth,
+		sourceHeight: canvasHeight,
+		targetAspectRatio,
+		projection,
+	});
+	return {
+		placementParams: {
+			x: Math.max(
+				0,
+				Math.min(
+					1,
+					panelRect.left + (bounds.x + bounds.width / 2) * panelRect.width,
+				),
+			),
+			y: Math.max(
+				0,
+				Math.min(
+					1,
+					panelRect.top + (bounds.y + bounds.height / 2) * panelRect.height,
+				),
+			),
+			scale: Math.max(
+				0.18,
+				Math.min(2.6, panelRect.width * bounds.width),
+			),
+			angle: 0,
+		},
+		designCoversPrintArea: false,
+		isFullPrintAreaCapture: false,
+		forceSourcePlacement: true,
+	};
+}
+
+function getPodListTwemojiCodepoints(emoji = "") {
+	return Array.from(String(emoji || ""))
+		.map((char) => char.codePointAt(0))
+		.filter((codePoint) => Number.isFinite(codePoint) && codePoint !== 0xfe0f)
+		.map((codePoint) => codePoint.toString(16))
+		.join("-");
+}
+
+async function getPodListEmojiAssetDataUri(emoji = "") {
+	const safeEmoji = String(emoji || "").trim();
+	if (!safeEmoji) return null;
+	if (POD_LIST_EMOJI_ICON_CACHE.has(safeEmoji)) {
+		return POD_LIST_EMOJI_ICON_CACHE.get(safeEmoji);
+	}
+	const codepoints = getPodListTwemojiCodepoints(safeEmoji);
+	if (!codepoints) {
+		POD_LIST_EMOJI_ICON_CACHE.set(safeEmoji, null);
+		return null;
+	}
+	try {
+		const response = await axios.get(
+			`${POD_LIST_TWEMOJI_BASE_URL}/${codepoints}.svg`,
+			{
+				responseType: "text",
+				timeout: 15000,
+			},
+		);
+		const dataUri = `data:image/svg+xml;base64,${Buffer.from(
+			String(response.data || ""),
+		).toString("base64")}`;
+		POD_LIST_EMOJI_ICON_CACHE.set(safeEmoji, dataUri);
+		return dataUri;
+	} catch (error) {
+		console.warn("[pod-list-emoji] Failed loading emoji asset", {
+			emoji: safeEmoji,
+			codepoints,
+			status: error?.response?.status || null,
+			message: error?.message,
+		});
+		POD_LIST_EMOJI_ICON_CACHE.set(safeEmoji, null);
+		return null;
+	}
 }
 
 function normalizePrintAreaPosition(value = "") {
@@ -1162,64 +1662,73 @@ function getPodListDesignLayout(product = {}) {
 			return {
 				canvasWidth: 1600,
 				canvasHeight: 1600,
-				maxCharsPerLine: 18,
-				maxLines: 2,
-				lineHeight: 84,
-				textFontSize: 70,
-				textBaseY: 930,
+				maxCharsPerLine: 10,
+				maxLines: 3,
+				lineHeight: 112,
+				textFontSize: 112,
+				textBaseY: 842,
 				textX: 800,
 				iconCx: 800,
-				iconCy: 618,
-				iconR: 54,
-				iconFontSize: 50,
-				panelX: 360,
-				panelY: 760,
-				panelWidth: 880,
-				panelHeight: 284,
-				panelRadius: 90,
+				iconCy: 468,
+				iconR: 48,
+				iconFontSize: 34,
+				panelX: 224,
+				panelY: 220,
+				panelWidth: 1152,
+				panelHeight: 1160,
+				panelRadius: 104,
 				panelStrokeWidth: 6,
+				ornamentYRatio: 0.55,
+				ornamentInsetRatio: 0.16,
+				ornamentStyle: "diamond",
 			};
 		case "magnet":
 			return {
 				canvasWidth: 1600,
 				canvasHeight: 1600,
-				maxCharsPerLine: 22,
+				maxCharsPerLine: 10,
 				maxLines: 3,
-				lineHeight: 90,
-				textFontSize: 78,
-				textBaseY: 920,
+				lineHeight: 126,
+				textFontSize: 132,
+				textBaseY: 852,
 				textX: 800,
 				iconCx: 800,
-				iconCy: 566,
-				iconR: 64,
-				iconFontSize: 58,
-				panelX: 252,
-				panelY: 716,
-				panelWidth: 1096,
-				panelHeight: 308,
-				panelRadius: 74,
+				iconCy: 430,
+				iconR: 52,
+				iconFontSize: 38,
+				panelX: 172,
+				panelY: 150,
+				panelWidth: 1256,
+				panelHeight: 1268,
+				panelRadius: 92,
 				panelStrokeWidth: 6,
+				ornamentYRatio: 0.55,
+				ornamentInsetRatio: 0.17,
+				ornamentStyle: "diamond",
 			};
 		case "candle":
 			return {
 				canvasWidth: 1480,
 				canvasHeight: 1120,
-				maxCharsPerLine: 20,
-				maxLines: 2,
-				lineHeight: 94,
-				textFontSize: 96,
-				textBaseY: 600,
+				maxCharsPerLine: 10,
+				maxLines: 3,
+				lineHeight: 120,
+				textFontSize: 104,
+				textBaseY: 650,
 				textX: 740,
 				iconCx: 740,
-				iconCy: 268,
-				iconR: 58,
-				iconFontSize: 52,
-				panelX: 120,
-				panelY: 280,
-				panelWidth: 1240,
-				panelHeight: 560,
-				panelRadius: 110,
+				iconCy: 360,
+				iconR: 42,
+				iconFontSize: 30,
+				panelX: 124,
+				panelY: 120,
+				panelWidth: 1232,
+				panelHeight: 876,
+				panelRadius: 92,
 				panelStrokeWidth: 7,
+				ornamentYRatio: 0.55,
+				ornamentInsetRatio: 0.18,
+				ornamentStyle: "diamond",
 			};
 		default:
 			return {
@@ -1252,6 +1761,25 @@ function escapeForSvg(text = "") {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;")
 		.replace(/'/g, "&#39;");
+}
+
+function buildPodListDiamondOrnamentSvg({
+	x = 0,
+	y = 0,
+	size = 18,
+	fill = "rgba(120, 80, 40, 0.42)",
+}) {
+	const safeX = Math.round(Number(x) || 0);
+	const safeY = Math.round(Number(y) || 0);
+	const safeSize = Math.max(8, Math.round(Number(size) || 18));
+	const half = safeSize / 2;
+	const dotOffset = Math.round(safeSize * 0.86);
+	const dotRadius = Math.max(2, Math.round(safeSize * 0.18));
+	return `<g fill="${fill}">
+		<rect x="${safeX - half}" y="${safeY - half}" width="${safeSize}" height="${safeSize}" rx="${Math.max(1, Math.round(safeSize * 0.14))}" ry="${Math.max(1, Math.round(safeSize * 0.14))}" transform="rotate(45 ${safeX} ${safeY})"/>
+		<circle cx="${safeX - dotOffset}" cy="${safeY}" r="${dotRadius}"/>
+		<circle cx="${safeX + dotOffset}" cy="${safeY}" r="${dotRadius}"/>
+	</g>`;
 }
 
 function splitPodListSvgLines(message, maxCharsPerLine = 22, maxLines = 3) {
@@ -1318,7 +1846,9 @@ function splitPodListSvgLines(message, maxCharsPerLine = 22, maxLines = 3) {
 }
 
 function buildPodListDesignSvgDataUri({ message, preset, product }) {
-	const safeIcon = escapeForSvg(preset.accentIcon || "\u{1F381}");
+	const safeIcon = escapeForSvg(
+		preset.svgAccentIcon || preset.accentIcon || "\u2726",
+	);
 	const safeTextColor = escapeForSvg(preset.textColor || "#1f2937");
 	const safeBackgroundColor = escapeForSvg(preset.backgroundColor || "#fff7ed");
 	const safePanelGradientStart = escapeForSvg(
@@ -1351,6 +1881,11 @@ function buildPodListDesignSvgDataUri({ message, preset, product }) {
 		preset.ornamentColor || "rgba(120, 80, 40, 0.42)",
 	);
 	const safeFontFamily = escapeForSvg(preset.fontFamily || "Georgia, serif");
+	const safeIconFontFamily = escapeForSvg(
+		preset.iconFontFamily ||
+			preset.fontFamily ||
+			"'Segoe UI Symbol', 'Apple Symbols', 'Arial Unicode MS', serif",
+	);
 	const safeFontWeight = escapeForSvg(String(preset.fontWeight || "700"));
 	const safeFontStyle = escapeForSvg(preset.fontStyle || "normal");
 	const layout = getPodListDesignLayout(product);
@@ -1455,11 +1990,43 @@ function buildPodListDesignSvgDataUri({ message, preset, product }) {
 				lineCompressionScale,
 		),
 	);
-	const ornamentY =
-		panelY + panelHeight - Math.max(24, Math.round(panelHeight * 0.18));
-	const ornamentLeftX = panelX + Math.max(38, Math.round(panelWidth * 0.05));
-	const ornamentRightX =
-		panelX + panelWidth - Math.max(38, Math.round(panelWidth * 0.05));
+	const ornamentInsetRatio = Number.isFinite(Number(layout.ornamentInsetRatio))
+		? Math.max(0.02, Math.min(0.24, Number(layout.ornamentInsetRatio)))
+		: null;
+	const ornamentInsetPx = Number.isFinite(Number(layout.ornamentInsetPx))
+		? Math.max(24, Number(layout.ornamentInsetPx))
+		: null;
+	const ornamentInset =
+		ornamentInsetPx ||
+		(ornamentInsetRatio !== null
+			? Math.max(34, Math.round(panelWidth * ornamentInsetRatio))
+			: Math.max(38, Math.round(panelWidth * 0.05)));
+	const ornamentY = Number.isFinite(Number(layout.ornamentYRatio))
+		? panelY +
+			Math.round(
+				panelHeight *
+					Math.max(0.16, Math.min(0.84, Number(layout.ornamentYRatio))),
+			)
+		: panelY + panelHeight - Math.max(24, Math.round(panelHeight * 0.18));
+	const ornamentLeftX = panelX + ornamentInset;
+	const ornamentRightX = panelX + panelWidth - ornamentInset;
+	const ornamentSize = Math.max(14, Math.round(textFontSize * 0.16));
+	const ornamentMarkup =
+		layout.ornamentStyle === "diamond"
+			? `${buildPodListDiamondOrnamentSvg({
+					x: ornamentLeftX,
+					y: ornamentY,
+					size: ornamentSize,
+					fill: safeOrnamentColor,
+				})}
+				${buildPodListDiamondOrnamentSvg({
+					x: ornamentRightX,
+					y: ornamentY,
+					size: ornamentSize,
+					fill: safeOrnamentColor,
+				})}`
+			: `<text x="${ornamentLeftX}" y="${ornamentY}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${Math.max(34, Math.round(textFontSize * 0.34))}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentLeft}</text>
+	<text x="${ornamentRightX}" y="${ornamentY}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${Math.max(34, Math.round(textFontSize * 0.34))}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentRight}</text>`;
 	const textTspans = textLines
 		.map((line, index) => {
 			const dy = index === 0 ? 0 : lineHeight;
@@ -1488,13 +2055,361 @@ function buildPodListDesignSvgDataUri({ message, preset, product }) {
 	<rect x="0" y="0" width="${canvasWidth}" height="${canvasHeight}" fill="transparent"/>
 	<rect x="${panelX}" y="${panelY}" width="${panelWidth}" height="${panelHeight}" rx="${panelRadius}" ry="${panelRadius}" fill="url(#panelGrad)" stroke="${safePanelBorderColor}" stroke-width="${panelStrokeWidth}" filter="url(#softShadow)"/>
 	<circle cx="${iconCx}" cy="${iconCy}" r="${iconR}" fill="url(#iconGrad)" stroke="${safeBorderColor}" stroke-width="${Math.max(6, Math.round(panelStrokeWidth * 0.9))}" filter="url(#softShadow)"/>
-	<text x="${iconCx}" y="${iconCy}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${iconFontSize}px; font-weight: 700; fill: ${safeAccentTextColor};">${safeIcon}</text>
-	<text x="${ornamentLeftX}" y="${ornamentY}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${Math.max(34, Math.round(textFontSize * 0.34))}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentLeft}</text>
-	<text x="${ornamentRightX}" y="${ornamentY}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${Math.max(34, Math.round(textFontSize * 0.34))}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentRight}</text>
+	<text x="${iconCx}" y="${iconCy}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeIconFontFamily}; font-size: ${iconFontSize}px; font-weight: 700; fill: ${safeAccentTextColor};">${safeIcon}</text>
+	${ornamentMarkup}
 	<text x="${textX}" y="${startY}" text-anchor="middle" filter="url(#titleShadow)" style="font-family: ${safeFontFamily}; font-size: ${textFontSize}px; font-weight: ${safeFontWeight}; font-style: ${safeFontStyle}; fill: ${safeTextColor}; letter-spacing: -0.02em;">${textTspans}</text>
 </svg>`;
 
 	return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
+async function buildFrontendSyncedPodListDesignAsset({
+	message,
+	preset,
+	product,
+	sourcePlaceholder = null,
+	sourcePosition = "front",
+}) {
+	const kind = getPodListProductKind(product);
+	if (!shouldUseFrontendSyncedPodListAsset(product)) {
+		return {
+			dataUri: buildPodListDesignSvgDataUri({ message, preset, product }),
+			placementAsset: null,
+		};
+	}
+
+	const surface = getPodListEditorSurfaceConfig(product, sourcePosition);
+	const widthRatio = Math.max(1, Number(surface?.widthRatio) || 1);
+	const heightRatio = Math.max(1, Number(surface?.heightRatio) || 1);
+	const canvasWidth = kind === "candle" ? 360 : 420;
+	const canvasHeight = Math.max(
+		kind === "candle" ? 396 : 420,
+		Math.round((canvasWidth * heightRatio) / widthRatio),
+	);
+	const safeBounds = resolvePodListSafeBounds(
+		canvasWidth,
+		canvasHeight,
+		Number(surface?.clampInset) || 0,
+	);
+	const safeStartX = safeBounds.minX;
+	const safeStartY = safeBounds.minY;
+	const safeWidth = Math.max(120, safeBounds.maxX - safeBounds.minX);
+	const safeHeight = Math.max(90, safeBounds.maxY - safeBounds.minY);
+	const geometry = resolvePodListAutoDesignGeometry(product, preset);
+	const isPillowDesign = kind === "pillow";
+	const isMagnetDesign = kind === "magnet";
+	const isCandleDesign = kind === "candle";
+	const widthCapRatio = isPillowDesign ? 0.95 : isMagnetDesign ? 0.95 : 0.98;
+	const minMessageWidth = isPillowDesign ? 270 : isMagnetDesign ? 258 : 304;
+	const minMessageHeight = isPillowDesign ? 170 : isMagnetDesign ? 176 : 282;
+	const minIconSize = isPillowDesign ? 34 : isMagnetDesign ? 40 : 28;
+
+	let messageWidth = Math.min(
+		Math.round(safeWidth * widthCapRatio),
+		Math.max(
+			minMessageWidth,
+			Math.round(safeWidth * geometry.messageWidthRatio),
+		),
+	);
+	let messageHeight = Math.min(
+		geometry.maxMessageHeight || 86,
+		Math.max(
+			minMessageHeight,
+			Math.round(safeHeight * geometry.messageHeightRatio),
+		),
+	);
+	let iconSize = Math.min(
+		geometry.maxIconSize || 44,
+		Math.max(
+			minIconSize,
+			Math.round(safeWidth * geometry.iconSizeRatio),
+		),
+	);
+	const rawMessageRect = {
+		x: safeStartX + Math.round((safeWidth - messageWidth) / 2),
+		y: 0,
+		width: messageWidth,
+		height: messageHeight,
+	};
+	const rawIconRect = {
+		x: safeStartX + Math.round((safeWidth - iconSize) / 2),
+		y: 0,
+		width: iconSize,
+		height: iconSize,
+	};
+	const minMessageY = isPillowDesign
+		? safeStartY
+		: safeStartY + Math.max(0, iconSize - geometry.iconOverlapPx);
+	const maxMessageY = safeStartY + safeHeight - messageHeight;
+	rawMessageRect.y = Math.max(
+		minMessageY,
+		Math.min(
+			Math.max(minMessageY, maxMessageY),
+			safeStartY + Math.round((safeHeight - messageHeight) / 2),
+		),
+	);
+	rawIconRect.y = Math.max(
+		safeStartY,
+		Math.min(
+			safeStartY + safeHeight - iconSize,
+			isCandleDesign
+				? rawMessageRect.y + Math.round(messageHeight * 0.11)
+				: isPillowDesign
+					? rawMessageRect.y + Math.round(messageHeight * 0.155)
+				: rawMessageRect.y + Math.round(messageHeight * 0.195),
+		),
+	);
+	const messageRect = clampPodListElementRectWithinBounds(rawMessageRect, safeBounds);
+	const iconRect = clampPodListElementRectWithinBounds(rawIconRect, safeBounds);
+	const textFontFactor = isPillowDesign ? 0.188 : isMagnetDesign ? 0.305 : 0.235;
+	const textFontMin = isPillowDesign ? 20 : isMagnetDesign ? 20 : 20;
+	const textFontMax = isPillowDesign ? 40 : isMagnetDesign ? 52 : 52;
+	const iconFontFactor = isPillowDesign ? 0.64 : isMagnetDesign ? 0.72 : 0.7;
+	const iconFontMin = isPillowDesign ? 20 : isMagnetDesign ? 20 : 18;
+	const iconFontMax = isPillowDesign ? 32 : isMagnetDesign ? 40 : 34;
+	let textFontSize = Math.max(
+		textFontMin,
+		Math.min(
+			textFontMax,
+			Math.round(messageRect.height * textFontFactor),
+		),
+	);
+	const iconFontSize = Math.max(
+		iconFontMin,
+		Math.min(iconFontMax, Math.round(iconRect.height * iconFontFactor)),
+	);
+	const messageGradientStart =
+		preset.messageGradientStart || preset.backgroundColor || "#fff7ed";
+	const messageGradientEnd =
+		preset.messageGradientEnd || preset.backgroundColor || "#fff7ed";
+	const iconGradientStart =
+		preset.accentBackgroundColor || preset.messageGradientStart || "#ffffff";
+	const iconGradientEnd =
+		preset.accentBackgroundColor2 ||
+		preset.accentBackgroundColor ||
+		"#f3f4f6";
+	const borderRadius = isCandleDesign ? 30 : isPillowDesign ? 26 : 22;
+	const paddingX = Math.max(
+		isPillowDesign ? 10 : isMagnetDesign ? 8 : 10,
+		Math.min(
+			isPillowDesign ? 16 : isMagnetDesign ? 14 : 18,
+			Math.round(
+				messageRect.width *
+					(isPillowDesign ? 0.03 : isMagnetDesign ? 0.028 : 0.034),
+			),
+		),
+	);
+	const paddingY = Math.max(
+		isPillowDesign ? 8 : isMagnetDesign ? 6 : 8,
+		Math.min(
+			isPillowDesign ? 12 : isMagnetDesign ? 12 : 14,
+			Math.round(
+				messageRect.height *
+					(isPillowDesign ? 0.05 : isMagnetDesign ? 0.044 : 0.05),
+			),
+		),
+	);
+	const lineHeightFactor = isCandleDesign ? 0.96 : 1.01;
+	const messageMaxLines = 3;
+	let lines = wrapPodListMessageToWidth({
+		message,
+		maxWidthPx: Math.max(120, messageRect.width - paddingX * 2 - 8),
+		fontSizePx: textFontSize,
+		fontFamily: preset.fontFamily,
+		maxLines: messageMaxLines,
+	});
+	let attempts = 0;
+	while (
+		attempts < 10 &&
+		(lines.length > messageMaxLines ||
+			lines.length * textFontSize * lineHeightFactor >
+				messageRect.height - paddingY * 2)
+	) {
+		textFontSize = Math.max(textFontMin, textFontSize - 2);
+		lines = wrapPodListMessageToWidth({
+			message,
+			maxWidthPx: Math.max(120, messageRect.width - paddingX * 2 - 8),
+			fontSizePx: textFontSize,
+			fontFamily: preset.fontFamily,
+			maxLines: messageMaxLines,
+		});
+		attempts += 1;
+		if (textFontSize === textFontMin) break;
+	}
+	if (isCandleDesign && lines.length > 2) {
+		textFontSize = Math.max(textFontMin, textFontSize - 4);
+		lines = wrapPodListMessageToWidth({
+			message,
+			maxWidthPx: Math.max(120, messageRect.width - paddingX * 2 - 8),
+			fontSizePx: textFontSize,
+			fontFamily: preset.fontFamily,
+			maxLines: messageMaxLines,
+		});
+	}
+	const lineHeightPx = Math.round(textFontSize * lineHeightFactor);
+	const textCenterX = messageRect.x + messageRect.width / 2;
+	const textCenterY = messageRect.y + messageRect.height * (isCandleDesign ? 0.57 : 0.5);
+	const textStartY =
+		textCenterY - ((lines.length - 1) * lineHeightPx) / 2 + textFontSize * 0.08;
+	const ornamentOffset = Math.min(
+		messageRect.width * 0.34,
+		Math.max(textFontSize * 1.6, 88),
+	);
+	const ornamentY = textCenterY + textFontSize * 0.06;
+	const ornamentSize = Math.max(18, Math.round(textFontSize * 0.42));
+	const emojiDataUri = await getPodListEmojiAssetDataUri(
+		preset.accentIcon || "\u2726",
+	);
+	const emojiSize = Math.max(18, Math.round(iconRect.width * 0.5));
+	const emojiX = iconRect.x + (iconRect.width - emojiSize) / 2;
+	const emojiY = iconRect.y + (iconRect.height - emojiSize) / 2;
+	const safeTextColor = escapeForSvg(preset.textColor || "#1f2937");
+	const safeTextShadowColor = escapeForSvg(
+		preset.textShadowColor || "rgba(15, 23, 42, 0.22)",
+	);
+	const safePanelGradientStart = escapeForSvg(messageGradientStart);
+	const safePanelGradientEnd = escapeForSvg(messageGradientEnd);
+	const safePanelBorderColor = escapeForSvg(
+		preset.messageBorderColor ||
+			preset.accentBorderColor ||
+			"rgba(31, 41, 55, 0.2)",
+	);
+	const safeAccentTextColor = escapeForSvg(
+		preset.accentTextColor || preset.textColor || "#1f2937",
+	);
+	const safeAccentBackgroundColor = escapeForSvg(iconGradientStart);
+	const safeAccentBackgroundColor2 = escapeForSvg(iconGradientEnd);
+	const safeBorderColor = escapeForSvg(
+		preset.accentBorderColor || "rgba(31, 41, 55, 0.18)",
+	);
+	const safeOrnamentColor = escapeForSvg(
+		preset.ornamentColor || "rgba(120, 80, 40, 0.42)",
+	);
+	const safeOrnamentLeft = escapeForSvg(preset.ornamentLeft || "\u2726");
+	const safeOrnamentRight = escapeForSvg(preset.ornamentRight || "\u2726");
+	const safeFontFamily = escapeForSvg(preset.fontFamily || "Georgia, serif");
+	const safeFontWeight = escapeForSvg(String(preset.fontWeight || "700"));
+	const safeFontStyle = escapeForSvg(preset.fontStyle || "normal");
+	const normalizedBounds = getPodListNormalizedContentBounds(
+		[messageRect, iconRect],
+		canvasWidth,
+		canvasHeight,
+	);
+	const cropBounds =
+		normalizedBounds?.pixelBounds || {
+			x: 0,
+			y: 0,
+			width: canvasWidth,
+			height: canvasHeight,
+		};
+	const placementMode = kind === "pillow" ? "projected" : "direct-wrap";
+	const placementAsset = buildPodListPlacementAssetFromBounds({
+		normalizedBounds,
+		canvasWidth,
+		canvasHeight,
+		placementMode,
+		targetAspectRatio:
+			getPodListPlaceholderAspectRatio(sourcePlaceholder) ||
+			canvasWidth / canvasHeight,
+		projection: getPodListCaptureProjection(product, sourcePosition),
+	});
+	const ornamentMarkup =
+		safeOrnamentLeft || safeOrnamentRight
+			? `<text x="${Math.round(textCenterX - ornamentOffset)}" y="${Math.round(
+					ornamentY,
+				)}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${ornamentSize}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentLeft}</text>
+	<text x="${Math.round(textCenterX + ornamentOffset)}" y="${Math.round(
+					ornamentY,
+				)}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${ornamentSize}px; font-weight: 700; fill: ${safeOrnamentColor};">${safeOrnamentRight}</text>`
+			: "";
+	const textTspans = lines
+		.map((line, index) => {
+			const safeLine = escapeForSvg(line);
+			const dy = index === 0 ? 0 : lineHeightPx;
+			return `<tspan x="${Math.round(textCenterX)}" dy="${dy}">${safeLine}</tspan>`;
+		})
+		.join("");
+	const iconMarkup = emojiDataUri
+		? `<image href="${emojiDataUri}" x="${Math.round(emojiX)}" y="${Math.round(
+				emojiY,
+			)}" width="${emojiSize}" height="${emojiSize}" preserveAspectRatio="xMidYMid meet"/>`
+		: `<text x="${Math.round(iconRect.x + iconRect.width / 2)}" y="${Math.round(
+				iconRect.y + iconRect.height / 2,
+			)}" text-anchor="middle" dominant-baseline="middle" style="font-family: ${safeFontFamily}; font-size: ${iconFontSize}px; font-weight: 600; fill: ${safeAccentTextColor};">${escapeForSvg(
+				preset.accentIcon || "\u2726",
+			)}</text>`;
+	const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${cropBounds.width}" height="${cropBounds.height}" viewBox="${cropBounds.x} ${cropBounds.y} ${cropBounds.width} ${cropBounds.height}">
+	<defs>
+		<linearGradient id="panelGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+			<stop offset="0%" stop-color="${safePanelGradientStart}"/>
+			<stop offset="100%" stop-color="${safePanelGradientEnd}"/>
+		</linearGradient>
+		<linearGradient id="iconGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+			<stop offset="0%" stop-color="${safeAccentBackgroundColor}"/>
+			<stop offset="100%" stop-color="${safeAccentBackgroundColor2}"/>
+		</linearGradient>
+		<filter id="softShadow" x="-25%" y="-25%" width="150%" height="170%">
+			<feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.18"/>
+		</filter>
+		<filter id="titleShadow" x="-25%" y="-25%" width="150%" height="150%">
+			<feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="${safeTextShadowColor}" flood-opacity="0.5"/>
+		</filter>
+	</defs>
+	<rect x="${Math.round(messageRect.x)}" y="${Math.round(messageRect.y)}" width="${Math.round(
+		messageRect.width,
+	)}" height="${Math.round(messageRect.height)}" rx="${borderRadius}" ry="${borderRadius}" fill="url(#panelGrad)" stroke="${safePanelBorderColor}" stroke-width="${Math.max(
+		1,
+		Math.round(Number(preset.messageBorderWidth) || 2),
+	)}" filter="url(#softShadow)"/>
+	<circle cx="${Math.round(iconRect.x + iconRect.width / 2)}" cy="${Math.round(
+		iconRect.y + iconRect.height / 2,
+	)}" r="${Math.round(iconRect.width / 2)}" fill="url(#iconGrad)" stroke="${safeBorderColor}" stroke-width="${Math.max(
+		1,
+		Math.round(Number(preset.accentBorderWidth) || 2),
+	)}" filter="url(#softShadow)"/>
+	${iconMarkup}
+	${ornamentMarkup}
+	<text x="${Math.round(textCenterX)}" y="${Math.round(textStartY)}" text-anchor="middle" filter="url(#titleShadow)" style="font-family: ${safeFontFamily}; font-size: ${textFontSize}px; font-weight: ${safeFontWeight}; font-style: ${safeFontStyle}; fill: ${safeTextColor}; letter-spacing: ${escapeForSvg(
+		preset.letterSpacing || "0.08px",
+	)};">${textTspans}</text>
+</svg>`;
+
+	return {
+		dataUri: `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`,
+		placementAsset,
+		debug: {
+			kind,
+			canvasWidth,
+			canvasHeight,
+			messageRect,
+			iconRect,
+			cropBounds,
+			normalizedBounds,
+		},
+	};
+}
+
+async function buildPodListDesignAsset({
+	message,
+	preset,
+	product,
+	sourcePlaceholder = null,
+	sourcePosition = "front",
+}) {
+	if (shouldUseFrontendSyncedPodListAsset(product)) {
+		return buildFrontendSyncedPodListDesignAsset({
+			message,
+			preset,
+			product,
+			sourcePlaceholder,
+			sourcePosition,
+		});
+	}
+	return {
+		dataUri: buildPodListDesignSvgDataUri({ message, preset, product }),
+		placementAsset: null,
+	};
 }
 
 function makePodListPreviewCacheKey({ productId, variantId, occasion, name }) {
@@ -1801,19 +2716,11 @@ function buildPodVisualGroupKey(
 	product = {},
 	{ color = "", size = "", scent = "" } = {},
 ) {
-	const productKind = getPodListProductKind(product);
 	const colorToken = normalizePodSyncToken(color);
-	const sizeToken = normalizePodSyncToken(size);
-	const scentToken = normalizePodSyncToken(scent);
 
 	if (colorToken) {
-		if (["mug", "magnet"].includes(productKind) && sizeToken) {
-			return `color:${colorToken}|size:${sizeToken}`;
-		}
 		return `color:${colorToken}`;
 	}
-	if (scentToken) return `scent:${scentToken}`;
-	if (sizeToken) return `size:${sizeToken}`;
 	return "default";
 }
 
@@ -2502,11 +3409,33 @@ async function generatePodListPreview({
 		throw new Error("Could not resolve a valid variant ID for POD preview.");
 	}
 
-	const designSvgDataUri = buildPodListDesignSvgDataUri({
+	const printAreas = Array.isArray(product?.printifyProductDetails?.print_areas)
+		? product.printifyProductDetails.print_areas
+		: [];
+	const variantPrintArea =
+		printAreas.find(
+			(area) =>
+				Array.isArray(area?.variant_ids) &&
+				area.variant_ids.some((id) => String(id) === String(variantId)),
+		) || printAreas[0];
+	const sourcePlaceholders = Array.isArray(variantPrintArea?.placeholders)
+		? variantPrintArea.placeholders
+		: [];
+	const sourcePlaceholder =
+		pickBestPodListPlaceholder(sourcePlaceholders, product) ||
+		sourcePlaceholders[0];
+	const sourcePosition = String(sourcePlaceholder?.position || "front");
+	const designAsset = await buildPodListDesignAsset({
 		message,
 		preset,
 		product,
+		sourcePlaceholder,
+		sourcePosition,
 	});
+	const designSvgDataUri = designAsset?.dataUri;
+	if (!designSvgDataUri) {
+		throw new Error("Failed building the POD list preview design asset.");
+	}
 	const designUpload = await cloudinary.uploader.upload(designSvgDataUri, {
 		folder: "serene_janat/pod_list_preview_designs",
 		resource_type: "image",
@@ -2597,25 +3526,11 @@ async function generatePodListPreview({
 		throw new Error("Printify image upload did not return an ID.");
 	}
 
-	const printAreas = Array.isArray(product?.printifyProductDetails?.print_areas)
-		? product.printifyProductDetails.print_areas
-		: [];
-	const variantPrintArea =
-		printAreas.find(
-			(area) =>
-				Array.isArray(area?.variant_ids) &&
-				area.variant_ids.some((id) => String(id) === String(variantId)),
-		) || printAreas[0];
-	const sourcePlaceholders = Array.isArray(variantPrintArea?.placeholders)
-		? variantPrintArea.placeholders
-		: [];
-	const sourcePlaceholder =
-		pickBestPodListPlaceholder(sourcePlaceholders, product) ||
-		sourcePlaceholders[0];
-	const sourcePosition = String(sourcePlaceholder?.position || "front");
-	const sourceImage = Array.isArray(sourcePlaceholder?.images)
-		? sourcePlaceholder.images[0]
-		: null;
+	const sourceImage = designAsset?.placementAsset?.forceSourcePlacement
+		? designAsset.placementAsset.placementParams
+		: Array.isArray(sourcePlaceholder?.images)
+			? sourcePlaceholder.images[0]
+			: null;
 	const placementDefaults = getPodListPlacementDefaults(
 		product,
 		sourcePosition,
@@ -2623,6 +3538,9 @@ async function generatePodListPreview({
 	const placementResult = resolvePodListPlacementFromSource({
 		sourceImage,
 		placementDefaults,
+		forceSourcePlacement: Boolean(
+			designAsset?.placementAsset?.forceSourcePlacement,
+		),
 	});
 	const {
 		finalX,
@@ -2635,17 +3553,22 @@ async function generatePodListPreview({
 		sourcePlacementIsTooLarge,
 		sourcePlacement,
 	} = placementResult;
-	const previewScaleBoost = getPodPreviewPlacementBoost(
-		product,
-		sourcePosition,
-	);
-	const boostedScale = Math.min(
-		2.6,
-		Math.max(
-			0.28,
-			Number(finalScale || placementDefaults.scale || 0.88) * previewScaleBoost,
-		),
-	);
+	const previewScaleBoost = designAsset?.placementAsset?.forceSourcePlacement
+		? 1
+		: getPodPreviewPlacementBoost(product, sourcePosition);
+	const boostedScale = Boolean(designAsset?.placementAsset?.forceSourcePlacement)
+		? Math.min(
+				2.6,
+				Math.max(0.18, Number(finalScale || placementDefaults.scale || 0.88)),
+			)
+		: Math.min(
+				2.6,
+				Math.max(
+					0.28,
+					Number(finalScale || placementDefaults.scale || 0.88) *
+						previewScaleBoost,
+				),
+			);
 
 	console.log(`[${debugId}] POD list placement resolved`, {
 		productId: String(product?._id || ""),
@@ -2661,6 +3584,10 @@ async function generatePodListPreview({
 		sourcePlacementIsTooLarge,
 		sourcePlacement,
 		defaultPlacement: placementDefaults,
+		designAssetPlacement: designAsset?.placementAsset?.placementParams || null,
+		usedFrontendSyncedAsset: Boolean(
+			designAsset?.placementAsset?.forceSourcePlacement,
+		),
 		previewScaleBoost,
 		finalPlacement: {
 			x: finalX,
