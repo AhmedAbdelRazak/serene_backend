@@ -1007,15 +1007,22 @@ exports.getUnseenMessagesCountForCaseByClient = async (req, res) => {
 		const { id } = req.params;
 
 		if (!mongoose.Types.ObjectId.isValid(id)) {
-			return res.status(400).json({ error: "Invalid support case ID" });
+			return res.status(200).json({
+				count: 0,
+				exists: false,
+				invalidId: true,
+			});
 		}
 
 		const supportCase = await SupportCase.findById(id)
-			.select("conversation.seenByClient")
+			.select("conversation.seenByClient caseStatus")
 			.lean();
 
 		if (!supportCase) {
-			return res.status(404).json({ error: "Support case not found" });
+			return res.status(200).json({
+				count: 0,
+				exists: false,
+			});
 		}
 
 		const count = Array.isArray(supportCase.conversation)
@@ -1023,7 +1030,11 @@ exports.getUnseenMessagesCountForCaseByClient = async (req, res) => {
 					.length
 			: 0;
 
-		return res.status(200).json({ count });
+		return res.status(200).json({
+			count,
+			exists: true,
+			caseStatus: supportCase.caseStatus || "open",
+		});
 	} catch (error) {
 		console.error(
 			"Error fetching unseen messages count for customer case:",

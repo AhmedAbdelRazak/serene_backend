@@ -34,6 +34,11 @@ const MAX_TYPING_RETRIES = 2;
 const INTER_SEGMENT_PAUSE_MS = 450;
 const FIRST_REPLY_MIN_DELAY_MS = 5000;
 const FIRST_REPLY_MAX_DELAY_MS = 10000;
+const IDLE_FOLLOW_UP_MIN_DELAY_MS = 45000;
+const IDLE_FOLLOW_UP_MAX_DELAY_MS = 60000;
+const IDLE_FOLLOW_UP_RETRY_DELAY_MS = 8000;
+const MAX_IDLE_FOLLOW_UP_TYPING_RETRIES = 2;
+const NO_FOLLOW_UP_MARKER = "[[no_follow_up]]";
 const HAS_SUPPORT_AI_API_KEY = Boolean(
 	`${process.env.CHATGPT_API_TOKEN || ""}`.trim(),
 );
@@ -47,6 +52,7 @@ if (!HAS_SUPPORT_AI_API_KEY) {
 
 const lastTypingAt = new Map();
 const typingRetryState = new Map();
+const idleFollowUpState = new Map();
 
 function ensureTypingHook() {
 	if (global.__supportChatTypingHookInstalled) return;
@@ -221,6 +227,20 @@ function extractReplyUiDirectives(value = "") {
 	};
 }
 
+function extractIdleFollowUpDecision(value = "") {
+	const pattern = new RegExp(
+		`\\s*${escapeRegex(NO_FOLLOW_UP_MARKER)}\\s*`,
+		"gi",
+	);
+	const rawValue = `${value || ""}`;
+	const replyText = sanitizeReplyText(rawValue.replace(pattern, " "));
+
+	return {
+		shouldSkipFollowUp: pattern.test(rawValue) && !replyText,
+		replyText,
+	};
+}
+
 function hasRecentTyping(caseId, thresholdMs = TYPING_IDLE_MS) {
 	const lastSeen = lastTypingAt.get(String(caseId)) || 0;
 	return Date.now() - lastSeen < thresholdMs;
@@ -250,6 +270,17 @@ function clearTypingRetry(caseId = "") {
 		clearTimeout(existing.timer);
 	}
 	typingRetryState.delete(normalizedCaseId);
+}
+
+function clearIdleFollowUp(caseId = "") {
+	const normalizedCaseId = normalizeString(caseId);
+	if (!normalizedCaseId) return;
+
+	const existing = idleFollowUpState.get(normalizedCaseId);
+	if (existing?.timer) {
+		clearTimeout(existing.timer);
+	}
+	idleFollowUpState.delete(normalizedCaseId);
 }
 
 function stableHash(value = "") {
@@ -454,6 +485,203 @@ function scheduleTypingRetry({
 		delayMs: TYPING_RETRY_DELAY_MS,
 		latestTurnIndex: latestClientTurn.index,
 		latestTurnPreview: previewText(latestClientTurn?.message?.message || ""),
+	});
+
+	return true;
+}
+
+function scheduleIdleFollowUp({
+	caseId,
+	referenceSupportTurn,
+	originTriggerType = "client_message",
+	agentName = "",
+	retryAttempt = 0,
+	delayMs = randomBetween(
+		IDLE_FOLLOW_UP_MIN_DELAY_MS,
+		IDLE_FOLLOW_UP_MAX_DELAY_MS,
+	),
+}) {
+	const normalizedCaseId = normalizeString(caseId);
+	if (!normalizedCaseId || !referenceSupportTurn) {
+		logSupportAi(
+			"idle-follow-up-not-scheduled",
+			{
+				caseId: normalizedCaseId || caseId || "",
+				originTriggerType,
+				reason: "missing_case_or_support_turn",
+			},
+			"warn",
+		);
+		return false;
+	}
+
+	const turnKey = getMessageIdentity(
+		referenceSupportTurn.message,
+		referenceSupportTurn.index,
+	);
+	if (!turnKey) {
+		logSupportAi(
+			"idle-follow-up-not-scheduled",
+			{
+				caseId: normalizedCaseId,
+				originTriggerType,
+				reason: "missing_turn_key",
+			},
+			"warn",
+		);
+		return false;
+	}
+
+	clearIdleFollowUp(normalizedCaseId);
+
+	const timer = setTimeout(async () => {
+		const current = idleFollowUpState.get(normalizedCaseId);
+		if (
+			!current ||
+			current.turnKey !== turnKey ||
+			current.retryAttempt !== retryAttempt
+		) {
+			logSupportAi("idle-follow-up-stale", {
+				caseId: normalizedCaseId,
+				originTriggerType,
+				retryAttempt,
+			});
+			return;
+		}
+
+		try {
+			const [flags, caseDoc] = await Promise.all([
+				WebsiteBasicSetup.findOne({}).lean(),
+				SupportCase.findById(normalizedCaseId).lean(),
+			]);
+
+			if (!caseDoc) {
+				clearIdleFollowUp(normalizedCaseId);
+				logSupportAi("idle-follow-up-skipped", {
+					caseId: normalizedCaseId,
+					originTriggerType,
+					reason: "case_not_found",
+				});
+				return;
+			}
+
+			const aiBlockReason = getAiBlockReason(flags, caseDoc);
+			if (aiBlockReason) {
+				clearIdleFollowUp(normalizedCaseId);
+				logSupportAi("idle-follow-up-skipped", {
+					caseId: normalizedCaseId,
+					originTriggerType,
+					reason: aiBlockReason,
+					caseState: summarizeCaseForLogs(caseDoc, flags),
+				});
+				return;
+			}
+
+			const currentLatestSupportTurn = getLatestSupportTurn(caseDoc);
+			if (
+				!currentLatestSupportTurn ||
+				!isSameTurn(currentLatestSupportTurn, referenceSupportTurn)
+			) {
+				clearIdleFollowUp(normalizedCaseId);
+				logSupportAi("idle-follow-up-skipped", {
+					caseId: normalizedCaseId,
+					originTriggerType,
+					reason: "support_turn_changed",
+					referenceTurnIndex: referenceSupportTurn.index,
+					currentTurnIndex: currentLatestSupportTurn?.index ?? null,
+				});
+				return;
+			}
+
+			if (hasClientReplyAfter(caseDoc, referenceSupportTurn.index)) {
+				clearIdleFollowUp(normalizedCaseId);
+				logSupportAi("idle-follow-up-skipped", {
+					caseId: normalizedCaseId,
+					originTriggerType,
+					reason: "client_replied",
+					referenceTurnIndex: referenceSupportTurn.index,
+				});
+				return;
+			}
+
+			if (hasRecentTyping(normalizedCaseId, TYPING_ABORT_MS)) {
+				if (retryAttempt >= MAX_IDLE_FOLLOW_UP_TYPING_RETRIES) {
+					clearIdleFollowUp(normalizedCaseId);
+					logSupportAi("idle-follow-up-skipped", {
+						caseId: normalizedCaseId,
+						originTriggerType,
+						reason: "client_typing_retry_exhausted",
+						retryAttempt,
+					});
+					return;
+				}
+
+				logSupportAi("idle-follow-up-delayed", {
+					caseId: normalizedCaseId,
+					originTriggerType,
+					reason: "client_typing",
+					retryAttempt: retryAttempt + 1,
+					delayMs: IDLE_FOLLOW_UP_RETRY_DELAY_MS,
+				});
+
+				scheduleIdleFollowUp({
+					caseId: normalizedCaseId,
+					referenceSupportTurn,
+					originTriggerType,
+					agentName,
+					retryAttempt: retryAttempt + 1,
+					delayMs: IDLE_FOLLOW_UP_RETRY_DELAY_MS,
+				});
+				return;
+			}
+
+			clearIdleFollowUp(normalizedCaseId);
+			logSupportAi("idle-follow-up-fired", {
+				caseId: normalizedCaseId,
+				originTriggerType,
+				agentName,
+				referenceTurnIndex: referenceSupportTurn.index,
+				retryAttempt,
+			});
+
+			await respondToSupportCase({
+				caseId: normalizedCaseId,
+				triggerType: "idle_follow_up",
+			});
+		} catch (error) {
+			clearIdleFollowUp(normalizedCaseId);
+			logSupportAi(
+				"idle-follow-up-failed",
+				{
+					caseId: normalizedCaseId,
+					originTriggerType,
+					agentName,
+					retryAttempt,
+					...summarizeSupportAiError(error),
+				},
+				"error",
+			);
+		}
+	}, delayMs);
+
+	idleFollowUpState.set(normalizedCaseId, {
+		turnKey,
+		referenceTurnIndex: referenceSupportTurn.index,
+		retryAttempt,
+		timer,
+	});
+
+	logSupportAi("idle-follow-up-scheduled", {
+		caseId: normalizedCaseId,
+		originTriggerType,
+		agentName,
+		referenceTurnIndex: referenceSupportTurn.index,
+		delayMs,
+		retryAttempt,
+		messagePreview: previewText(
+			referenceSupportTurn?.message?.message || "",
+			160,
+		),
 	});
 
 	return true;
@@ -922,6 +1150,9 @@ async function disableAiForCase(caseId = "") {
 	const normalizedCaseId = normalizeString(caseId);
 	if (!normalizedCaseId) return null;
 
+	clearIdleFollowUp(normalizedCaseId);
+	clearTypingRetry(normalizedCaseId);
+
 	const updatedCase = await SupportCase.findByIdAndUpdate(
 		normalizedCaseId,
 		{ $set: { aiToRespond: false } },
@@ -1159,6 +1390,30 @@ function getLatestClientTurn(caseDoc) {
 		}
 	}
 	return null;
+}
+
+function getLatestSupportTurn(caseDoc = {}) {
+	const conversation = getConversationArray(caseDoc);
+	for (let index = conversation.length - 1; index >= 0; index -= 1) {
+		const senderType = classifyConversationMessage(conversation[index]);
+		if (senderType === "staff" || senderType === "ai") {
+			return {
+				index,
+				message: conversation[index],
+			};
+		}
+	}
+	return null;
+}
+
+function hasClientReplyAfter(caseDoc, messageIndex) {
+	const conversation = getConversationArray(caseDoc);
+	for (let index = messageIndex + 1; index < conversation.length; index += 1) {
+		if (classifyConversationMessage(conversation[index]) === "client") {
+			return true;
+		}
+	}
+	return false;
 }
 
 function hasSupportReplyAfter(caseDoc, messageIndex) {
@@ -2372,6 +2627,11 @@ function buildSystemPrompt() {
 		"If the answer is long, split it into 2 short chat messages using a line that contains exactly [[send]] between message parts.",
 		"Do not split short, simple factual answers into 2 messages just to sound chatty.",
 		"If you split into 2 messages, the second message must add distinct value and must not repeat the first answer in different words.",
+		"If triggerType is idle_follow_up, the customer has not replied for roughly 45 to 60 seconds after your last support message.",
+		"If triggerType is idle_follow_up, decide whether a short proactive nudge is useful. If yes, send exactly one short, friendly live-chat sentence.",
+		"If triggerType is idle_follow_up, good patterns are brief check-ins like asking whether they are still there or whether there is anything else you can help with.",
+		"If triggerType is idle_follow_up, do not restate product facts, do not repeat your previous answer, do not use tools, and do not ask more than one question.",
+		"If triggerType is idle_follow_up and a follow-up is not needed, return exactly [[no_follow_up]].",
 		"If the customer asks a short confirmation follow-up like 'same colors?' or 'with shipping and everything', answer directly in one sentence unless they asked for more detail.",
 		"Only when the conversation truly feels wrapped up, you may add [[suggest_end_chat]] at the very end of your reply for the UI. Use it sparingly.",
 		"Use [[suggest_end_chat]] only when the customer's main question appears answered, you are not waiting on more details, and nothing else is pending.",
@@ -2408,11 +2668,22 @@ function buildUserPrompt({ caseDoc, flags, agentName, triggerType }) {
 	const latestClientTurn = getLatestClientTurn(caseDoc);
 	const latestPendingClientTurn = getLatestRelevantPendingClientTurn(caseDoc);
 	const latestPendingClientWindow = getLatestPendingClientWindow(caseDoc);
+	const latestSupportTurn = getLatestSupportTurn(caseDoc);
 	const storeId = normalizeString(caseDoc?.storeId?._id || caseDoc?.storeId);
 	const customerName = getCustomerName(caseDoc);
 	const rootInquiryAbout = firstMessage?.inquiryAbout || "";
 	const rootInquiryDetails = firstMessage?.inquiryDetails || "";
 	const replyStylePreferences = getReplyStylePreferences(caseDoc);
+	const silenceSinceLastSupportMessageMs = latestSupportTurn?.message?.date
+		? Math.max(
+				0,
+				Date.now() - new Date(latestSupportTurn.message.date).getTime(),
+			)
+		: null;
+	const task =
+		triggerType === "idle_follow_up"
+			? "The customer has not replied for roughly 45 to 60 seconds since your last support message. Decide whether one short proactive follow-up is appropriate. If yes, send exactly one short friendly sentence only. Keep it natural and light, like checking whether they are still there or whether there is anything else you can help with. Do not repeat product facts or restate your previous answer. If no follow-up is needed, return exactly [[no_follow_up]]."
+			: "Decide the best next reply to the customer. Prioritize the latest unresolved customer turn over older product context. If a human teammate already replied earlier in the same chat, continue naturally from that conversation instead of restarting it. Call tools whenever product, custom-gift, order, shipping, policy, tracking, or store facts would improve the answer. Return only the customer-facing chat reply.";
 
 	return JSON.stringify(
 		{
@@ -2466,6 +2737,14 @@ function buildUserPrompt({ caseDoc, flags, agentName, triggerType }) {
 				inquiryAbout: turn.message?.inquiryAbout || rootInquiryAbout,
 				inquiryDetails: turn.message?.inquiryDetails || rootInquiryDetails,
 			})),
+			latestSupportTurn: latestSupportTurn
+				? {
+						message: latestSupportTurn.message?.message || "",
+						senderType: classifyConversationMessage(latestSupportTurn.message),
+						sentAt: latestSupportTurn.message?.date || null,
+						silenceSinceLastSupportMessageMs,
+					}
+				: null,
 			conversationPreferences: {
 				prefersShortReplies: replyStylePreferences.prefersShortReplies,
 				dislikesUnaskedExtras: replyStylePreferences.dislikesUnaskedExtras,
@@ -2490,7 +2769,7 @@ function buildUserPrompt({ caseDoc, flags, agentName, triggerType }) {
 				clarifyIntentBeforeAnswering: shouldClarifyFirstReply(caseDoc),
 			},
 			transcript,
-			task: "Decide the best next reply to the customer. Prioritize the latest unresolved customer turn over older product context. If a human teammate already replied earlier in the same chat, continue naturally from that conversation instead of restarting it. Call tools whenever product, custom-gift, order, shipping, policy, tracking, or store facts would improve the answer. Return only the customer-facing chat reply.",
+			task,
 		},
 		null,
 		2,
@@ -2527,13 +2806,18 @@ async function runOrchestrator({ caseDoc, flags, agentName, triggerType }) {
 			messageCount: messages.length,
 		});
 
-		const completion = await openai.chat.completions.create({
+		const requestPayload = {
 			model: DEFAULT_MODEL,
 			temperature: 0.45,
 			messages,
-			tools: toolDefinitions,
-			tool_choice: "auto",
-		});
+		};
+
+		if (triggerType !== "idle_follow_up") {
+			requestPayload.tools = toolDefinitions;
+			requestPayload.tool_choice = "auto";
+		}
+
+		const completion = await openai.chat.completions.create(requestPayload);
 
 		const choice = completion?.choices?.[0]?.message;
 		logSupportAi("orchestrator-round-response", {
@@ -2700,7 +2984,7 @@ async function emitTypingAndSend(
 	caseDoc,
 	replySegments,
 	agentName,
-	latestClientTurn,
+	referenceTurn,
 	options = {},
 ) {
 	const io = global.io;
@@ -2709,24 +2993,29 @@ async function emitTypingAndSend(
 	}
 
 	const caseId = String(caseDoc._id);
+	const referenceKind = options?.referenceKind || "pending_client";
 	logSupportAi("emit-typing-and-send-start", {
 		caseId,
 		agentName,
 		replySegmentCount: replySegments.length,
 		shouldSuggestEndChat: Boolean(options?.shouldSuggestEndChat),
 		firstReplyDelayRange: options?.firstReplyDelayRange || null,
+		referenceKind,
 	});
 
 	if (hasRecentTyping(caseId, TYPING_ABORT_MS)) {
-		scheduleTypingRetry({
-			caseId,
-			latestClientTurn,
-			triggerType: "client_message",
-		});
+		if (referenceKind === "pending_client") {
+			scheduleTypingRetry({
+				caseId,
+				latestClientTurn: referenceTurn,
+				triggerType: options?.triggerType || "client_message",
+			});
+		}
 		logSupportAi("emit-typing-and-send-skipped", {
 			caseId,
 			agentName,
 			reason: "client_typing_before_emit",
+			referenceKind,
 		});
 		return {
 			skipped: "client_typing",
@@ -2734,6 +3023,9 @@ async function emitTypingAndSend(
 	}
 
 	let sentSegments = 0;
+	let latestAppendedCase = caseDoc;
+	let latestSentSupportTurn =
+		referenceKind === "support_turn" ? referenceTurn : null;
 	const firstReplyDelayRange = options?.firstReplyDelayRange || null;
 
 	for (
@@ -2767,16 +3059,19 @@ async function emitTypingAndSend(
 
 		if (hasRecentTyping(caseId, TYPING_ABORT_MS)) {
 			io.to(caseId).emit("stopTyping", { caseId, user: agentName });
-			scheduleTypingRetry({
-				caseId,
-				latestClientTurn,
-				triggerType: "client_message",
-			});
+			if (referenceKind === "pending_client") {
+				scheduleTypingRetry({
+					caseId,
+					latestClientTurn: referenceTurn,
+					triggerType: options?.triggerType || "client_message",
+				});
+			}
 			logSupportAi("segment-send-aborted", {
 				caseId,
 				agentName,
 				reason: "client_typing_during_delay",
 				segmentIndex: segmentIndex + 1,
+				referenceKind,
 			});
 			return {
 				skipped: "client_typing",
@@ -2808,24 +3103,40 @@ async function emitTypingAndSend(
 		}
 
 		const currentLatestClientTurn =
-			getLatestRelevantPendingClientTurn(liveCase);
-		if (
-			!currentLatestClientTurn ||
-			!isSameTurn(currentLatestClientTurn, latestClientTurn) ||
-			hasHumanStaffReplyAfter(liveCase, latestClientTurn.index)
-		) {
+			referenceKind === "pending_client"
+				? getLatestRelevantPendingClientTurn(liveCase)
+				: null;
+		const currentLatestSupportTurn =
+			referenceKind === "support_turn" ? getLatestSupportTurn(liveCase) : null;
+		const referenceTurnIsStale =
+			referenceKind === "pending_client"
+				? !currentLatestClientTurn ||
+					!isSameTurn(currentLatestClientTurn, referenceTurn) ||
+					hasHumanStaffReplyAfter(liveCase, referenceTurn.index)
+				: !currentLatestSupportTurn ||
+					!isSameTurn(currentLatestSupportTurn, referenceTurn) ||
+					hasClientReplyAfter(liveCase, referenceTurn.index);
+		if (referenceTurnIsStale) {
 			io.to(caseId).emit("stopTyping", { caseId, user: agentName });
 			clearTypingRetry(caseId);
 			logSupportAi("segment-send-aborted", {
 				caseId,
 				agentName,
-				reason: "already_handled",
+				reason:
+					referenceKind === "pending_client"
+						? "already_handled"
+						: "follow_up_no_longer_needed",
 				segmentIndex: segmentIndex + 1,
 				currentLatestClientTurnIndex: currentLatestClientTurn?.index ?? null,
-				referenceTurnIndex: latestClientTurn?.index ?? null,
+				currentLatestSupportTurnIndex: currentLatestSupportTurn?.index ?? null,
+				referenceTurnIndex: referenceTurn?.index ?? null,
+				referenceKind,
 			});
 			return {
-				skipped: "already_handled",
+				skipped:
+					referenceKind === "pending_client"
+						? "already_handled"
+						: "follow_up_no_longer_needed",
 				sentSegments,
 			};
 		}
@@ -2841,6 +3152,8 @@ async function emitTypingAndSend(
 		}
 
 		sentSegments += 1;
+		latestAppendedCase = appended.liveCase;
+		latestSentSupportTurn = getLatestSupportTurn(appended.liveCase);
 		logSupportAi("segment-sent", {
 			caseId,
 			agentName,
@@ -2862,6 +3175,18 @@ async function emitTypingAndSend(
 	}
 
 	clearTypingRetry(caseId);
+	if (
+		sentSegments > 0 &&
+		options?.scheduleIdleFollowUp &&
+		latestSentSupportTurn
+	) {
+		scheduleIdleFollowUp({
+			caseId,
+			referenceSupportTurn: latestSentSupportTurn,
+			originTriggerType: options?.triggerType || "client_message",
+			agentName,
+		});
+	}
 
 	if (sentSegments > 0 && options?.shouldSuggestEndChat) {
 		logSupportAi("end-chat-suggestion-emitted", {
@@ -2881,6 +3206,9 @@ async function emitTypingAndSend(
 		agentName,
 		sentSegments,
 		ok: sentSegments > 0,
+		conversationCount: Array.isArray(latestAppendedCase?.conversation)
+			? latestAppendedCase.conversation.length
+			: null,
 	});
 
 	return {
@@ -2894,6 +3222,9 @@ async function respondToSupportCase({
 	triggerType = "client_message",
 }) {
 	ensureTypingHook();
+	if (triggerType !== "idle_follow_up") {
+		clearIdleFollowUp(caseId);
+	}
 	logSupportAi("respond-start", {
 		caseId: normalizeString(caseId),
 		triggerType,
@@ -2927,6 +3258,7 @@ async function respondToSupportCase({
 
 	if (!caseDoc) {
 		clearTypingRetry(caseId);
+		clearIdleFollowUp(caseId);
 		logSupportAi(
 			"respond-skipped",
 			{
@@ -2944,6 +3276,7 @@ async function respondToSupportCase({
 	const aiBlockReason = getAiBlockReason(flags, caseDoc);
 	if (aiBlockReason) {
 		clearTypingRetry(caseId);
+		clearIdleFollowUp(caseId);
 		logSupportAi(
 			"respond-skipped",
 			{
@@ -2959,8 +3292,12 @@ async function respondToSupportCase({
 		};
 	}
 
-	const latestClientTurn = getLatestRelevantPendingClientTurn(caseDoc);
-	if (!latestClientTurn) {
+	const latestClientTurn =
+		triggerType === "idle_follow_up"
+			? getLatestClientTurn(caseDoc)
+			: getLatestRelevantPendingClientTurn(caseDoc);
+	const latestSupportTurn = getLatestSupportTurn(caseDoc);
+	if (triggerType !== "idle_follow_up" && !latestClientTurn) {
 		clearTypingRetry(caseId);
 		logSupportAi(
 			"respond-skipped",
@@ -2979,7 +3316,45 @@ async function respondToSupportCase({
 		};
 	}
 
-	if (hasRecentTyping(caseId, TYPING_IDLE_MS)) {
+	if (triggerType === "idle_follow_up") {
+		if (!latestSupportTurn) {
+			clearTypingRetry(caseId);
+			logSupportAi("respond-skipped", {
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: "no_support_turn_for_follow_up",
+			});
+			return {
+				skipped: "no_support_turn_for_follow_up",
+			};
+		}
+
+		if (hasClientReplyAfter(caseDoc, latestSupportTurn.index)) {
+			clearTypingRetry(caseId);
+			logSupportAi("respond-skipped", {
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: "client_replied_after_support_turn",
+				referenceTurnIndex: latestSupportTurn.index,
+			});
+			return {
+				skipped: "client_replied_after_support_turn",
+			};
+		}
+
+		if (hasRecentTyping(caseId, TYPING_ABORT_MS)) {
+			clearTypingRetry(caseId);
+			logSupportAi("respond-skipped", {
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: "client_typing",
+				referenceTurnIndex: latestSupportTurn.index,
+			});
+			return {
+				skipped: "client_typing",
+			};
+		}
+	} else if (hasRecentTyping(caseId, TYPING_IDLE_MS)) {
 		scheduleTypingRetry({
 			caseId,
 			latestClientTurn,
@@ -3000,8 +3375,8 @@ async function respondToSupportCase({
 	const agentName = pickAgentName(caseDoc);
 	const firstReplyDelayRange = getFirstReplyDelayRange(caseDoc, triggerType);
 	const latestCustomerText = normalizeString(
-		latestClientTurn.message?.message ||
-			latestClientTurn.message?.inquiryDetails ||
+		latestClientTurn?.message?.message ||
+			latestClientTurn?.message?.inquiryDetails ||
 			"",
 	);
 
@@ -3011,8 +3386,13 @@ async function respondToSupportCase({
 		model: DEFAULT_MODEL,
 		hasApiKey: HAS_SUPPORT_AI_API_KEY,
 		agentName,
-		latestTurnIndex: latestClientTurn.index,
+		latestTurnIndex: latestClientTurn?.index ?? null,
 		latestTurnPreview: previewText(latestCustomerText, 200),
+		latestSupportTurnIndex: latestSupportTurn?.index ?? null,
+		latestSupportTurnPreview: previewText(
+			latestSupportTurn?.message?.message || "",
+			200,
+		),
 		firstReplyDelayRange,
 	});
 
@@ -3110,7 +3490,12 @@ async function respondToSupportCase({
 			[clarificationReply],
 			agentName,
 			latestClientTurn,
-			{ firstReplyDelayRange },
+			{
+				firstReplyDelayRange,
+				triggerType,
+				referenceKind: "pending_client",
+				scheduleIdleFollowUp: true,
+			},
 		);
 	}
 
@@ -3136,8 +3521,30 @@ async function respondToSupportCase({
 		throw error;
 	}
 
-	const { replyText, shouldSuggestEndChat } =
-		extractReplyUiDirectives(orchestratorReply);
+	const idleFollowUpDecision =
+		triggerType === "idle_follow_up"
+			? extractIdleFollowUpDecision(orchestratorReply)
+			: null;
+	if (idleFollowUpDecision?.shouldSkipFollowUp) {
+		clearTypingRetry(caseId);
+		logSupportAi("respond-skipped", {
+			caseId: normalizeString(caseId),
+			triggerType,
+			reason: "idle_follow_up_not_needed",
+		});
+		return {
+			skipped: "idle_follow_up_not_needed",
+		};
+	}
+
+	const extractedReply = extractReplyUiDirectives(
+		idleFollowUpDecision?.replyText ?? orchestratorReply,
+	);
+	const replyText = extractedReply.replyText;
+	const shouldSuggestEndChat =
+		triggerType === "idle_follow_up"
+			? false
+			: extractedReply.shouldSuggestEndChat;
 	const replySegments = splitReplyIntoSegments(replyText, caseDoc, agentName);
 
 	logSupportAi("reply-prepared", {
@@ -3170,8 +3577,16 @@ async function respondToSupportCase({
 		caseDoc,
 		replySegments,
 		agentName,
-		latestClientTurn,
-		{ firstReplyDelayRange, shouldSuggestEndChat },
+		triggerType === "idle_follow_up" ? latestSupportTurn : latestClientTurn,
+		{
+			firstReplyDelayRange,
+			shouldSuggestEndChat,
+			triggerType,
+			referenceKind:
+				triggerType === "idle_follow_up" ? "support_turn" : "pending_client",
+			scheduleIdleFollowUp:
+				triggerType !== "idle_follow_up" && !shouldSuggestEndChat,
+		},
 	);
 }
 
