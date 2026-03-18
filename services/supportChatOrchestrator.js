@@ -34,6 +34,16 @@ const MAX_TYPING_RETRIES = 2;
 const INTER_SEGMENT_PAUSE_MS = 450;
 const FIRST_REPLY_MIN_DELAY_MS = 5000;
 const FIRST_REPLY_MAX_DELAY_MS = 10000;
+const HAS_SUPPORT_AI_API_KEY = Boolean(
+	`${process.env.CHATGPT_API_TOKEN || ""}`.trim(),
+);
+const SUPPORT_AI_LOG_PREFIX = "[support-ai]";
+
+if (!HAS_SUPPORT_AI_API_KEY) {
+	console.warn(
+		"[support-ai] CHATGPT_API_TOKEN is not configured. Support AI replies will not work.",
+	);
+}
 
 const lastTypingAt = new Map();
 const typingRetryState = new Map();
@@ -65,6 +75,115 @@ function normalizeString(value = "") {
 
 function normalizeLower(value = "") {
 	return normalizeString(value).toLowerCase();
+}
+
+function previewText(value = "", maxLength = 140) {
+	const normalized = normalizeString(value).replace(/\s+/g, " ");
+	if (!normalized) return "";
+	return normalized.length > maxLength
+		? `${normalized.slice(0, maxLength - 3)}...`
+		: normalized;
+}
+
+function logSupportAi(event, details = {}, level = "log") {
+	const logger =
+		typeof console[level] === "function" ? console[level] : console.log;
+	logger(`${SUPPORT_AI_LOG_PREFIX} ${event}:`, details);
+}
+
+function summarizeSupportAiError(error) {
+	return {
+		message: error?.message || "Unknown error",
+		status: error?.status || error?.statusCode || null,
+		code: error?.code || null,
+		type: error?.type || null,
+		requestId:
+			error?.request_id ||
+			error?.requestId ||
+			error?.headers?.["x-request-id"] ||
+			null,
+	};
+}
+
+function summarizeCaseForLogs(caseDoc = {}, flags = null) {
+	const conversation = Array.isArray(caseDoc?.conversation)
+		? caseDoc.conversation
+		: [];
+	const latestMessage = conversation[conversation.length - 1] || null;
+	return {
+		caseId: normalizeString(caseDoc?._id),
+		caseStatus: caseDoc?.caseStatus || "",
+		openedBy: caseDoc?.openedBy || "",
+		caseAiEnabled: Boolean(caseDoc?.aiToRespond),
+		globalAiEnabled:
+			flags === null
+				? null
+				: Boolean(flags?.aiAgentToRespond && !flags?.deactivateChatResponse),
+		globalAiSwitch: flags === null ? null : Boolean(flags?.aiAgentToRespond),
+		chatPaused: flags === null ? null : Boolean(flags?.deactivateChatResponse),
+		conversationCount: conversation.length,
+		latestMessageSender: latestMessage
+			? classifyConversationMessage(latestMessage)
+			: null,
+		latestMessagePreview: latestMessage
+			? previewText(latestMessage?.message || "")
+			: "",
+	};
+}
+
+function summarizeToolResult(result) {
+	if (result === null || result === undefined) {
+		return { type: "empty" };
+	}
+
+	if (Array.isArray(result)) {
+		return { type: "array", count: result.length };
+	}
+
+	if (typeof result !== "object") {
+		return {
+			type: typeof result,
+			value: previewText(String(result), 80),
+		};
+	}
+
+	const summary = {
+		type: "object",
+		keys: Object.keys(result).slice(0, 12),
+	};
+
+	for (const key of [
+		"found",
+		"message",
+		"requestedOccasion",
+		"requestedOccasionSupported",
+		"supportedOccasionCount",
+	]) {
+		if (Object.prototype.hasOwnProperty.call(result, key)) {
+			summary[key] =
+				key === "message" ? previewText(result[key], 120) : result[key];
+		}
+	}
+
+	for (const [key, value] of Object.entries(result)) {
+		if (Array.isArray(value)) {
+			summary[`${key}Count`] = value.length;
+		}
+	}
+
+	return summary;
+}
+
+function getAiBlockReason(flags = {}, caseDoc = {}) {
+	if (!flags) return "website_setup_missing";
+	if (!flags?.aiAgentToRespond) return "global_ai_disabled";
+	if (flags?.deactivateChatResponse) return "chat_responses_paused";
+	if (!caseDoc?.aiToRespond) return "case_ai_disabled";
+	if (caseDoc?.caseStatus !== "open") {
+		return `case_${normalizeLower(caseDoc?.caseStatus || "not_open")}`;
+	}
+	if (caseDoc?.openedBy !== "client") return "not_client_opened";
+	return null;
 }
 
 function escapeRegex(value = "") {
@@ -219,19 +338,54 @@ function scheduleTypingRetry({
 	triggerType = "client_message",
 }) {
 	const normalizedCaseId = normalizeString(caseId);
-	if (!normalizedCaseId || !latestClientTurn) return false;
+	if (!normalizedCaseId || !latestClientTurn) {
+		logSupportAi(
+			"typing-retry-not-scheduled",
+			{
+				caseId: normalizedCaseId || caseId || "",
+				triggerType,
+				reason: "missing_case_or_turn",
+			},
+			"warn",
+		);
+		return false;
+	}
 
 	const turnKey = getMessageIdentity(
 		latestClientTurn.message,
 		latestClientTurn.index,
 	);
-	if (!turnKey) return false;
+	if (!turnKey) {
+		logSupportAi(
+			"typing-retry-not-scheduled",
+			{
+				caseId: normalizedCaseId,
+				triggerType,
+				reason: "missing_turn_key",
+			},
+			"warn",
+		);
+		return false;
+	}
 
 	const existing = typingRetryState.get(normalizedCaseId);
 	const isSameTurn = existing?.turnKey === turnKey;
 	const attempts = isSameTurn ? (existing?.attempts || 0) + 1 : 1;
 
 	if (isSameTurn && attempts > MAX_TYPING_RETRIES) {
+		logSupportAi(
+			"typing-retry-exhausted",
+			{
+				caseId: normalizedCaseId,
+				triggerType,
+				attempts,
+				latestTurnIndex: latestClientTurn.index,
+				latestTurnPreview: previewText(
+					latestClientTurn?.message?.message || "",
+				),
+			},
+			"warn",
+		);
 		return false;
 	}
 
@@ -246,12 +400,26 @@ function scheduleTypingRetry({
 			current.turnKey !== turnKey ||
 			current.attempts !== attempts
 		) {
+			logSupportAi("typing-retry-stale", {
+				caseId: normalizedCaseId,
+				triggerType,
+				attempts,
+			});
 			return;
 		}
 
 		typingRetryState.delete(normalizedCaseId);
 
 		try {
+			logSupportAi("typing-retry-fired", {
+				caseId: normalizedCaseId,
+				triggerType,
+				attempts,
+				latestTurnIndex: latestClientTurn.index,
+				latestTurnPreview: previewText(
+					latestClientTurn?.message?.message || "",
+				),
+			});
 			await respondToSupportCase({
 				caseId: normalizedCaseId,
 				triggerType:
@@ -260,7 +428,16 @@ function scheduleTypingRetry({
 						: "post_typing_retry",
 			});
 		} catch (error) {
-			console.error("[support-ai-typing-retry] failed:", error.message);
+			logSupportAi(
+				"typing-retry-failed",
+				{
+					caseId: normalizedCaseId,
+					triggerType,
+					attempts,
+					...summarizeSupportAiError(error),
+				},
+				"error",
+			);
 		}
 	}, TYPING_RETRY_DELAY_MS);
 
@@ -268,6 +445,15 @@ function scheduleTypingRetry({
 		turnKey,
 		attempts,
 		timer,
+	});
+
+	logSupportAi("typing-retry-scheduled", {
+		caseId: normalizedCaseId,
+		triggerType,
+		attempts,
+		delayMs: TYPING_RETRY_DELAY_MS,
+		latestTurnIndex: latestClientTurn.index,
+		latestTurnPreview: previewText(latestClientTurn?.message?.message || ""),
 	});
 
 	return true;
@@ -1070,13 +1256,7 @@ function hasHumanStaffMessages(caseDoc = {}) {
 }
 
 function isAiAllowed(flags = {}, caseDoc = {}) {
-	return Boolean(
-		flags?.aiAgentToRespond &&
-		!flags?.deactivateChatResponse &&
-		caseDoc?.aiToRespond &&
-		caseDoc?.caseStatus === "open" &&
-		caseDoc?.openedBy === "client",
-	);
+	return !getAiBlockReason(flags, caseDoc);
 }
 
 function extractOrderItems(order = {}) {
@@ -2304,6 +2484,10 @@ function buildUserPrompt({ caseDoc, flags, agentName, triggerType }) {
 }
 
 async function runOrchestrator({ caseDoc, flags, agentName, triggerType }) {
+	if (!HAS_SUPPORT_AI_API_KEY) {
+		throw new Error("CHATGPT_API_TOKEN is not configured");
+	}
+
 	const messages = [
 		{ role: "system", content: buildSystemPrompt() },
 		{
@@ -2312,7 +2496,23 @@ async function runOrchestrator({ caseDoc, flags, agentName, triggerType }) {
 		},
 	];
 
+	logSupportAi("orchestrator-start", {
+		caseId: normalizeString(caseDoc?._id),
+		triggerType,
+		agentName,
+		model: DEFAULT_MODEL,
+		messageCount: messages.length,
+		caseState: summarizeCaseForLogs(caseDoc, flags),
+	});
+
 	for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+		logSupportAi("orchestrator-round-request", {
+			caseId: normalizeString(caseDoc?._id),
+			triggerType,
+			round: round + 1,
+			messageCount: messages.length,
+		});
+
 		const completion = await openai.chat.completions.create({
 			model: DEFAULT_MODEL,
 			temperature: 0.45,
@@ -2322,12 +2522,43 @@ async function runOrchestrator({ caseDoc, flags, agentName, triggerType }) {
 		});
 
 		const choice = completion?.choices?.[0]?.message;
-		if (!choice) break;
+		logSupportAi("orchestrator-round-response", {
+			caseId: normalizeString(caseDoc?._id),
+			triggerType,
+			round: round + 1,
+			finishReason: completion?.choices?.[0]?.finish_reason || null,
+			hasToolCalls: Boolean(choice?.tool_calls?.length),
+			toolCallCount: Array.isArray(choice?.tool_calls)
+				? choice.tool_calls.length
+				: 0,
+			contentPreview: previewText(choice?.content || ""),
+			usage: completion?.usage || null,
+		});
+
+		if (!choice) {
+			logSupportAi(
+				"orchestrator-empty-choice",
+				{
+					caseId: normalizeString(caseDoc?._id),
+					triggerType,
+					round: round + 1,
+				},
+				"warn",
+			);
+			break;
+		}
 
 		messages.push(choice);
 
 		if (!Array.isArray(choice.tool_calls) || !choice.tool_calls.length) {
-			return stripResponseText(choice.content || "");
+			const finalReply = stripResponseText(choice.content || "");
+			logSupportAi("orchestrator-final-reply", {
+				caseId: normalizeString(caseDoc?._id),
+				triggerType,
+				round: round + 1,
+				replyPreview: previewText(finalReply, 220),
+			});
+			return finalReply;
 		}
 
 		for (const toolCall of choice.tool_calls) {
@@ -2340,10 +2571,26 @@ async function runOrchestrator({ caseDoc, flags, agentName, triggerType }) {
 				parsedArgs = {};
 			}
 
+			logSupportAi("tool-call-start", {
+				caseId: normalizeString(caseDoc?._id),
+				triggerType,
+				round: round + 1,
+				toolName: toolCall?.function?.name || "",
+				args: parsedArgs,
+			});
+
 			const result = await executeToolCall(
 				toolCall?.function?.name,
 				parsedArgs,
 			);
+
+			logSupportAi("tool-call-result", {
+				caseId: normalizeString(caseDoc?._id),
+				triggerType,
+				round: round + 1,
+				toolName: toolCall?.function?.name || "",
+				summary: summarizeToolResult(result),
+			});
 
 			messages.push({
 				role: "tool",
@@ -2353,12 +2600,32 @@ async function runOrchestrator({ caseDoc, flags, agentName, triggerType }) {
 		}
 	}
 
+	logSupportAi(
+		"orchestrator-max-rounds-reached",
+		{
+			caseId: normalizeString(caseDoc?._id),
+			triggerType,
+			maxToolRounds: MAX_TOOL_ROUNDS,
+		},
+		"warn",
+	);
+
 	return "";
 }
 
 async function appendAiMessage(caseId, segment, agentName) {
 	const liveCase = await SupportCase.findById(caseId).lean();
-	if (!liveCase) return null;
+	if (!liveCase) {
+		logSupportAi(
+			"append-message-missing-case",
+			{
+				caseId,
+				agentName,
+			},
+			"warn",
+		);
+		return null;
+	}
 
 	const root = liveCase.conversation[0] || {};
 	const messagePayload = {
@@ -2375,6 +2642,13 @@ async function appendAiMessage(caseId, segment, agentName) {
 		date: new Date(),
 	};
 
+	logSupportAi("append-message-start", {
+		caseId,
+		agentName,
+		messagePreview: previewText(segment, 220),
+		rootInquiryAbout: root.inquiryAbout || "",
+	});
+
 	const updatedCase = await SupportCase.findByIdAndUpdate(
 		caseId,
 		{
@@ -2384,7 +2658,25 @@ async function appendAiMessage(caseId, segment, agentName) {
 		{ new: true },
 	);
 
-	if (!updatedCase) return null;
+	if (!updatedCase) {
+		logSupportAi(
+			"append-message-update-missed",
+			{
+				caseId,
+				agentName,
+			},
+			"warn",
+		);
+		return null;
+	}
+
+	logSupportAi("append-message-complete", {
+		caseId,
+		agentName,
+		conversationCount: Array.isArray(updatedCase?.conversation)
+			? updatedCase.conversation.length
+			: null,
+	});
 
 	return { liveCase: updatedCase, messagePayload };
 }
@@ -2402,11 +2694,24 @@ async function emitTypingAndSend(
 	}
 
 	const caseId = String(caseDoc._id);
+	logSupportAi("emit-typing-and-send-start", {
+		caseId,
+		agentName,
+		replySegmentCount: replySegments.length,
+		shouldSuggestEndChat: Boolean(options?.shouldSuggestEndChat),
+		firstReplyDelayRange: options?.firstReplyDelayRange || null,
+	});
+
 	if (hasRecentTyping(caseId, TYPING_ABORT_MS)) {
 		scheduleTypingRetry({
 			caseId,
 			latestClientTurn,
 			triggerType: "client_message",
+		});
+		logSupportAi("emit-typing-and-send-skipped", {
+			caseId,
+			agentName,
+			reason: "client_typing_before_emit",
 		});
 		return {
 			skipped: "client_typing",
@@ -2435,6 +2740,14 @@ async function emitTypingAndSend(
 						),
 					)
 				: calculateTypingDelay(segment, segmentIndex);
+		logSupportAi("segment-typing-delay", {
+			caseId,
+			agentName,
+			segmentIndex: segmentIndex + 1,
+			segmentCount: replySegments.length,
+			typingDelay,
+			segmentPreview: previewText(segment, 180),
+		});
 		await wait(typingDelay);
 
 		if (hasRecentTyping(caseId, TYPING_ABORT_MS)) {
@@ -2443,6 +2756,12 @@ async function emitTypingAndSend(
 				caseId,
 				latestClientTurn,
 				triggerType: "client_message",
+			});
+			logSupportAi("segment-send-aborted", {
+				caseId,
+				agentName,
+				reason: "client_typing_during_delay",
+				segmentIndex: segmentIndex + 1,
 			});
 			return {
 				skipped: "client_typing",
@@ -2458,6 +2777,15 @@ async function emitTypingAndSend(
 		if (!liveCase || !isAiAllowed(latestFlags, liveCase)) {
 			io.to(caseId).emit("stopTyping", { caseId, user: agentName });
 			clearTypingRetry(caseId);
+			logSupportAi("segment-send-aborted", {
+				caseId,
+				agentName,
+				reason: liveCase
+					? getAiBlockReason(latestFlags, liveCase) || "ai_disabled_before_send"
+					: "case_not_found_before_send",
+				segmentIndex: segmentIndex + 1,
+				caseState: summarizeCaseForLogs(liveCase, latestFlags),
+			});
 			return {
 				skipped: "ai_disabled_before_send",
 				sentSegments,
@@ -2473,6 +2801,14 @@ async function emitTypingAndSend(
 		) {
 			io.to(caseId).emit("stopTyping", { caseId, user: agentName });
 			clearTypingRetry(caseId);
+			logSupportAi("segment-send-aborted", {
+				caseId,
+				agentName,
+				reason: "already_handled",
+				segmentIndex: segmentIndex + 1,
+				currentLatestClientTurnIndex: currentLatestClientTurn?.index ?? null,
+				referenceTurnIndex: latestClientTurn?.index ?? null,
+			});
 			return {
 				skipped: "already_handled",
 				sentSegments,
@@ -2490,6 +2826,14 @@ async function emitTypingAndSend(
 		}
 
 		sentSegments += 1;
+		logSupportAi("segment-sent", {
+			caseId,
+			agentName,
+			segmentIndex: segmentIndex + 1,
+			segmentCount: replySegments.length,
+			segmentPreview: previewText(segment, 220),
+			sentSegments,
+		});
 		io.to(caseId).emit("stopTyping", { caseId, user: agentName });
 		io.to(caseId).emit("receiveMessage", {
 			caseId,
@@ -2505,12 +2849,24 @@ async function emitTypingAndSend(
 	clearTypingRetry(caseId);
 
 	if (sentSegments > 0 && options?.shouldSuggestEndChat) {
+		logSupportAi("end-chat-suggestion-emitted", {
+			caseId,
+			agentName,
+			sentSegments,
+		});
 		io.to(caseId).emit("supportEndChatSuggestion", {
 			caseId,
 			suggestedBy: agentName,
 			requestedAt: new Date().toISOString(),
 		});
 	}
+
+	logSupportAi("emit-typing-and-send-complete", {
+		caseId,
+		agentName,
+		sentSegments,
+		ok: sentSegments > 0,
+	});
 
 	return {
 		ok: sentSegments > 0,
@@ -2523,8 +2879,21 @@ async function respondToSupportCase({
 	triggerType = "client_message",
 }) {
 	ensureTypingHook();
+	logSupportAi("respond-start", {
+		caseId: normalizeString(caseId),
+		triggerType,
+	});
 
 	if (!normalizeString(caseId)) {
+		logSupportAi(
+			"respond-skipped",
+			{
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: "missing_case_id",
+			},
+			"warn",
+		);
 		return {
 			skipped: "missing_case_id",
 		};
@@ -2535,23 +2904,61 @@ async function respondToSupportCase({
 		SupportCase.findById(caseId).lean(),
 	]);
 
+	logSupportAi("respond-loaded-state", {
+		caseId: normalizeString(caseId),
+		triggerType,
+		caseState: summarizeCaseForLogs(caseDoc, flags),
+	});
+
 	if (!caseDoc) {
 		clearTypingRetry(caseId);
+		logSupportAi(
+			"respond-skipped",
+			{
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: "case_not_found",
+			},
+			"warn",
+		);
 		return {
 			skipped: "case_not_found",
 		};
 	}
 
-	if (!isAiAllowed(flags, caseDoc)) {
+	const aiBlockReason = getAiBlockReason(flags, caseDoc);
+	if (aiBlockReason) {
 		clearTypingRetry(caseId);
+		logSupportAi(
+			"respond-skipped",
+			{
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: aiBlockReason,
+				caseState: summarizeCaseForLogs(caseDoc, flags),
+			},
+			"warn",
+		);
 		return {
-			skipped: "ai_disabled",
+			skipped: aiBlockReason,
 		};
 	}
 
 	const latestClientTurn = getLatestRelevantPendingClientTurn(caseDoc);
 	if (!latestClientTurn) {
 		clearTypingRetry(caseId);
+		logSupportAi(
+			"respond-skipped",
+			{
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: "no_pending_client_turn",
+				conversationCount: Array.isArray(caseDoc?.conversation)
+					? caseDoc.conversation.length
+					: 0,
+			},
+			"warn",
+		);
 		return {
 			skipped: "no_pending_client_turn",
 		};
@@ -2562,6 +2969,13 @@ async function respondToSupportCase({
 			caseId,
 			latestClientTurn,
 			triggerType,
+		});
+		logSupportAi("respond-skipped", {
+			caseId: normalizeString(caseId),
+			triggerType,
+			reason: "client_typing",
+			latestTurnIndex: latestClientTurn.index,
+			latestTurnPreview: previewText(latestClientTurn?.message?.message || ""),
 		});
 		return {
 			skipped: "client_typing",
@@ -2576,20 +2990,53 @@ async function respondToSupportCase({
 			"",
 	);
 
+	console.log("[support-ai] processing:", {
+		caseId,
+		triggerType,
+		model: DEFAULT_MODEL,
+		hasApiKey: HAS_SUPPORT_AI_API_KEY,
+		agentName,
+		latestTurnIndex: latestClientTurn.index,
+		latestTurnPreview: previewText(latestCustomerText, 200),
+		firstReplyDelayRange,
+	});
+
 	if (
 		triggerType === "ai_reenabled" &&
 		isHumanHandoffRequest(latestCustomerText)
 	) {
 		clearTypingRetry(caseId);
+		logSupportAi("respond-skipped", {
+			caseId: normalizeString(caseId),
+			triggerType,
+			reason: "awaiting_next_client_turn_after_handoff",
+			latestTurnPreview: previewText(latestCustomerText, 200),
+		});
 		return {
 			skipped: "awaiting_next_client_turn_after_handoff",
 		};
 	}
 
 	if (isHumanHandoffRequest(latestCustomerText)) {
+		logSupportAi("handoff-request-detected", {
+			caseId: normalizeString(caseId),
+			triggerType,
+			agentName,
+			latestTurnPreview: previewText(latestCustomerText, 200),
+		});
 		const handoffReply = sanitizeReplyText(buildHumanHandoffReply(caseDoc));
 		if (!handoffReply) {
 			clearTypingRetry(caseId);
+			logSupportAi(
+				"respond-skipped",
+				{
+					caseId: normalizeString(caseId),
+					triggerType,
+					reason: "empty_reply",
+					branch: "handoff",
+				},
+				"warn",
+			);
 			return {
 				skipped: "empty_reply",
 			};
@@ -2604,18 +3051,40 @@ async function respondToSupportCase({
 
 		if (handoffResult?.ok || handoffResult?.sentSegments > 0) {
 			await disableAiForCase(caseId);
+			logSupportAi("handoff-complete", {
+				caseId: normalizeString(caseId),
+				triggerType,
+				agentName,
+				sentSegments: handoffResult?.sentSegments || 0,
+			});
 		}
 
 		return handoffResult;
 	}
 
 	if (shouldClarifyFirstReply(caseDoc)) {
+		logSupportAi("clarification-branch", {
+			caseId: normalizeString(caseId),
+			triggerType,
+			agentName,
+			latestTurnPreview: previewText(latestCustomerText, 200),
+		});
 		const clarificationReply = sanitizeReplyText(
 			await buildIntentClarifierReply(caseDoc, agentName),
 		);
 
 		if (!clarificationReply) {
 			clearTypingRetry(caseId);
+			logSupportAi(
+				"respond-skipped",
+				{
+					caseId: normalizeString(caseId),
+					triggerType,
+					reason: "empty_reply",
+					branch: "clarification",
+				},
+				"warn",
+			);
 			return {
 				skipped: "empty_reply",
 			};
@@ -2630,18 +3099,53 @@ async function respondToSupportCase({
 		);
 	}
 
-	const { replyText, shouldSuggestEndChat } = extractReplyUiDirectives(
-		await runOrchestrator({
+	let orchestratorReply = "";
+	try {
+		orchestratorReply = await runOrchestrator({
 			caseDoc,
 			flags,
 			agentName,
 			triggerType,
-		}),
-	);
+		});
+	} catch (error) {
+		logSupportAi(
+			"orchestrator-failed",
+			{
+				caseId: normalizeString(caseId),
+				triggerType,
+				agentName,
+				...summarizeSupportAiError(error),
+			},
+			"error",
+		);
+		throw error;
+	}
+
+	const { replyText, shouldSuggestEndChat } =
+		extractReplyUiDirectives(orchestratorReply);
 	const replySegments = splitReplyIntoSegments(replyText, caseDoc, agentName);
+
+	logSupportAi("reply-prepared", {
+		caseId: normalizeString(caseId),
+		triggerType,
+		agentName,
+		shouldSuggestEndChat,
+		replySegmentCount: replySegments.length,
+		replyPreview: previewText(replyText, 240),
+	});
 
 	if (!replySegments.length) {
 		clearTypingRetry(caseId);
+		logSupportAi(
+			"respond-skipped",
+			{
+				caseId: normalizeString(caseId),
+				triggerType,
+				reason: "empty_reply",
+				branch: "orchestrator",
+			},
+			"warn",
+		);
 		return {
 			skipped: "empty_reply",
 		};
@@ -2659,7 +3163,9 @@ async function respondToSupportCase({
 module.exports = {
 	agentNames,
 	classifyConversationMessage,
+	getAiBlockReason,
 	isAiAllowed,
 	pickAgentName,
 	respondToSupportCase,
+	summarizeSupportAiError,
 };

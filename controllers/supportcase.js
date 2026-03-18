@@ -10,6 +10,7 @@ const {
 	classifyConversationMessage,
 	isAiAllowed,
 	respondToSupportCase,
+	summarizeSupportAiError,
 } = require("../services/supportChatOrchestrator");
 // Example email template function (Adjust as needed)
 const { newSupportCaseEmail } = require("./assets");
@@ -25,9 +26,35 @@ const orderStatusSMS = twilio(
 );
 
 function triggerAiResponseInBackground(caseId, triggerType) {
-	respondToSupportCase({ caseId, triggerType }).catch((error) => {
-		console.error("[support-ai-trigger] failed:", error.message);
+	console.log("[support-ai-trigger] started:", {
+		caseId,
+		triggerType,
 	});
+	respondToSupportCase({ caseId, triggerType })
+		.then((result) => {
+			if (result?.skipped) {
+				console.warn("[support-ai-trigger] skipped:", {
+					caseId,
+					triggerType,
+					reason: result.skipped,
+					sentSegments: result?.sentSegments || 0,
+				});
+				return;
+			}
+
+			console.log("[support-ai-trigger] completed:", {
+				caseId,
+				triggerType,
+				sentSegments: result?.sentSegments || 0,
+			});
+		})
+		.catch((error) => {
+			console.error("[support-ai-trigger] failed:", {
+				caseId,
+				triggerType,
+				...summarizeSupportAiError(error),
+			});
+		});
 }
 
 function getConversationDefaults(caseDoc) {
@@ -274,6 +301,16 @@ exports.updateSupportCase = async (req, res) => {
 
 		if (normalizedConversation) {
 			const senderType = classifyConversationMessage(normalizedConversation);
+			console.log("[support-case] normalized conversation:", {
+				caseId: req.params.id,
+				senderType,
+				messagePreview: `${normalizedConversation?.message || ""}`
+					.replace(/\s+/g, " ")
+					.trim()
+					.slice(0, 180),
+				caseStatus: currentCase.caseStatus,
+				caseAiEnabled: Boolean(currentCase.aiToRespond),
+			});
 			if (senderType === "staff") {
 				const flags = await WebsiteBasicSetup.findOne({}).lean();
 				if (isAiAllowed(flags, currentCase)) {
@@ -355,6 +392,15 @@ exports.updateSupportCase = async (req, res) => {
 			io?.emit("receiveMessage", updatedCase);
 
 			if (classifyConversationMessage(normalizedConversation) === "client") {
+				console.log("[support-case] triggering ai from client message:", {
+					caseId: updatedCase._id.toString(),
+					caseStatus: updatedCase.caseStatus,
+					caseAiEnabled: Boolean(updatedCase.aiToRespond),
+					messagePreview: `${normalizedConversation?.message || ""}`
+						.replace(/\s+/g, " ")
+						.trim()
+						.slice(0, 180),
+				});
 				triggerAiResponseInBackground(updatedCase._id.toString(), "client_message");
 			}
 		}
@@ -452,8 +498,22 @@ exports.createNewSupportCase = async (req, res) => {
 
 		// 1) Save to DB
 		await newCase.save();
+		console.log("[support-case] created:", {
+			caseId: newCase._id.toString(),
+			openedBy,
+			inquiryAbout,
+			inquiryDetailsPreview: `${inquiryDetails || ""}`
+				.replace(/\s+/g, " ")
+				.trim()
+				.slice(0, 180),
+			caseAiEnabled: Boolean(newCase.aiToRespond),
+		});
 
 		if (openedBy === "client") {
+			console.log("[support-case] triggering ai from new client case:", {
+				caseId: newCase._id.toString(),
+				triggerType: "case_opened",
+			});
 			triggerAiResponseInBackground(newCase._id.toString(), "case_opened");
 		}
 
@@ -557,6 +617,10 @@ exports.updateCaseAiResponder = async (req, res) => {
 		req.io?.emit("supportCaseUpdated", updatedCase?.toObject());
 
 		if (aiToRespond) {
+			console.log("[support-case] ai re-enabled for case:", {
+				caseId: id,
+				caseStatus: updatedCase?.caseStatus,
+			});
 			triggerAiResponseInBackground(id, "ai_reenabled");
 		}
 
