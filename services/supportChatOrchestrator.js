@@ -1041,6 +1041,39 @@ function customerRejectedOldTopicAnchoring(caseDoc = {}) {
   );
 }
 
+function customerHasServiceComplaintHistory(caseDoc = {}) {
+  const customerText = normalizeLower(
+    getConversationArray(caseDoc)
+      .filter((message) => classifyConversationMessage(message) === "client")
+      .map((message) => message?.message || "")
+      .join("\n"),
+  );
+
+  if (!customerText) return false;
+
+  return (
+    /\b(horrible|bad|poor|terrible)\s+customer\s+service\b/i.test(
+      customerText,
+    ) ||
+    /\b(poor|bad|weak|horrible)\s+reply\b/i.test(customerText) ||
+    /\b(didn'?t answer|never answered|never offered)\b/i.test(customerText) ||
+    /\b(horrible developer|who trained you|so bad)\b/i.test(customerText)
+  );
+}
+
+function latestTurnSeemsHostileOrSarcastic(caseDoc = {}) {
+  const latestText = normalizeLower(getLatestCustomerText(caseDoc));
+  if (!latestText) return false;
+
+  return (
+    /\b(stupid|horrible|so bad|awful|terrible|useless)\b/i.test(latestText) ||
+    /\bwho trained you\b/i.test(latestText) ||
+    /\bhorrible developer\b/i.test(latestText) ||
+    /\byou('?re| are)\s+.*ai\b/i.test(latestText) ||
+    /^\s*(wow|lol|lmao|sure|right)\s*[.!?]*\s*$/i.test(latestText)
+  );
+}
+
 function latestTurnIsBareGreetingAfterResolvedExchange(caseDoc = {}) {
   const latestText = getLatestCustomerText(caseDoc);
   if (!isGreetingOnlyMessage(latestText)) return false;
@@ -1134,7 +1167,40 @@ function isHumanHandoffRequest(value = "") {
     ) ||
     /\b(get|bring|have)\s+(me\s+)?(a|an)\s+(human|representative|rep|agent|csr)\b/i.test(
       normalized,
-    )
+    ) ||
+    /\b(someone|somebody|anyone)\s+else\b/i.test(normalized) ||
+    /\b(another|different)\s+(person|rep|representative|agent|csr|one)\b/i.test(
+      normalized,
+    ) ||
+    /\b(talk|speak|chat)\s+(to|with)\s+(someone|somebody|anyone)\s+else\b/i.test(
+      normalized,
+    ) ||
+    /\b(give|get|bring)\s+me\s+(another|someone else|somebody else|anyone else)\b/i.test(
+      normalized,
+    ) ||
+    /\b(take over|step in)\b/i.test(normalized)
+  );
+}
+
+function customerExplicitlyDeclinesHelp(value = "") {
+  const normalized = normalizeLower(value);
+  if (!normalized) return false;
+
+  return (
+    /\b(i do not|i don't|dont)\s+need\s+(your\s+)?help\b/i.test(normalized) ||
+    /\b(i do not|i don't|dont)\s+want\s+(your\s+)?help\b/i.test(normalized) ||
+    /\b(stop|quit)\s+(helping|asking)\b/i.test(normalized) ||
+    /\bleave it\b/i.test(normalized)
+  );
+}
+
+function isRhetoricalComplaintPrompt(value = "") {
+  const normalized = normalizeLower(value);
+  if (!normalized) return false;
+
+  return (
+    /\bwhat do you think i need\b/i.test(normalized) ||
+    /\bwhat do you think i want\b/i.test(normalized)
   );
 }
 
@@ -1145,6 +1211,21 @@ function buildHumanHandoffReply(caseDoc = {}) {
   }
 
   return "Of course. I'm getting a customer service rep into this chat now. Please give us a moment.";
+}
+
+function buildComplaintTrapReply(caseDoc = {}) {
+  const firstName = getFirstName(getCustomerName(caseDoc));
+  const intro = firstName ? `Fair point, ${firstName}.` : "Fair point.";
+  return `${intro} You needed a clearer answer from me. If you want to keep going, ask me anything directly and I'll answer straight.`;
+}
+
+function buildNoFurtherHelpReply(caseDoc = {}) {
+  const firstName = getFirstName(getCustomerName(caseDoc));
+  if (firstName) {
+    return `Understood, ${firstName}. I’ll pass that feedback along.`;
+  }
+
+  return "Understood. I’ll pass that feedback along.";
 }
 
 async function disableAiForCase(caseId = "") {
@@ -2745,9 +2826,15 @@ function buildSystemPrompt() {
     "If the customer asks only one thing, answer only that thing unless they ask for more.",
     "If the customer asks more than one direct thing in the same message, answer every part you can in the same reply instead of only answering the first part.",
     "If the customer asks a yes-or-no question plus a detail question, answer both parts together, for example availability plus colors or status plus price.",
+    "If the customer asks a category availability question like 'do you carry candles,' answer yes or no and immediately add the next most helpful detail or offer in the same reply instead of stopping at a bare yes or no.",
     "If latestPendingCustomerWindow shows several back-to-back customer messages, combine them into one unresolved thought before you answer. Do not treat a quick nudge like 'Michael?' as the real question.",
     "Before sending, make sure every direct question in the latest customer message has been addressed if the data is available.",
     "If the customer says you did not answer fully, apologize briefly and then give the missing answer right away in that same reply if you can verify it.",
+    "Do not assume short reactions like 'wow', 'lol', 'sure', or 'right' are positive. Read them in context because they may be sarcasm or frustration.",
+    "If the customer is sarcastic, mocking, or hostile, stay calm and brief. Address the underlying complaint or request instead of taking the wording literally.",
+    "Never psychoanalyze the customer and never tell them what they emotionally 'need.'",
+    "If the customer asks a rhetorical complaint question like 'what do you think I need,' answer the underlying complaint in a grounded way instead of replying literally.",
+    "If the customer says they do not need your help, do not ask another help-opening question. Acknowledge briefly and step back.",
     "Do not add extra size, price, shipping, stock, or policy details when the customer only asked about one attribute.",
     "The latest customer turn has priority over the earlier inquiry context.",
     "If the customer pivots to a different product, product type, occasion, or gift idea, switch context immediately and stop anchoring on the earlier item.",
@@ -2793,6 +2880,7 @@ function buildSystemPrompt() {
     "If they ask whether you are AI or human, good response patterns are like: 'I'm Sally with Serene Jannat support here in chat. I work alongside our team and can help right away. If you'd rather have a teammate step in, I can have them take over.'",
     "If the customer presses again on whether you are human, answer clearly that you are the virtual support assistant in chat and offer a human handoff instead of pretending to be human.",
     "If the customer explicitly asks for a human, a CSR, a representative, or a real person, treat that as a handoff request. Acknowledge it briefly and do not continue troubleshooting in the same reply.",
+    "If you have already told the customer you are getting a human teammate, do not keep chatting as if you still own the conversation.",
     "Use the assigned agent name naturally in first-person if helpful, but do not overuse it.",
   ].join("\n");
 }
@@ -2891,6 +2979,13 @@ function buildUserPrompt({ caseDoc, flags, agentName, triggerType }) {
         latestTurnLikelyChangesTopic: latestTurnLikelyChangesTopic(caseDoc),
         latestTurnIsBareGreetingAfterResolvedExchange:
           latestTurnIsBareGreetingAfterResolvedExchange(caseDoc),
+        latestTurnSeemsHostileOrSarcastic:
+          latestTurnSeemsHostileOrSarcastic(caseDoc),
+        latestTurnExplicitlyDeclinesHelp: customerExplicitlyDeclinesHelp(
+          getLatestCustomerText(caseDoc),
+        ),
+        customerHasServiceComplaintHistory:
+          customerHasServiceComplaintHistory(caseDoc),
         initialInquiryIsSeedContextOnly: true,
         customGiftCollectionUrl: buildCustomGiftCollectionUrl(),
         hasHumanStaffMessages: hasHumanStaffMessages(caseDoc),
@@ -3267,9 +3362,12 @@ async function emitTypingAndSend(
       referenceKind === "support_turn" ? getLatestSupportTurn(liveCase) : null;
     const referenceTurnIsStale =
       referenceKind === "pending_client"
-        ? !currentLatestClientTurn ||
-          !isSameTurn(currentLatestClientTurn, referenceTurn) ||
-          hasHumanStaffReplyAfter(liveCase, referenceTurn.index)
+        ? hasHumanStaffReplyAfter(liveCase, referenceTurn.index) ||
+          hasClientReplyAfter(liveCase, referenceTurn.index) ||
+          Boolean(
+            currentLatestClientTurn &&
+            !isSameTurn(currentLatestClientTurn, referenceTurn),
+          )
         : !currentLatestSupportTurn ||
           !isSameTurn(currentLatestSupportTurn, referenceTurn) ||
           hasClientReplyAfter(liveCase, referenceTurn.index);
@@ -3637,6 +3735,50 @@ async function respondToSupportCase({
     }
 
     return handoffResult;
+  }
+
+  if (
+    triggerType !== "idle_follow_up" &&
+    isRhetoricalComplaintPrompt(latestCustomerText)
+  ) {
+    const complaintTrapReply = sanitizeReplyText(
+      buildComplaintTrapReply(caseDoc),
+    );
+
+    return emitTypingAndSend(
+      caseDoc,
+      [complaintTrapReply],
+      agentName,
+      latestClientTurn,
+      {
+        firstReplyDelayRange,
+        triggerType,
+        referenceKind: "pending_client",
+        scheduleIdleFollowUp: false,
+      },
+    );
+  }
+
+  if (
+    triggerType !== "idle_follow_up" &&
+    customerExplicitlyDeclinesHelp(latestCustomerText)
+  ) {
+    const noFurtherHelpReply = sanitizeReplyText(
+      buildNoFurtherHelpReply(caseDoc),
+    );
+
+    return emitTypingAndSend(
+      caseDoc,
+      [noFurtherHelpReply],
+      agentName,
+      latestClientTurn,
+      {
+        firstReplyDelayRange,
+        triggerType,
+        referenceKind: "pending_client",
+        scheduleIdleFollowUp: false,
+      },
+    );
   }
 
   if (shouldClarifyFirstReply(caseDoc)) {
