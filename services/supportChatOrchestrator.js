@@ -27,9 +27,9 @@ const MAX_TOOL_ROUNDS = 6;
 const MAX_REPLY_SEGMENTS = 2;
 const REPLY_SEGMENT_MARKER = "[[send]]";
 const END_CHAT_SUGGESTION_MARKER = "[[suggest_end_chat]]";
-const TYPING_IDLE_MS = 1500;
-const TYPING_ABORT_MS = 2500;
-const TYPING_RETRY_DELAY_MS = TYPING_ABORT_MS + 350;
+const TYPING_IDLE_MS = 3500;
+const TYPING_ABORT_MS = 8000;
+const TYPING_RETRY_DELAY_MS = TYPING_ABORT_MS + 500;
 const MAX_TYPING_RETRIES = 2;
 const INTER_SEGMENT_PAUSE_MS = 450;
 const FIRST_REPLY_MIN_DELAY_MS = 5000;
@@ -39,6 +39,7 @@ const IDLE_FOLLOW_UP_MAX_DELAY_MS = 60000;
 const IDLE_FOLLOW_UP_RETRY_DELAY_MS = 8000;
 const MAX_IDLE_FOLLOW_UP_TYPING_RETRIES = 2;
 const NO_FOLLOW_UP_MARKER = "[[no_follow_up]]";
+const LIGHTWEIGHT_REPEAT_NUDGE_WINDOW_MS = 90000;
 const HAS_SUPPORT_AI_API_KEY = Boolean(
   `${process.env.CHATGPT_API_TOKEN || ""}`.trim(),
 );
@@ -1573,6 +1574,83 @@ function getLatestRelevantPendingClientTurn(caseDoc = {}) {
   }
 
   return pendingTurns[pendingTurns.length - 1] || null;
+}
+
+function getLatestClientTurnBeforeIndex(caseDoc = {}, beforeIndex = Infinity) {
+  const conversation = getConversationArray(caseDoc);
+  for (
+    let index = Math.min(beforeIndex, conversation.length) - 1;
+    index >= 0;
+    index -= 1
+  ) {
+    if (classifyConversationMessage(conversation[index]) !== "client") {
+      continue;
+    }
+
+    return {
+      index,
+      message: conversation[index],
+    };
+  }
+
+  return null;
+}
+
+function isOpenHelpPrompt(message = "") {
+  const normalized = normalizeLower(message).replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+
+  return [
+    /\bwhat can i help (?:you )?with(?: today)?\b/i,
+    /\bhow can i help(?: today)?\b/i,
+    /\bwhat would you like to know\b/i,
+    /\bwhat would you like me to check\b/i,
+    /\bwhat can i check for you\b/i,
+    /\bi'?m here(?: with you)?\b/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function getMessageTimestampMs(message = {}) {
+  const rawDate = message?.date;
+  const parsed = rawDate ? new Date(rawDate).getTime() : NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function shouldSkipRepeatedLightweightNudge(
+  caseDoc = {},
+  latestClientTurn = null,
+  latestSupportTurn = null,
+) {
+  if (!latestClientTurn || !latestSupportTurn) return false;
+
+  const latestClientText = latestClientTurn?.message?.message || "";
+  if (!isLightweightCustomerNudge(latestClientText)) {
+    return false;
+  }
+
+  if (!isOpenHelpPrompt(latestSupportTurn?.message?.message || "")) {
+    return false;
+  }
+
+  const latestSupportSentAtMs = getMessageTimestampMs(
+    latestSupportTurn?.message,
+  );
+  if (
+    latestSupportSentAtMs &&
+    Date.now() - latestSupportSentAtMs > LIGHTWEIGHT_REPEAT_NUDGE_WINDOW_MS
+  ) {
+    return false;
+  }
+
+  const previousClientTurn = getLatestClientTurnBeforeIndex(
+    caseDoc,
+    latestSupportTurn.index,
+  );
+  if (!previousClientTurn) {
+    return false;
+  }
+
+  return isLightweightCustomerNudge(previousClientTurn?.message?.message || "");
 }
 
 function hasHumanStaffMessages(caseDoc = {}) {
@@ -3448,6 +3526,31 @@ async function respondToSupportCase({
     });
     return {
       skipped: "client_typing",
+    };
+  }
+
+  if (
+    triggerType !== "idle_follow_up" &&
+    shouldSkipRepeatedLightweightNudge(
+      caseDoc,
+      latestClientTurn,
+      latestSupportTurn,
+    )
+  ) {
+    clearTypingRetry(caseId);
+    logSupportAi("respond-skipped", {
+      caseId: normalizeString(caseId),
+      triggerType,
+      reason: "duplicate_lightweight_nudge",
+      latestTurnIndex: latestClientTurn?.index ?? null,
+      latestTurnPreview: previewText(latestClientTurn?.message?.message || ""),
+      latestSupportTurnIndex: latestSupportTurn?.index ?? null,
+      latestSupportTurnPreview: previewText(
+        latestSupportTurn?.message?.message || "",
+      ),
+    });
+    return {
+      skipped: "duplicate_lightweight_nudge",
     };
   }
 
