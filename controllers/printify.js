@@ -2878,7 +2878,7 @@ async function generatePodListPreview({
 
 exports.publishPrintifyProducts = async (req, res) => {
 	try {
-		console.log("Fetching Shop ID from Printify...");
+		console.log("[publish-printify] Fetching shop ID from Printify.");
 
 		const DESIGN_PRINTIFY_TOKEN = process.env.DESIGN_PRINTIFY_TOKEN;
 
@@ -2897,7 +2897,7 @@ exports.publishPrintifyProducts = async (req, res) => {
 		}
 
 		const shopId = shopResponse.data[0].id; // Use the first shop ID
-		console.log(`âœ… Shop ID found: ${shopId}`);
+		console.log(`[publish-printify] Shop ID found: ${shopId}`);
 
 		// Fetch all products from the shop
 		const productsResponse = await axios.get(
@@ -2917,12 +2917,14 @@ exports.publishPrintifyProducts = async (req, res) => {
 
 		const printifyProducts = productsResponse.data.data;
 
-		console.log(`âœ… Total products retrieved: ${printifyProducts.length}`);
+		console.log(
+			`[publish-printify] Total products retrieved: ${printifyProducts.length}`,
+		);
 
 		// Log product visibility and lock status
 		printifyProducts.forEach((product) => {
 			console.log(
-				`ðŸ”¹ Product: ${product.title}, Visible: ${product.visible}, Locked: ${product.is_locked}, ID: ${product.id}`,
+				`[publish-printify] Product status | title=${product.title} | visible=${product.visible} | locked=${product.is_locked} | id=${product.id}`,
 			);
 		});
 
@@ -2932,11 +2934,13 @@ exports.publishPrintifyProducts = async (req, res) => {
 			.map((product) => product.id);
 
 		if (productsToPublish.length === 0) {
-			console.log("ðŸš€ No products need publishing.");
+			console.log("[publish-printify] No products need publishing.");
 			return res.json({ message: "No products need publishing." });
 		}
 
-		console.log(`ðŸ“Œ Publishing ${productsToPublish.length} products...`);
+		console.log(
+			`[publish-printify] Publishing ${productsToPublish.length} products.`,
+		);
 
 		// Function to publish each product
 		const publishResults = await Promise.all(
@@ -2959,11 +2963,13 @@ exports.publishPrintifyProducts = async (req, res) => {
 							},
 						},
 					);
-					console.log(`âœ… Successfully published product: ${productId}`);
+					console.log(
+						`[publish-printify] Successfully published product: ${productId}`,
+					);
 					return { productId, status: "Published Successfully" };
 				} catch (error) {
 					console.error(
-						`âŒ Error publishing product ${productId}:`,
+						`[publish-printify] Error publishing product ${productId}:`,
 						error.response?.data || error.message,
 					);
 					return {
@@ -2987,7 +2993,7 @@ exports.publishPrintifyProducts = async (req, res) => {
 		});
 	} catch (error) {
 		console.error(
-			"âŒ Error publishing Printify products:",
+			"[publish-printify] Error publishing Printify products:",
 			error.response?.data || error.message,
 		);
 		res.status(500).json({ error: "Failed to publish Printify products" });
@@ -2996,7 +3002,7 @@ exports.publishPrintifyProducts = async (req, res) => {
 
 exports.forceRepublishPrintifyProducts = async (req, res) => {
 	try {
-		console.log("Fetching Shop ID from Printify...");
+		console.log("[force-republish-printify] Fetching shop ID from Printify.");
 
 		const DESIGN_PRINTIFY_TOKEN = process.env.DESIGN_PRINTIFY_TOKEN;
 
@@ -3015,7 +3021,7 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 		}
 
 		const shopId = shopResponse.data[0].id; // Use the first shop ID
-		console.log(`âœ… Shop ID found: ${shopId}`);
+		console.log(`[force-republish-printify] Shop ID found: ${shopId}`);
 
 		// Fetch all products
 		const productsResponse = await axios.get(
@@ -3035,7 +3041,9 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 
 		const printifyProducts = productsResponse.data.data;
 
-		console.log(`âœ… Total products retrieved: ${printifyProducts.length}`);
+		console.log(
+			`[force-republish-printify] Total products retrieved: ${printifyProducts.length}`,
+		);
 
 		// Force republish all products by adding a random tag & republishing
 		const republishResults = await Promise.all(
@@ -3054,7 +3062,9 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 						},
 					);
 
-					console.log(`ðŸ”„ Updated product ${product.id} with new tag`);
+					console.log(
+						`[force-republish-printify] Updated product ${product.id} with republish tag`,
+					);
 
 					// Now attempt to publish it
 					await axios.post(
@@ -3075,11 +3085,13 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 						},
 					);
 
-					console.log(`âœ… Successfully republished product: ${product.id}`);
+					console.log(
+						`[force-republish-printify] Successfully republished product: ${product.id}`,
+					);
 					return { productId: product.id, status: "Republished Successfully" };
 				} catch (error) {
 					console.error(
-						`âŒ Error republishing product ${product.id}:`,
+						`[force-republish-printify] Error republishing product ${product.id}:`,
 						error.response?.data || error.message,
 					);
 					return {
@@ -3103,7 +3115,7 @@ exports.forceRepublishPrintifyProducts = async (req, res) => {
 		});
 	} catch (error) {
 		console.error(
-			"âŒ Error republishing Printify products:",
+			"[force-republish-printify] Error republishing Printify products:",
 			error.response?.data || error.message,
 		);
 		res.status(500).json({ error: "Failed to republish Printify products" });
@@ -3616,8 +3628,9 @@ async function generatePodDefaultDesignEntriesForSync({
 		),
 	];
 
+	const hasScopedExistingEntries = Array.isArray(existingDefaultDesignEntries);
 	const existingEntries = clonePodDefaultDesignEntries(
-		existingDefaultDesignEntries?.length
+		hasScopedExistingEntries
 			? existingDefaultDesignEntries
 			: collectPodDefaultDesignEntriesFromProduct(existingProductDoc || {}),
 	);
@@ -3799,12 +3812,18 @@ exports.syncPrintifyProducts = async (req, res) => {
 					.filter(Boolean),
 			),
 		];
+		console.log(
+			`[sync-printify] Starting sync. generateDefaultDesigns=${shouldGenerateDefaultDesigns} forceRegenerateDefaultDesigns=${forceRegenerateDefaultDesigns} occasionCount=${defaultDesignOccasions.length}`,
+		);
 
 		//-------------------------------------------------------------------
 		// 1. FETCH CATEGORIES / SUBCATEGORIES
 		//-------------------------------------------------------------------
 		const categories = await Category.find().sort({ createdAt: -1 });
 		const subcategories = await Subcategory.find();
+		console.log(
+			`[sync-printify] Loaded category data. categories=${categories.length} subcategories=${subcategories.length}`,
+		);
 
 		//-------------------------------------------------------------------
 		// 2. HELPER: FETCH SHOP + PRODUCTS for the DESIGN token
@@ -3817,22 +3836,22 @@ exports.syncPrintifyProducts = async (req, res) => {
 				},
 			);
 			if (!shopRes.data?.length) {
-				console.log(`âš ï¸ [${tokenName}] No shops found.`);
+				console.log(`[${tokenName}] No shops found.`);
 				return [];
 			}
 			const shopId = shopRes.data[0].id;
-			console.log(`âœ… [${tokenName}] Shop ID found: ${shopId}`);
+			console.log(`[${tokenName}] Shop ID found: ${shopId}`);
 
 			const productsRes = await axios.get(
 				`https://api.printify.com/v1/shops/${shopId}/products.json`,
 				{ headers: { Authorization: `Bearer ${token}` } },
 			);
 			if (!productsRes.data?.data?.length) {
-				console.log(`âš ï¸ [${tokenName}] No products found in shop ${shopId}`);
+				console.log(`[${tokenName}] No products found in shop ${shopId}`);
 				return [];
 			}
 			console.log(
-				`ðŸ”¹ [${tokenName}] Fetched ${productsRes.data.data.length} products`,
+				`[${tokenName}] Fetched ${productsRes.data.data.length} products`,
 			);
 
 			// Attach the shopId so we know which shop to update
@@ -3842,7 +3861,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 		//-------------------------------------------------------------------
 		// 3. FETCH PRODUCTS ONLY FROM DESIGN TOKEN
 		//-------------------------------------------------------------------
-		console.log("ðŸš€ Fetching products from Design token only...");
+		console.log(
+			"[sync-printify] Fetching products from the design token only.",
+		);
 		const designProducts = await fetchDesignProducts("DESIGN", DESIGN_TOKEN);
 		if (!designProducts.length) {
 			return res
@@ -3850,6 +3871,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 				.json({ error: "No products found from the Printify design shop" });
 		}
 		const combinedProducts = designProducts;
+		console.log(
+			`[sync-printify] Ready to process ${combinedProducts.length} Printify products.`,
+		);
 
 		//-------------------------------------------------------------------
 		// 4. IMAGE UPLOAD HELPER (LIMIT TO 3)
@@ -3903,7 +3927,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 		async function handleProductSync(productData, variantSKU, printifyProduct) {
 			if (!variantSKU) {
 				console.warn(
-					`âŒ Variant SKU is missing for product: ${printifyProduct.title}`,
+					`[sync-printify] Variant SKU is missing for product: ${printifyProduct.title}`,
 				);
 				return;
 			}
@@ -3942,14 +3966,18 @@ exports.syncPrintifyProducts = async (req, res) => {
 				}
 
 				await existingProduct.save();
-				console.log(`â†º Updated product in Mongo: ${productData.productName}`);
+				console.log(
+					`[sync-printify] Updated product in Mongo: ${productData.productName}`,
+				);
 			} else {
 				const newProduct = new Product({
 					productSKU: variantSKU,
 					...productData,
 				});
 				await newProduct.save();
-				console.log(`âž• Added product in Mongo: ${productData.productName}`);
+				console.log(
+					`[sync-printify] Added product in Mongo: ${productData.productName}`,
+				);
 			}
 
 			// B) Set product to "Draft" in Printify
@@ -3984,7 +4012,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				);
 
 				console.log(
-					`✅ Set product ${printifyProduct.id} to draft (visible=false).`,
+					`[sync-printify] Set product ${printifyProduct.id} to draft (visible=false).`,
 				);
 			} catch (draftError) {
 				if (draftError?.response?.data?.code === 8251) {
@@ -4003,19 +4031,19 @@ exports.syncPrintifyProducts = async (req, res) => {
 							},
 						);
 						console.warn(
-							`⚠️ Set product ${printifyProduct.id} to draft after 8251 fallback (without variants payload).`,
+							`[sync-printify] Set product ${printifyProduct.id} to draft after 8251 fallback without variants payload.`,
 						);
 						return;
 					} catch (retryDraftError) {
 						console.error(
-							`Error setting product ${printifyProduct.id} to draft after fallback:`,
+							`[sync-printify] Error setting product ${printifyProduct.id} to draft after fallback:`,
 							retryDraftError.response?.data || retryDraftError.message,
 						);
 						return;
 					}
 				}
 				console.error(
-					`Error setting product ${printifyProduct.id} to draft:`,
+					`[sync-printify] Error setting product ${printifyProduct.id} to draft:`,
 					draftError.response?.data || draftError.message,
 				);
 			}
@@ -4036,9 +4064,12 @@ exports.syncPrintifyProducts = async (req, res) => {
 			productsFailed: 0,
 		};
 
-		for (const printifyProduct of combinedProducts) {
+		for (const [productIndex, printifyProduct] of combinedProducts.entries()) {
 			// Determine if product is in the POD list
 			const isPOD = productIdsWithPOD.includes(printifyProduct.id);
+			console.log(
+				`[sync-printify] Processing product ${productIndex + 1}/${combinedProducts.length}: ${printifyProduct.title} | id=${printifyProduct.id} | pod=${isPOD}`,
+			);
 
 			// If product is POD => fixed category, else auto-match by tags
 			let matchingCategory = null;
@@ -4065,7 +4096,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 
 			if (!matchingCategory && !isPOD) {
 				failedProducts.push(printifyProduct.title);
-				console.warn(`âŒ Skipped non-POD product: ${printifyProduct.title}`);
+				console.warn(
+					`[sync-printify] Skipped non-POD product with no category match: ${printifyProduct.title}`,
+				);
 				continue;
 			}
 
@@ -4089,9 +4122,14 @@ exports.syncPrintifyProducts = async (req, res) => {
 			);
 			if (!enabledVariants.length) {
 				failedProducts.push(printifyProduct.title);
-				console.warn(`âŒ No enabled variants for ${printifyProduct.title}`);
+				console.warn(
+					`[sync-printify] No enabled variants found for ${printifyProduct.title}`,
+				);
 				continue;
 			}
+			console.log(
+				`[sync-printify] Enabled variants for ${printifyProduct.title}: ${enabledVariants.length}`,
+			);
 
 			// Build an optionValueMap => { valueId: { type, title, colors? } }
 			const optionValueMap = buildPrintifyOptionValueMap(
@@ -4141,6 +4179,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 			);
 			const representativeGalleryVariant =
 				distinctColorVariants[0] || enabledVariants[0];
+			console.log(
+				`[sync-printify] Distinct visual color variants for ${printifyProduct.title}: ${distinctColorVariants.length || 1}`,
+			);
 
 			//-------------------------------------------------------------------
 			// Upload up to 3 ranked images for the top-level
@@ -4163,6 +4204,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 					.filter((image) => image?.url || image?.src)
 					.slice(0, 3);
 			}
+			console.log(
+				`[sync-printify] Top-level gallery images prepared for ${printifyProduct.title}: requested=${topLevelVariantImages.length} uploaded=${validUploadedImages.length}`,
+			);
 
 			//-------------------------------------------------------------------
 			// Build productData (Mongo fields)
@@ -4282,6 +4326,12 @@ exports.syncPrintifyProducts = async (req, res) => {
 			productData.productAttributes = attributeMetas.map(
 				(entry) => entry.attribute,
 			);
+			const attributesWithImages = attributeMetas.filter(
+				(entry) => Number(entry?.attribute?.productImages?.length || 0) > 0,
+			).length;
+			console.log(
+				`[sync-printify] Variant image upload complete for ${printifyProduct.title}: attributes=${attributeMetas.length} attributesWithImages=${attributesWithImages}`,
+			);
 
 			//-------------------------------------------------------------------
 			// 8. If product has multiple colors => ephemeral per color
@@ -4315,7 +4365,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				}
 			} catch (ephemeralErr) {
 				console.error(
-					"âš ï¸ Failed ephemeral product for example design:",
+					"[sync-printify] Failed generating example-design preview images:",
 					ephemeralErr.message,
 				);
 			}
@@ -4364,6 +4414,14 @@ exports.syncPrintifyProducts = async (req, res) => {
 					}
 				}
 			}
+			const exampleDesignCount = productData.productAttributes.filter((attr) =>
+				Boolean(
+					attr?.exampleDesignImage?.url || attr?.exampleDesignImage?.public_id,
+				),
+			).length;
+			console.log(
+				`[sync-printify] Example design images assigned for ${printifyProduct.title}: ${exampleDesignCount}/${productData.productAttributes.length}`,
+			);
 
 			//-------------------------------------------------------------------
 			// 10. Build persisted defaultDesigns (3 images per occasion, no-name)
@@ -4388,6 +4446,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 				let generatedVisualGroups = 0;
 				let reusedVisualGroups = 0;
 				try {
+					console.log(
+						`[sync-printify] Building default designs for ${printifyProduct.title}: visualGroups=${new Set(attributeMetas.map((item) => item.visualGroupKey || "default")).size}`,
+					);
 					for (const attributeMeta of attributeMetas) {
 						const visualGroupKey = attributeMeta.visualGroupKey || "default";
 						if (defaultDesignsByVisualGroup.has(visualGroupKey)) {
@@ -4411,6 +4472,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 						defaultDesignsByVisualGroup.set(
 							visualGroupKey,
 							defaultDesignSync.entries,
+						);
+						console.log(
+							`[sync-printify] Default design sync for ${printifyProduct.title} group=${visualGroupKey}: generated=${defaultDesignSync.generatedCount} reused=${defaultDesignSync.reusedCount} entries=${defaultDesignSync.entries.length}`,
 						);
 						if (defaultDesignSync.generatedCount > 0) {
 							generatedVisualGroups += 1;
@@ -4453,7 +4517,7 @@ exports.syncPrintifyProducts = async (req, res) => {
 				} catch (defaultDesignSyncError) {
 					defaultDesignSyncStats.productsFailed += 1;
 					console.warn(
-						`âš ï¸ Failed generating persisted default designs for ${printifyProduct.title}`,
+						`[sync-printify] Failed generating persisted default designs for ${printifyProduct.title}`,
 						{
 							productId: printifyProduct.id,
 							status: defaultDesignSyncError?.response?.status || null,
@@ -4490,6 +4554,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 			//-------------------------------------------------------------------
 			await handleProductSync(productData, firstVariantSKU, printifyProduct);
 			processedProducts.push(printifyProduct.id);
+			console.log(
+				`[sync-printify] Finished product ${productIndex + 1}/${combinedProducts.length}: ${printifyProduct.title}`,
+			);
 		}
 
 		//-------------------------------------------------------------------
@@ -4501,6 +4568,9 @@ exports.syncPrintifyProducts = async (req, res) => {
 		}));
 
 		if (failedProducts.length > 0) {
+			console.log(
+				`[sync-printify] Sync finished with partial failures. processed=${processedProducts.length} failed=${failedProducts.length}`,
+			);
 			res.status(207).json({
 				message: `Products synced with some failures. ${processedProducts.length} products processed, ${failedProducts.length} products failed.`,
 				failedProducts,
@@ -4508,20 +4578,23 @@ exports.syncPrintifyProducts = async (req, res) => {
 				defaultDesignSync: defaultDesignSyncStats,
 			});
 		} else {
+			console.log(
+				`[sync-printify] Sync finished successfully. processed=${processedProducts.length}`,
+			);
 			res.json({
 				message: `All Printify products synced successfully. ${processedProducts.length} products processed.`,
 				defaultDesignSync: defaultDesignSyncStats,
 			});
 		}
 	} catch (error) {
-		console.error("âŒ Error syncing products:", error);
+		console.error("[sync-printify] Error syncing products:", error);
 		res.status(500).json({ error: "Error syncing products" });
 	}
 };
 
 exports.getSpecificPrintifyProducts = async (req, res) => {
 	try {
-		console.log("Fetching all products from Printify...");
+		console.log("[get-specific-printify] Fetching all products from Printify.");
 
 		const DESIGN_PRINTIFY_TOKEN = process.env.DESIGN_PRINTIFY_TOKEN;
 		if (!DESIGN_PRINTIFY_TOKEN) {
@@ -4545,7 +4618,7 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 		}
 
 		const shopId = shopResponse.data[0].id;
-		console.log(`âœ… Shop ID found: ${shopId}`);
+		console.log(`[get-specific-printify] Shop ID found: ${shopId}`);
 
 		// 2. Fetch ALL products from the shop
 		const productsResponse = await axios.get(
@@ -4564,7 +4637,9 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 		}
 
 		let allProducts = productsResponse.data.data;
-		console.log(`âœ… Total products retrieved: ${allProducts.length}`);
+		console.log(
+			`[get-specific-printify] Total products retrieved: ${allProducts.length}`,
+		);
 
 		// 3. Optional: If ?productIds=xyz,abc is provided, filter
 		const republishedProductIds = req.query.productIds
@@ -4579,7 +4654,9 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 			allProducts = allProducts.filter((product) =>
 				republishedProductIds.includes(product.id),
 			);
-			console.log(`âœ… Filtered products count: ${allProducts.length}`);
+			console.log(
+				`[get-specific-printify] Filtered products count: ${allProducts.length}`,
+			);
 		}
 
 		// 4. Map them to a simplified structure (optional)
@@ -4610,7 +4687,7 @@ exports.getSpecificPrintifyProducts = async (req, res) => {
 		});
 	} catch (error) {
 		console.error(
-			"âŒ Error fetching Printify products:",
+			"[get-specific-printify] Error fetching Printify products:",
 			error.response?.data || error.message,
 		);
 		res.status(500).json({ error: "Failed to fetch Printify products" });
