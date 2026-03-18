@@ -1170,6 +1170,54 @@ function normalizeReferenceToken(value = "") {
   return normalizeString(value).replace(/^#/, "").toLowerCase();
 }
 
+function looksLikeSpecificProductReference(value = "") {
+  const normalized = normalizeString(value);
+  const tokens = extractSearchTokens(normalized);
+
+  if (!normalized) return false;
+
+  return (
+    tokens.length >= 3 ||
+    normalized.length >= 16 ||
+    (tokens.length >= 2 && /\d/.test(normalized))
+  );
+}
+
+function shouldTrustClarifierMatch(query = "", matchedName = "") {
+  const normalizedQuery = normalizeLower(query);
+  const normalizedMatch = normalizeLower(matchedName);
+  if (!normalizedQuery || !normalizedMatch) return false;
+
+  if (normalizedQuery === normalizedMatch) {
+    return true;
+  }
+
+  const queryTokens = extractSearchTokens(query);
+  const matchTokens = extractSearchTokens(matchedName);
+  if (!queryTokens.length || !matchTokens.length) {
+    return false;
+  }
+
+  const overlappingTokens = queryTokens.filter((token) =>
+    matchTokens.includes(token),
+  );
+  const queryLooksFragmentary =
+    queryTokens.length <= 2 || normalizeString(query).length <= 12;
+
+  if (
+    queryLooksFragmentary &&
+    overlappingTokens.length === queryTokens.length
+  ) {
+    return true;
+  }
+
+  if (queryLooksFragmentary && normalizedMatch.includes(normalizedQuery)) {
+    return true;
+  }
+
+  return false;
+}
+
 function shouldClarifyFirstReply(caseDoc = {}) {
   if (!isFirstSupportReply(caseDoc)) return false;
   if (normalizeLower(caseDoc?.openedBy) !== "client") return false;
@@ -1290,6 +1338,10 @@ async function buildProductIntentClarifierReply(caseDoc = {}, agentName = "") {
     return `${greeting} I'd be happy to help with a product. Which item are you asking about?`;
   }
 
+  if (looksLikeSpecificProductReference(productText)) {
+    return `${greeting} Just to make sure I'm looking at the right item, are you asking about ${productText}? If so, what can I help you with?`;
+  }
+
   const lookup = await toolFindProducts({
     query: productText,
     limit: 3,
@@ -1300,12 +1352,17 @@ async function buildProductIntentClarifierReply(caseDoc = {}, agentName = "") {
   }
 
   const [firstMatch, secondMatch] = lookup.products || [];
+  const displayName =
+    firstMatch && shouldTrustClarifierMatch(productText, firstMatch.name)
+      ? firstMatch.name
+      : productText;
+
   if (firstMatch && !secondMatch) {
-    return `${greeting} Just to make sure I'm looking at the right item, are you asking about ${firstMatch.name}? If so, what can I help you with?`;
+    return `${greeting} Just to make sure I'm looking at the right item, are you asking about ${displayName}? If so, what can I help you with?`;
   }
 
   if (firstMatch) {
-    return `${greeting} I want to make sure I'm looking at the right product. Are you asking about ${firstMatch.name}, or something else?`;
+    return `${greeting} I want to make sure I'm looking at the right product. Are you asking about ${displayName}, or something else?`;
   }
 
   return `${greeting} What can I help you with on that product today?`;
