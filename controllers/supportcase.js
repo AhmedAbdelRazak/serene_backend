@@ -1,19 +1,189 @@
 const mongoose = require("mongoose");
-const ObjectId = mongoose.Types.ObjectId;
 const sgMail = require("@sendgrid/mail");
 const twilio = require("twilio");
 // Import Models
 const SupportCase = require("../models/supportcase");
 const StoreManagement = require("../models/storeManagement");
 const User = require("../models/user");
-const axios = require("axios");
+const WebsiteBasicSetup = require("../models/website");
+const {
+	classifyConversationMessage,
+	isAiAllowed,
+	respondToSupportCase,
+} = require("../services/supportChatOrchestrator");
 // Example email template function (Adjust as needed)
 const { newSupportCaseEmail } = require("./assets");
+
+const SUPPORT_CASE_INACTIVITY_CLOSE_MS =
+	Number(process.env.SUPPORT_CASE_INACTIVITY_CLOSE_MS) > 0
+		? Number(process.env.SUPPORT_CASE_INACTIVITY_CLOSE_MS)
+		: 10 * 60 * 1000;
 
 const orderStatusSMS = twilio(
 	process.env.TWILIO_ACCOUNT_SID,
 	process.env.TWILIO_AUTH_TOKEN
 );
+
+function triggerAiResponseInBackground(caseId, triggerType) {
+	respondToSupportCase({ caseId, triggerType }).catch((error) => {
+		console.error("[support-ai-trigger] failed:", error.message);
+	});
+}
+
+function getConversationDefaults(caseDoc) {
+	const rootMessage = caseDoc?.conversation?.[0] || {};
+	return {
+		inquiryAbout: rootMessage.inquiryAbout || "other",
+		inquiryDetails: rootMessage.inquiryDetails || "",
+	};
+}
+
+function normalizeConversationEntry(conversation, caseDoc) {
+	if (!conversation || typeof conversation !== "object") {
+		return conversation;
+	}
+
+	const defaults = getConversationDefaults(caseDoc);
+	const normalizedInquiryAbout = conversation.inquiryAbout || defaults.inquiryAbout;
+	const hasInquiryDetails = Object.prototype.hasOwnProperty.call(
+		conversation,
+		"inquiryDetails"
+	);
+
+	return {
+		...conversation,
+		inquiryAbout: normalizedInquiryAbout,
+		inquiryDetails: hasInquiryDetails
+			? conversation.inquiryDetails
+			: defaults.inquiryDetails,
+	};
+}
+
+function getIoFromRequest(req) {
+	return req?.io || req?.app?.get?.("io") || global.io || null;
+}
+
+function getSupportCaseLastActivityAt(caseDoc = {}) {
+	const messageDates = Array.isArray(caseDoc?.conversation)
+		? caseDoc.conversation
+				.map((entry) => new Date(entry?.date || 0))
+				.filter((date) => Number.isFinite(date.getTime()))
+		: [];
+
+	if (messageDates.length) {
+		return new Date(
+			Math.max(...messageDates.map((date) => date.getTime()))
+		);
+	}
+
+	const createdAt = new Date(caseDoc?.createdAt || 0);
+	return Number.isFinite(createdAt.getTime()) ? createdAt : null;
+}
+
+async function loadSupportCaseForRealtime(caseId) {
+	return SupportCase.findById(caseId)
+		.populate("supporterId")
+		.populate({ path: "storeId", select: "belongsTo addStoreName" })
+		.exec();
+}
+
+function buildRealtimeCasePayload(supportCase) {
+	if (!supportCase) return null;
+
+	const plainCase =
+		typeof supportCase.toObject === "function"
+			? supportCase.toObject()
+			: supportCase;
+	const targetSellerId =
+		plainCase?.storeId?.belongsTo?.toString?.() ||
+		plainCase?.storeId?.belongsTo ||
+		null;
+
+	return {
+		...plainCase,
+		targetSellerId,
+	};
+}
+
+async function closeSupportCaseAndBroadcast(
+	caseId,
+	{ closedBy = null, rating, additionalSetFields = {}, io = null } = {}
+) {
+	if (!mongoose.Types.ObjectId.isValid(caseId)) {
+		return null;
+	}
+
+	const setFields = {
+		caseStatus: "closed",
+		aiToRespond: false,
+		"conversation.$[].seenByAdmin": true,
+		"conversation.$[].seenBySeller": true,
+		"conversation.$[].seenByClient": true,
+		...additionalSetFields,
+	};
+
+	if (closedBy !== undefined) {
+		setFields.closedBy = closedBy;
+	}
+
+	if (rating !== undefined) {
+		setFields.rating = rating;
+	}
+
+	const result = await SupportCase.updateOne(
+		{
+			_id: new mongoose.Types.ObjectId(caseId),
+			caseStatus: "open",
+		},
+		{
+			$set: setFields,
+		}
+	);
+
+	if (result.matchedCount === 0) {
+		return null;
+	}
+
+	const updatedCase = await loadSupportCaseForRealtime(caseId);
+	if (!updatedCase) {
+		return null;
+	}
+
+	const realtimePayload = buildRealtimeCasePayload(updatedCase);
+	if (io && realtimePayload) {
+		io.emit("supportCaseUpdated", realtimePayload);
+		io.emit("closeCase", {
+			case: realtimePayload,
+			closedBy,
+		});
+	}
+
+	return updatedCase;
+}
+
+async function canStaffManageCase(caseDoc, profile) {
+	if (!caseDoc || !profile) return false;
+	if (profile.role === 1) return true;
+
+	if (profile.role === 2000 || profile.role === 3000 || profile.role === 7000) {
+		if (
+			caseDoc.supporterId &&
+			caseDoc.supporterId.toString() === profile._id.toString()
+		) {
+			return true;
+		}
+
+		if (!caseDoc.storeId) return false;
+
+		const ownsStore = await StoreManagement.exists({
+			_id: caseDoc.storeId?._id || caseDoc.storeId,
+			belongsTo: profile._id,
+		});
+		return Boolean(ownsStore);
+	}
+
+	return false;
+}
 
 exports.getSupportCases = async (req, res) => {
 	try {
@@ -60,7 +230,7 @@ exports.getSupportCaseById = async (req, res) => {
 		}
 
 		// Restrict if seller
-		if (req.user.role === "Seller") {
+		if (req.user?.role === "Seller") {
 			if (
 				!supportCase.supporterId ||
 				supportCase.supporterId.toString() !== req.user._id.toString()
@@ -91,18 +261,49 @@ exports.updateSupportCase = async (req, res) => {
 			storeId,
 		} = req.body;
 
+		const currentCase = await SupportCase.findById(req.params.id);
+		if (!currentCase) {
+			return res.status(404).json({ error: "Support case not found" });
+		}
+
+		const io = getIoFromRequest(req);
+
+		const normalizedConversation = conversation
+			? normalizeConversationEntry(conversation, currentCase)
+			: null;
+
+		if (normalizedConversation) {
+			const senderType = classifyConversationMessage(normalizedConversation);
+			if (senderType === "staff") {
+				const flags = await WebsiteBasicSetup.findOne({}).lean();
+				if (isAiAllowed(flags, currentCase)) {
+					return res.status(409).json({
+						error:
+							"AI replies are currently enabled for this chat. Turn AI replies off for this case before sending a manual response.",
+					});
+				}
+			}
+		}
+
 		const updateFields = {};
 
-		// Only update the fields that exist in req.body
 		if (supporterId) updateFields.supporterId = supporterId;
 		if (caseStatus) updateFields.caseStatus = caseStatus;
-		if (conversation) {
-			updateFields.$push = { conversation: conversation };
+		if (normalizedConversation) {
+			updateFields.$push = { conversation: normalizedConversation };
 		}
-		if (closedBy) updateFields.closedBy = closedBy;
-		if (rating) updateFields.rating = rating;
-		if (supporterName) updateFields.supporterName = supporterName;
-		if (storeId) updateFields.storeId = storeId;
+		if (Object.prototype.hasOwnProperty.call(req.body, "closedBy")) {
+			updateFields.closedBy = closedBy;
+		}
+		if (Object.prototype.hasOwnProperty.call(req.body, "rating")) {
+			updateFields.rating = rating;
+		}
+		if (Object.prototype.hasOwnProperty.call(req.body, "supporterName")) {
+			updateFields.supporterName = supporterName;
+		}
+		if (Object.prototype.hasOwnProperty.call(req.body, "storeId")) {
+			updateFields.storeId = storeId;
+		}
 
 		if (Object.keys(updateFields).length === 0) {
 			return res
@@ -110,88 +311,54 @@ exports.updateSupportCase = async (req, res) => {
 				.json({ error: "No valid fields provided for update" });
 		}
 
-		// 1) Update the support case (main fields)
+		if (caseStatus === "closed") {
+			const additionalSetFields = {};
+			if (supporterId) additionalSetFields.supporterId = supporterId;
+			if (Object.prototype.hasOwnProperty.call(req.body, "supporterName")) {
+				additionalSetFields.supporterName = supporterName;
+			}
+			if (Object.prototype.hasOwnProperty.call(req.body, "storeId")) {
+				additionalSetFields.storeId = storeId;
+			}
+
+			const closedCase = await closeSupportCaseAndBroadcast(req.params.id, {
+				closedBy,
+				rating:
+					Object.prototype.hasOwnProperty.call(req.body, "rating")
+						? rating
+						: undefined,
+				additionalSetFields,
+				io,
+			});
+
+			if (closedCase) {
+				return res.status(200).json(closedCase);
+			}
+
+			const existingCase = await loadSupportCaseForRealtime(req.params.id);
+			if (existingCase?.caseStatus === "closed") {
+				return res.status(200).json(existingCase);
+			}
+
+			return res
+				.status(404)
+				.json({ error: "Support case not found or already closed" });
+		}
+
 		const updatedCase = await SupportCase.findByIdAndUpdate(
 			req.params.id,
 			updateFields,
 			{ new: true }
 		);
-		if (!updatedCase) {
-			return res.status(404).json({ error: "Support case not found" });
-		}
 
-		// 2) If the case is being closed => mark all messages as seen
-		if (caseStatus === "closed") {
-			// Mark all messages as seen by Admin & Seller
-			await SupportCase.updateOne(
-				{ _id: updatedCase._id },
-				{
-					$set: {
-						"conversation.$[].seenByAdmin": true,
-						"conversation.$[].seenBySeller": true,
-					},
-				}
-			);
+		if (normalizedConversation) {
+			io?.emit("receiveMessage", updatedCase);
 
-			// Now re-fetch with population to emit the final closed event
-			const populatedClosedCase = await SupportCase.findById(updatedCase._id)
-				.populate({ path: "storeId", select: "belongsTo" })
-				.exec();
-
-			// Build the payload
-			const belongsTo =
-				populatedClosedCase?.storeId?.belongsTo?.toString() || null;
-			const eventPayload = {
-				case: {
-					...populatedClosedCase.toObject(),
-					targetSellerId: belongsTo,
-				},
-				closedBy,
-			};
-
-			// Emit to everyone; correct seller + super admin handle it
-			req.io.emit("closeCase", eventPayload);
-
-			return res.status(200).json(populatedClosedCase);
-		}
-
-		// 3) If only a new message was added, broadcast it
-		if (conversation) {
-			req.io.emit("receiveMessage", updatedCase);
-		}
-
-		/* ------------------------------------------------------------------
-       4) ── AI‑agent auto‑trigger
-       ------------------------------------------------------------------
-       Conditions:
-         • this update contains a conversation push           (already checked)
-         • the message is from the CLIENT, not from admin/AI
-    ------------------------------------------------------------------ */
-		if (conversation) {
-			const { customerEmail } = conversation.messageBy || {};
-
-			// Ignore agent/self messages (agent uses support@serenejannat.com)
-			if (
-				customerEmail &&
-				customerEmail !== "support@serenejannat.com" &&
-				customerEmail !== "admin@serenejannat.com"
-			) {
-				try {
-					console.log(
-						"[AI‑trigger] Calling AI for case",
-						updatedCase._id.toString()
-					);
-					await axios.post(
-						`${process.env.SERVER_URL}/api/aiagent/respond/${updatedCase._id}`,
-						{ newClientMessage: conversation.message }
-					);
-				} catch (aiErr) {
-					console.error("[AI‑trigger] Error calling AI:", aiErr.message);
-				}
+			if (classifyConversationMessage(normalizedConversation) === "client") {
+				triggerAiResponseInBackground(updatedCase._id.toString(), "client_message");
 			}
 		}
 
-		// Return the updated case if it's not closed
 		return res.status(200).json(updatedCase);
 	} catch (error) {
 		console.log("Error in updateSupportCase:", error);
@@ -247,11 +414,16 @@ exports.createNewSupportCase = async (req, res) => {
 				messageBy: {
 					customerName,
 					customerEmail: customerEmail || "no-email@example.com",
-					userId: role === 1 ? supporterId : ownerId,
+					userId:
+						openedBy === "client"
+							? ""
+							: role === 1
+							? supporterId
+							: ownerId,
 				},
 				message:
 					openedBy === "client"
-						? "A representative will be with you in 3 to 5 minutes."
+						? inquiryDetails
 						: `New support case created by ${
 								openedBy === "super admin"
 									? "Platform Administration"
@@ -275,18 +447,15 @@ exports.createNewSupportCase = async (req, res) => {
 			displayName1,
 			displayName2,
 			supporterName,
+			aiToRespond: openedBy === "client",
 		});
 
 		// 1) Save to DB
 		await newCase.save();
 
-		setTimeout(() => {
-			axios
-				.post(`${process.env.SERVER_URL}/api/aiagent/respond/${newCase._id}`, {
-					newClientMessage: "__WELCOME__",
-				})
-				.catch((e) => console.error("[AI‑welcome] failed:", e.message));
-		}, 15_000);
+		if (openedBy === "client") {
+			triggerAiResponseInBackground(newCase._id.toString(), "case_opened");
+		}
 
 		// 2) Populate storeId to get 'belongsTo'
 		const populatedCase = await SupportCase.findById(newCase._id).populate({
@@ -348,6 +517,52 @@ exports.createNewSupportCase = async (req, res) => {
 		return res.status(201).json(newCase);
 	} catch (error) {
 		console.error("Error creating support case:", error);
+		return res.status(400).json({ error: error.message });
+	}
+};
+
+exports.updateCaseAiResponder = async (req, res) => {
+	try {
+		const { id } = req.params;
+		const { aiToRespond } = req.body;
+
+		if (typeof aiToRespond !== "boolean") {
+			return res
+				.status(400)
+				.json({ error: "aiToRespond must be a boolean value." });
+		}
+
+		const supportCase = await SupportCase.findById(id).populate("storeId", "belongsTo");
+		if (!supportCase) {
+			return res.status(404).json({ error: "Support case not found" });
+		}
+
+		if (supportCase.openedBy !== "client") {
+			return res.status(400).json({
+				error: "AI replies can only be toggled for customer chats.",
+			});
+		}
+
+		const allowed = await canStaffManageCase(supportCase, req.profile);
+		if (!allowed) {
+			return res.status(403).json({ error: "Forbidden" });
+		}
+
+		const updatedCase = await SupportCase.findByIdAndUpdate(
+			id,
+			{ $set: { aiToRespond } },
+			{ new: true }
+		).populate("storeId", "belongsTo");
+
+		req.io?.emit("supportCaseUpdated", updatedCase?.toObject());
+
+		if (aiToRespond) {
+			triggerAiResponseInBackground(id, "ai_reenabled");
+		}
+
+		return res.status(200).json(updatedCase);
+	} catch (error) {
+		console.error("Error updating ai responder state:", error);
 		return res.status(400).json({ error: error.message });
 	}
 };
@@ -428,7 +643,7 @@ exports.getOpenSupportCasesForStore = async (req, res) => {
 		const cases = await SupportCase.find({
 			caseStatus: "open",
 			openedBy: { $in: ["super admin", "seller"] },
-			storeId: mongoose.Types.ObjectId(storeId),
+			storeId: new mongoose.Types.ObjectId(storeId),
 		})
 			.populate("supporterId")
 			.populate("storeId");
@@ -539,7 +754,7 @@ exports.getCloseSupportCasesForStore = async (req, res) => {
 		const cases = await SupportCase.find({
 			caseStatus: "closed",
 			openedBy: { $in: ["super admin", "seller"] },
-			storeId: mongoose.Types.ObjectId(storeId),
+			storeId: new mongoose.Types.ObjectId(storeId),
 		})
 			.populate("supporterId")
 			.populate("storeId");
@@ -564,7 +779,7 @@ exports.getCloseSupportCasesForStoreClients = async (req, res) => {
 		const cases = await SupportCase.find({
 			caseStatus: "closed",
 			openedBy: "client",
-			storeId: mongoose.Types.ObjectId(storeId),
+			storeId: new mongoose.Types.ObjectId(storeId),
 		})
 			.populate("supporterId")
 			.populate("storeId");
@@ -672,7 +887,7 @@ exports.getUnseenMessagesCountBySeller = async (req, res) => {
 		}
 
 		const count = await SupportCase.aggregate([
-			{ $match: { storeId: mongoose.Types.ObjectId(storeId) } },
+			{ $match: { storeId: new mongoose.Types.ObjectId(storeId) } },
 			{ $unwind: "$conversation" },
 			{
 				$match: {
@@ -703,7 +918,7 @@ exports.getUnseenMessagesByClient = async (req, res) => {
 
 		// Example approach; tailor to your actual logic of "unseen by the client"
 		const unseenMessages = await SupportCase.find({
-			"conversation.messageBy.userId": mongoose.Types.ObjectId(clientId),
+			"conversation.messageBy.userId": new mongoose.Types.ObjectId(clientId),
 			caseStatus: { $ne: "closed" },
 			"conversation.seenByClient": false,
 		}).select(
@@ -714,6 +929,40 @@ exports.getUnseenMessagesByClient = async (req, res) => {
 	} catch (error) {
 		console.error("Error fetching unseen messages for client:", error);
 		res.status(400).json({ error: error.message });
+	}
+};
+
+/**
+ * Fetch unseen messages count for a specific support case from the customer's view
+ */
+exports.getUnseenMessagesCountForCaseByClient = async (req, res) => {
+	try {
+		const { id } = req.params;
+
+		if (!mongoose.Types.ObjectId.isValid(id)) {
+			return res.status(400).json({ error: "Invalid support case ID" });
+		}
+
+		const supportCase = await SupportCase.findById(id)
+			.select("conversation.seenByClient")
+			.lean();
+
+		if (!supportCase) {
+			return res.status(404).json({ error: "Support case not found" });
+		}
+
+		const count = Array.isArray(supportCase.conversation)
+			? supportCase.conversation.filter((entry) => entry?.seenByClient === false)
+					.length
+			: 0;
+
+		return res.status(200).json({ count });
+	} catch (error) {
+		console.error(
+			"Error fetching unseen messages count for customer case:",
+			error
+		);
+		return res.status(400).json({ error: error.message });
 	}
 };
 
@@ -755,20 +1004,28 @@ exports.updateSeenStatusForClient = async (req, res) => {
 	try {
 		const { id } = req.params;
 
+		if (!mongoose.Types.ObjectId.isValid(id)) {
+			return res.status(400).json({ error: "Invalid support case ID" });
+		}
+
 		const result = await SupportCase.updateOne(
-			{ _id: id, "conversation.seenByClient": false },
+			{ _id: id },
 			{ $set: { "conversation.$[].seenByClient": true } }
 		);
 
-		if (result.nModified === 0) {
-			return res
-				.status(404)
-				.json({ error: "Support case not found or no unseen messages" });
+		if (result.matchedCount === 0) {
+			return res.status(404).json({ error: "Support case not found" });
 		}
 
-		res.status(200).json({ message: "Seen status updated for client" });
+		return res.status(200).json({
+			message:
+				result.modifiedCount > 0
+					? "Seen status updated for client"
+					: "Messages were already marked as seen for client",
+			alreadySeen: result.modifiedCount === 0,
+		});
 	} catch (error) {
-		res.status(400).json({ error: error.message });
+		return res.status(400).json({ error: error.message });
 	}
 };
 
@@ -783,7 +1040,7 @@ exports.markAllMessagesAsSeenByAdmin = async (req, res) => {
 		// If you want to only skip messages that the admin wrote, keep the arrayFilters
 		// Or you can do a blanket update if you always want admin to see them as read.
 		const result = await SupportCase.updateOne(
-			{ _id: ObjectId(id) },
+			{ _id: new mongoose.Types.ObjectId(id) },
 			{
 				$set: {
 					"conversation.$[].seenByAdmin": true,
@@ -798,12 +1055,19 @@ exports.markAllMessagesAsSeenByAdmin = async (req, res) => {
 				.json({ error: "No unseen messages found or already updated" });
 		}
 
-		// Emit socket event if you want
-		// req.app.get("io").to(id).emit("messageSeen", { caseId: id, userId });
+		const updatedCase = await SupportCase.findById(id)
+			.populate("supporterId")
+			.populate("storeId");
 
-		return res
-			.status(200)
-			.json({ message: "All messages marked as seen by Admin" });
+		if (updatedCase) {
+			req.app.get("io")?.emit("supportCaseUpdated", updatedCase.toObject());
+		}
+
+		return res.status(200).json({
+			message: "All messages marked as seen by Admin",
+			case: updatedCase,
+			userId,
+		});
 	} catch (error) {
 		console.error("Error in markAllMessagesAsSeenByAdmin:", error);
 		return res.status(400).json({ error: error.message });
@@ -1113,4 +1377,40 @@ exports.getUnseenMessagesListByAdmin = async (req, res) => {
 		console.error("Error fetching unseen messages for admin:", error);
 		res.status(400).json({ error: error.message });
 	}
+};
+
+exports.closeInactiveSupportCases = async ({
+	io = global.io,
+	idleMs = SUPPORT_CASE_INACTIVITY_CLOSE_MS,
+} = {}) => {
+	const normalizedIdleMs =
+		Number(idleMs) > 0 ? Number(idleMs) : SUPPORT_CASE_INACTIVITY_CLOSE_MS;
+	const now = Date.now();
+
+	const openCases = await SupportCase.find({ caseStatus: "open" })
+		.select("createdAt conversation.date")
+		.lean();
+
+	let closedCount = 0;
+
+	for (const supportCase of openCases) {
+		const lastActivityAt = getSupportCaseLastActivityAt(supportCase);
+		if (!lastActivityAt) continue;
+		if (now - lastActivityAt.getTime() < normalizedIdleMs) continue;
+
+		const closedCase = await closeSupportCaseAndBroadcast(supportCase._id, {
+			closedBy: "system",
+			io,
+		});
+
+		if (closedCase) {
+			closedCount += 1;
+		}
+	}
+
+	return {
+		scannedCount: openCases.length,
+		closedCount,
+		idleMs: normalizedIdleMs,
+	};
 };

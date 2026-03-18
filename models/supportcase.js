@@ -66,7 +66,7 @@ const supportCaseSchema = new Schema({
 	closedBy: {
 		// Who closed the case?
 		type: String,
-		enum: ["client", "seller", "super admin", null],
+		enum: ["client", "seller", "super admin", "system", null],
 		default: null,
 	},
 	supporterId: {

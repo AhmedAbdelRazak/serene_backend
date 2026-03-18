@@ -20,6 +20,7 @@ const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:8101";
 const app = express();
 
 const stripeController = require("./controllers/stripeController");
+const { closeInactiveSupportCases } = require("./controllers/supportcase");
 app.post(
 	"/api/stripe/webhook",
 	express.raw({ type: "application/json" }), // <‑‑ no json/body‑parser here
@@ -124,6 +125,24 @@ cron.schedule("0 */3 * * *", async () => {
 	} catch (error) {
 		console.error(
 			"Error during scheduled AI marketing audit task:",
+			error.message || error,
+		);
+	}
+});
+
+cron.schedule("* * * * *", async () => {
+	try {
+		const result = await closeInactiveSupportCases({ io });
+		if (result?.closedCount > 0) {
+			console.log(
+				`Closed ${result.closedCount} inactive support case(s) after ${Math.round(
+					result.idleMs / 60000,
+				)} minutes of inactivity`,
+			);
+		}
+	} catch (error) {
+		console.error(
+			"Error during scheduled support-case inactivity close task:",
 			error.message || error,
 		);
 	}

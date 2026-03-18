@@ -92,9 +92,28 @@ router.get(
 );
 
 /**
+ * Count all unassigned support cases
+ */
+router.get(
+	"/support-cases/unassigned/count",
+	requireSignin,
+	supportCaseController.getUnassignedSupportCasesCount
+);
+
+/**
  * Get a specific support case by ID
  */
 router.get("/support-cases/:id", supportCaseController.getSupportCaseById);
+
+router.get(
+	"/support-cases/:id/unseen/client/count",
+	supportCaseController.getUnseenMessagesCountForCaseByClient
+);
+
+router.get(
+	"/support-cases-customer/:id/unseen-count",
+	supportCaseController.getUnseenMessagesCountForCaseByClient
+);
 
 /**
  * Update a support case (add message, change status, etc.)
@@ -103,6 +122,15 @@ router.put(
 	"/support-cases/:id",
 	attachIo,
 	supportCaseController.updateSupportCase
+);
+
+router.put(
+	"/support-cases/:id/ai-responder/:userId",
+	requireSignin,
+	isAuth,
+	isSeller,
+	attachIo,
+	supportCaseController.updateCaseAiResponder
 );
 
 /**
@@ -143,6 +171,11 @@ router.put(
  */
 router.put(
 	"/support-cases/:id/seen/client",
+	supportCaseController.updateSeenStatusForClient
+);
+
+router.put(
+	"/support-cases-customer/:id/seen",
 	supportCaseController.updateSeenStatusForClient
 );
 
