@@ -79,6 +79,8 @@ function normalizeConversationEntry(conversation, caseDoc) {
 
 	return {
 		...conversation,
+		senderType:
+			conversation.senderType || classifyConversationMessage(conversation),
 		inquiryAbout: normalizedInquiryAbout,
 		inquiryDetails: hasInquiryDetails
 			? conversation.inquiryDetails
@@ -467,6 +469,7 @@ exports.createNewSupportCase = async (req, res) => {
 							? supporterId
 							: ownerId,
 				},
+				senderType: openedBy === "client" ? "client" : "staff",
 				message:
 					openedBy === "client"
 						? inquiryDetails

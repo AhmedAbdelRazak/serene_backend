@@ -24,6 +24,11 @@ const conversationSchema = new Schema({
 		type: String,
 		required: true,
 	},
+	senderType: {
+		type: String,
+		enum: ["client", "staff", "ai"],
+		required: false,
+	},
 	date: {
 		type: Date,
 		default: Date.now,

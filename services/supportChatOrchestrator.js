@@ -1124,9 +1124,23 @@ function isSupportEmail(email = "") {
 }
 
 function classifyConversationMessage(message = {}) {
+	const explicitSenderType = normalizeLower(message?.senderType);
+	if (["client", "staff", "ai"].includes(explicitSenderType)) {
+		return explicitSenderType;
+	}
+
 	const email = normalizeLower(message?.messageBy?.customerEmail);
-	if (isSupportEmail(email)) return "ai";
 	if (normalizeString(message?.messageBy?.userId)) return "staff";
+	if (isSupportEmail(email)) {
+		const senderName = normalizeLower(message?.messageBy?.customerName);
+		if (
+			agentNames.includes(senderName) ||
+			senderName === "platform support" ||
+			senderName === "support team"
+		) {
+			return "ai";
+		}
+	}
 	return "client";
 }
 
@@ -2633,6 +2647,7 @@ async function appendAiMessage(caseId, segment, agentName) {
 			customerName: agentName,
 			customerEmail: SUPPORT_EMAIL,
 		},
+		senderType: "ai",
 		message: segment,
 		inquiryAbout: root.inquiryAbout || "follow-up",
 		inquiryDetails: root.inquiryDetails || "",
