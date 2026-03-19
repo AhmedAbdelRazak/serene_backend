@@ -45,6 +45,10 @@ app.use(
 	}),
 );
 app.use(express.json({ limit: "50mb" }));
+app.use("/api", (req, res, next) => {
+	res.set("X-Robots-Tag", "noindex, nofollow, noarchive");
+	next();
+});
 
 app.get("/", (req, res) => {
 	res.send("Hello From ecommerce API");
