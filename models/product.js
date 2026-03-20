@@ -259,6 +259,8 @@ const productSchema = new mongoose.Schema(
 							{
 								url: String,
 								public_id: String,
+								original_cloudinary_url: String,
+								original_cloudinary_public_id: String,
 							},
 						],
 					},

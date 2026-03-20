@@ -72,6 +72,7 @@ function usage() {
 		"    [--assetSubdir serene_janat/pod_default_designs] \\",
 		"    [--productId 67b7fb903d0cd90c4fc410d6] \\",
 		"    [--storeId 67ef147140130b857c44ba75] \\",
+		"    [--seedOriginalFromBackupFile /path/to/backup.json] \\",
 		"    [--limit 10] [--dry-run] [--overwrite]",
 		"",
 		"Notes:",
@@ -79,6 +80,7 @@ function usage() {
 		"  - For local delivery to work in the storefront, migrated images are saved with:",
 		"      url       = local /assets URL",
 		'      public_id = ""',
+		'      original_cloudinary_url / original_cloudinary_public_id preserved',
 	].join("\n");
 }
 
@@ -146,6 +148,10 @@ function buildCloudinaryUrlFromPublicId(publicId = "") {
 		: "";
 }
 
+function isCloudinaryLikeUrl(url = "") {
+	return `${url || ""}`.includes("res.cloudinary.com");
+}
+
 function resolveSourceUrl(image = {}) {
 	if (!image || typeof image !== "object") return "";
 	return (
@@ -158,6 +164,120 @@ function resolveSourceUrl(image = {}) {
 				"",
 		)
 	);
+}
+
+function resolveOriginalCloudinaryDetails(image = {}, fallbackImage = null) {
+	const sources = [image, fallbackImage].filter(Boolean);
+
+	for (const item of sources) {
+		const originalUrl = String(
+			item?.original_cloudinary_url || item?.originalCloudinaryUrl || "",
+		).trim();
+		const originalPublicId = String(
+			item?.original_cloudinary_public_id ||
+				item?.originalCloudinaryPublicId ||
+				"",
+		).trim();
+		if (originalUrl || originalPublicId) {
+			return {
+				url: originalUrl || buildCloudinaryUrlFromPublicId(originalPublicId),
+				publicId: originalPublicId,
+				source: "original-fields",
+			};
+		}
+	}
+
+	for (const item of sources) {
+		const directUrl = String(
+			item?.cloudinary_url || item?.cloudinaryUrl || "",
+		).trim();
+		const directPublicId = String(
+			item?.cloudinary_public_id || item?.cloudinaryPublicId || "",
+		).trim();
+		if (directUrl || directPublicId) {
+			return {
+				url: directUrl || buildCloudinaryUrlFromPublicId(directPublicId),
+				publicId: directPublicId,
+				source: "cloudinary-fields",
+			};
+		}
+	}
+
+	for (const item of sources) {
+		const directUrl = String(item?.url || item?.src || "").trim();
+		const directPublicId = String(item?.public_id || item?.publicId || "").trim();
+		if (isCloudinaryLikeUrl(directUrl) || directPublicId) {
+			return {
+				url: directUrl || buildCloudinaryUrlFromPublicId(directPublicId),
+				publicId: directPublicId,
+				source: "primary-fields",
+			};
+		}
+	}
+
+	return { url: "", publicId: "", source: "" };
+}
+
+function loadBackupSeedMap(rawInput = "") {
+	const files = `${rawInput || ""}`
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter(Boolean);
+	const map = new Map();
+
+	for (const filePath of files) {
+		const raw = fs.readFileSync(filePath, "utf8");
+		const parsed = JSON.parse(raw);
+		const records = Array.isArray(parsed) ? parsed : [parsed];
+		for (const record of records) {
+			const productId = String(record?.productId || record?._id || "").trim();
+			if (!productId) continue;
+			map.set(productId, record);
+		}
+	}
+
+	return map;
+}
+
+function findBackupImageForPosition({
+	productId = "",
+	backupSeedMap,
+	attribute = {},
+	attrIndex = 0,
+	design = {},
+	designIndex = 0,
+	imageIndex = 0,
+}) {
+	if (!backupSeedMap || !backupSeedMap.size) return null;
+	const productSeed = backupSeedMap.get(String(productId || "").trim());
+	if (!productSeed) return null;
+
+	const backupAttributes = Array.isArray(productSeed?.productAttributes)
+		? productSeed.productAttributes
+		: [];
+	const backupAttribute =
+		backupAttributes.find(
+			(item) =>
+				String(item?.PK || "").trim() &&
+				String(item?.PK || "").trim() === String(attribute?.PK || "").trim(),
+		) || backupAttributes[attrIndex];
+	if (!backupAttribute) return null;
+
+	const backupDesigns = Array.isArray(backupAttribute?.defaultDesigns)
+		? backupAttribute.defaultDesigns
+		: [];
+	const designOccasion = String(design?.occassion || design?.occasion || "").trim();
+	const backupDesign =
+		backupDesigns.find(
+			(item) =>
+				String(item?.occassion || item?.occasion || "").trim() === designOccasion,
+		) || backupDesigns[designIndex];
+	if (!backupDesign) return null;
+
+	const backupImages = Array.isArray(backupDesign?.defaultDesignImages)
+		? backupDesign.defaultDesignImages
+		: [];
+	return backupImages[imageIndex] || null;
 }
 
 function buildTargetFileName({
@@ -268,6 +388,10 @@ function cloneDefaultDesignsForBackup(product = {}) {
 								public_id: image?.public_id || "",
 								cloudinary_url: image?.cloudinary_url || "",
 								cloudinary_public_id: image?.cloudinary_public_id || "",
+								original_cloudinary_url:
+									image?.original_cloudinary_url || "",
+								original_cloudinary_public_id:
+									image?.original_cloudinary_public_id || "",
 							}))
 						: [],
 				}))
@@ -283,6 +407,7 @@ async function main() {
 		args.assetSubdir || "serene_janat/pod_default_designs",
 	);
 	const limit = Number(args.limit || 0);
+	const backupSeedMap = loadBackupSeedMap(args.seedOriginalFromBackupFile || "");
 
 	if (!process.env.DATABASE) {
 		throw new Error("DATABASE is not set in the environment.");
@@ -312,6 +437,7 @@ async function main() {
 		backupFile,
 		productId: args.productId || null,
 		storeId: args.storeId || null,
+		seedOriginalFromBackupFile: args.seedOriginalFromBackupFile || null,
 		limit: limit || null,
 	});
 
@@ -335,6 +461,7 @@ async function main() {
 		imagesAlreadyLocal: 0,
 		downloadsCompleted: 0,
 		downloadsSkipped: 0,
+		originalRefsWritten: 0,
 		failures: 0,
 	};
 
@@ -345,6 +472,7 @@ async function main() {
 		let productImagesAlreadyLocal = 0;
 		let productDownloadsCompleted = 0;
 		let productDownloadsSkipped = 0;
+		let productOriginalRefsWritten = 0;
 
 		const originalDefaultDesigns = cloneDefaultDesignsForBackup(product);
 
@@ -371,8 +499,27 @@ async function main() {
 
 				for (let imageIndex = 0; imageIndex < images.length; imageIndex += 1) {
 					const image = images[imageIndex];
-					const sourceUrl = resolveSourceUrl(image);
-					if (!sourceUrl) {
+					const backupImage = findBackupImageForPosition({
+						productId: String(product._id),
+						backupSeedMap,
+						attribute,
+						attrIndex,
+						design,
+						designIndex,
+						imageIndex,
+					});
+					const originalCloudinary = resolveOriginalCloudinaryDetails(
+						image,
+						backupImage,
+					);
+					const alreadyLocal = isLocalUrl(image?.url || "", publicBaseUrl);
+					let sourceUrl = resolveSourceUrl(image);
+					if (!sourceUrl && !alreadyLocal) {
+						sourceUrl =
+							resolveSourceUrl(backupImage || {}) ||
+							String(backupImage?.url || backupImage?.src || "").trim();
+					}
+					if (!sourceUrl && !alreadyLocal) {
 						console.warn(
 							`[WARN] Missing source URL for product=${product._id} attr=${attrIndex} occasion=${occasion} image=${imageIndex}`,
 						);
@@ -381,25 +528,25 @@ async function main() {
 						continue;
 					}
 
-					const alreadyLocal = isLocalUrl(image?.url || "", publicBaseUrl);
 					let contentType = "";
-					let fileName = buildTargetFileName({
-						image,
-						sourceUrl,
-						productId: String(product._id),
-						attrIndex,
-						designIndex,
-						imageIndex,
-						occasion,
-					});
-
-					let targetRelativePath = toPosixPath(`${assetSubdir}/${fileName}`);
-					let targetAbsolutePath = path.join(
-						assetRoot,
-						...targetRelativePath.split("/"),
-					);
+					let localUrl = alreadyLocal ? String(image?.url || "").trim() : "";
 
 					if (!alreadyLocal) {
+						let fileName = buildTargetFileName({
+							image,
+							sourceUrl,
+							productId: String(product._id),
+							attrIndex,
+							designIndex,
+							imageIndex,
+							occasion,
+						});
+						let targetRelativePath = toPosixPath(`${assetSubdir}/${fileName}`);
+						let targetAbsolutePath = path.join(
+							assetRoot,
+							...targetRelativePath.split("/"),
+						);
+
 						try {
 							const result = await downloadFile(
 								sourceUrl,
@@ -446,6 +593,7 @@ async function main() {
 									);
 								}
 							}
+							localUrl = `${publicBaseUrl}/${targetRelativePath}`;
 
 							if (result.skippedDownload) {
 								productDownloadsSkipped += 1;
@@ -462,12 +610,25 @@ async function main() {
 						}
 					}
 
-					const localUrl = `${publicBaseUrl}/${targetRelativePath}`;
+					const targetOriginalCloudinaryUrl = originalCloudinary.url;
+					const targetOriginalCloudinaryPublicId =
+						originalCloudinary.publicId;
+					const currentOriginalCloudinaryUrl = String(
+						image?.original_cloudinary_url || "",
+					).trim();
+					const currentOriginalCloudinaryPublicId = String(
+						image?.original_cloudinary_public_id || "",
+					).trim();
+					const originalFieldsChanged =
+						currentOriginalCloudinaryUrl !== targetOriginalCloudinaryUrl ||
+						currentOriginalCloudinaryPublicId !==
+							targetOriginalCloudinaryPublicId;
 					const needsUpdate =
 						`${image?.url || ""}`.trim() !== localUrl ||
 						`${image?.public_id || ""}`.trim() !== "" ||
 						`${image?.cloudinary_url || ""}`.trim() !== "" ||
-						`${image?.cloudinary_public_id || ""}`.trim() !== "";
+						`${image?.cloudinary_public_id || ""}`.trim() !== "" ||
+						originalFieldsChanged;
 
 					if (!needsUpdate) {
 						productImagesAlreadyLocal += 1;
@@ -476,6 +637,17 @@ async function main() {
 
 					image.url = localUrl;
 					image.public_id = "";
+					if (targetOriginalCloudinaryUrl) {
+						image.original_cloudinary_url = targetOriginalCloudinaryUrl;
+					} else {
+						delete image.original_cloudinary_url;
+					}
+					if (targetOriginalCloudinaryPublicId) {
+						image.original_cloudinary_public_id =
+							targetOriginalCloudinaryPublicId;
+					} else {
+						delete image.original_cloudinary_public_id;
+					}
 					delete image.cloudinary_url;
 					delete image.cloudinary_public_id;
 					delete image.cloudinaryUrl;
@@ -483,6 +655,12 @@ async function main() {
 
 					changed = true;
 					productImagesUpdated += 1;
+					if (
+						originalFieldsChanged &&
+						(targetOriginalCloudinaryUrl || targetOriginalCloudinaryPublicId)
+					) {
+						productOriginalRefsWritten += 1;
+					}
 					if (alreadyLocal) {
 						productImagesAlreadyLocal += 1;
 					}
@@ -519,6 +697,7 @@ async function main() {
 		summary.imagesAlreadyLocal += productImagesAlreadyLocal;
 		summary.downloadsCompleted += productDownloadsCompleted;
 		summary.downloadsSkipped += productDownloadsSkipped;
+		summary.originalRefsWritten += productOriginalRefsWritten;
 
 		if (args.dryRun) {
 			console.log(

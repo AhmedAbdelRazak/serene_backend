@@ -2566,6 +2566,14 @@ function normalizePodDefaultDesignImages(images = []) {
 		if (!preferredUrl) continue;
 		if (dedupe.has(preferredUrl)) continue;
 		dedupe.add(preferredUrl);
+		const originalCloudinaryUrl = String(
+			image?.original_cloudinary_url || image?.originalCloudinaryUrl || "",
+		).trim();
+		const originalCloudinaryPublicId = String(
+			image?.original_cloudinary_public_id ||
+				image?.originalCloudinaryPublicId ||
+				"",
+		).trim();
 		normalized.push({
 			url,
 			public_id: String(image?.public_id || image?.publicId || "").trim(),
@@ -2573,6 +2581,8 @@ function normalizePodDefaultDesignImages(images = []) {
 			cloudinary_public_id: String(
 				image?.cloudinary_public_id || image?.cloudinaryPublicId || "",
 			).trim(),
+			original_cloudinary_url: originalCloudinaryUrl,
+			original_cloudinary_public_id: originalCloudinaryPublicId,
 		});
 	}
 	return normalized;
