@@ -80,7 +80,7 @@ function usage() {
 		"  - For local delivery to work in the storefront, migrated images are saved with:",
 		"      url       = local /assets URL",
 		'      public_id = ""',
-		'      original_cloudinary_url / original_cloudinary_public_id preserved',
+		"      original_cloudinary_url / original_cloudinary_public_id preserved",
 	].join("\n");
 }
 
@@ -205,7 +205,9 @@ function resolveOriginalCloudinaryDetails(image = {}, fallbackImage = null) {
 
 	for (const item of sources) {
 		const directUrl = String(item?.url || item?.src || "").trim();
-		const directPublicId = String(item?.public_id || item?.publicId || "").trim();
+		const directPublicId = String(
+			item?.public_id || item?.publicId || "",
+		).trim();
 		if (isCloudinaryLikeUrl(directUrl) || directPublicId) {
 			return {
 				url: directUrl || buildCloudinaryUrlFromPublicId(directPublicId),
@@ -266,11 +268,14 @@ function findBackupImageForPosition({
 	const backupDesigns = Array.isArray(backupAttribute?.defaultDesigns)
 		? backupAttribute.defaultDesigns
 		: [];
-	const designOccasion = String(design?.occassion || design?.occasion || "").trim();
+	const designOccasion = String(
+		design?.occassion || design?.occasion || "",
+	).trim();
 	const backupDesign =
 		backupDesigns.find(
 			(item) =>
-				String(item?.occassion || item?.occasion || "").trim() === designOccasion,
+				String(item?.occassion || item?.occasion || "").trim() ===
+				designOccasion,
 		) || backupDesigns[designIndex];
 	if (!backupDesign) return null;
 
@@ -388,8 +393,7 @@ function cloneDefaultDesignsForBackup(product = {}) {
 								public_id: image?.public_id || "",
 								cloudinary_url: image?.cloudinary_url || "",
 								cloudinary_public_id: image?.cloudinary_public_id || "",
-								original_cloudinary_url:
-									image?.original_cloudinary_url || "",
+								original_cloudinary_url: image?.original_cloudinary_url || "",
 								original_cloudinary_public_id:
 									image?.original_cloudinary_public_id || "",
 							}))
@@ -407,7 +411,9 @@ async function main() {
 		args.assetSubdir || "serene_janat/pod_default_designs",
 	);
 	const limit = Number(args.limit || 0);
-	const backupSeedMap = loadBackupSeedMap(args.seedOriginalFromBackupFile || "");
+	const backupSeedMap = loadBackupSeedMap(
+		args.seedOriginalFromBackupFile || "",
+	);
 
 	if (!process.env.DATABASE) {
 		throw new Error("DATABASE is not set in the environment.");
@@ -611,8 +617,7 @@ async function main() {
 					}
 
 					const targetOriginalCloudinaryUrl = originalCloudinary.url;
-					const targetOriginalCloudinaryPublicId =
-						originalCloudinary.publicId;
+					const targetOriginalCloudinaryPublicId = originalCloudinary.publicId;
 					const currentOriginalCloudinaryUrl = String(
 						image?.original_cloudinary_url || "",
 					).trim();
