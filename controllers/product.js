@@ -2059,7 +2059,7 @@ exports.listProductsForSeo = async (req, res) => {
 				)
 				.populate(
 					"category",
-					"_id categoryName categorySlug categoryName_Arabic"
+					"_id categoryName categorySlug categoryName_Arabic categoryStatus"
 				)
 				.sort({ updatedAt: -1 })
 				.skip(skip)
