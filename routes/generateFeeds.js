@@ -112,23 +112,58 @@ function normalizeUrl(value) {
 	return raw.replace(/^http:\/\//i, "https://");
 }
 
+function isCloudinaryImageUrl(url = "") {
+	return /^(https?:)?\/\/res\.cloudinary\.com\//i.test(`${url || ""}`.trim());
+}
+
+function isSameSiteImageUrl(url = "") {
+	const normalized = normalizeUrl(url);
+	if (!normalized) return false;
+	try {
+		return new URL(normalized, "https://serenejannat.com").origin === "https://serenejannat.com";
+	} catch {
+		return false;
+	}
+}
+
+function getImageUrlPreferenceRank(url = "") {
+	if (isSameSiteImageUrl(url)) return 0;
+	if (isCloudinaryImageUrl(url)) return 1;
+	return 2;
+}
+
+function prioritizeImageUrls(images = []) {
+	return Array.from(new Set(images.filter(Boolean))).sort((left, right) => {
+		return getImageUrlPreferenceRank(left) - getImageUrlPreferenceRank(right);
+	});
+}
+
 function resolveImageUrl(imageLike) {
 	if (!imageLike) return "";
 	if (typeof imageLike === "string") return normalizeUrl(imageLike);
 	if (Array.isArray(imageLike)) {
-		return imageLike.map((entry) => resolveImageUrl(entry)).find(Boolean) || "";
+		return prioritizeImageUrls(
+			imageLike.map((entry) => resolveImageUrl(entry)).filter(Boolean)
+		)[0] || "";
 	}
 	if (Array.isArray(imageLike?.images) && imageLike.images.length > 0) {
 		return resolveImageUrl(imageLike.images);
 	}
-	const direct =
-		imageLike.cloudinary_url ||
-		imageLike.cloudinaryUrl ||
-		imageLike.cloudinaryURL ||
-		imageLike.secure_url ||
-		imageLike.url ||
-		imageLike.src;
-	return normalizeUrl(direct);
+	return (
+		prioritizeImageUrls(
+			[
+				imageLike.url,
+				imageLike.src,
+				imageLike.secure_url,
+				imageLike.secureUrl,
+				imageLike.cloudinary_url,
+				imageLike.cloudinaryUrl,
+				imageLike.cloudinaryURL,
+			]
+				.map((entry) => normalizeUrl(entry))
+				.filter(Boolean)
+		)[0] || ""
+	);
 }
 
 function uniqueImageUrls(images = []) {
