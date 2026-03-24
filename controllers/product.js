@@ -14,6 +14,7 @@ const ObjectId = mongoose.Types.ObjectId;
 const axios = require("axios");
 
 const EXCLUDED_CATEGORY_ID = "6691981f25cf79d0a7dca70e";
+const POD_COLLECTION_CATEGORY_SLUG = "custom-design";
 const DEFAULT_ACTIVE_CATEGORY_RESPONSE = {
 	categories: [],
 	subcategories: [],
@@ -69,12 +70,24 @@ function uniqueValidObjectIds(values = []) {
 }
 
 function normalizeActiveCategoriesSnapshot(snapshot = {}) {
+	const safeCategories = Array.isArray(snapshot?.categories)
+		? snapshot.categories.filter(
+				(entry) =>
+					toTrimmedString(entry?.categorySlug).toLowerCase() !==
+					POD_COLLECTION_CATEGORY_SLUG
+		  )
+		: DEFAULT_ACTIVE_CATEGORY_RESPONSE.categories;
+	const allowedCategoryIds = new Set(
+		safeCategories.map((entry) => `${entry?._id || ""}`.trim()).filter(Boolean)
+	);
+
 	return {
-		categories: Array.isArray(snapshot?.categories)
-			? snapshot.categories
-			: DEFAULT_ACTIVE_CATEGORY_RESPONSE.categories,
+		categories: safeCategories,
 		subcategories: Array.isArray(snapshot?.subcategories)
-			? snapshot.subcategories
+			? snapshot.subcategories.filter((entry) => {
+					const parentCategoryId = `${entry?.categoryId || ""}`.trim();
+					return !parentCategoryId || allowedCategoryIds.has(parentCategoryId);
+			  })
 			: DEFAULT_ACTIVE_CATEGORY_RESPONSE.subcategories,
 		genders: Array.isArray(snapshot?.genders)
 			? snapshot.genders
