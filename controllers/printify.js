@@ -6549,9 +6549,21 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 			}
 			return score;
 		};
-		for (let attempt = 0; attempt < 5; attempt++) {
+		const selectPreviewImages = (images = []) => {
+			const prioritized = [...images]
+				.sort((a, b) => scorePreviewImage(b) - scorePreviewImage(a))
+				.map((image) => image?.src)
+				.filter(Boolean);
+			return [...new Set(prioritized)].slice(0, 3);
+		};
+		if (Array.isArray(createResp?.data?.images)) {
+			previewImages = selectPreviewImages(createResp.data.images);
+		}
+		const previewPollAttempts = previewImages.length ? 8 : 12;
+		for (let attempt = 0; attempt < previewPollAttempts; attempt++) {
 			console.log(`[${debugId}] Polling preview images`, {
 				attempt: attempt + 1,
+				maxAttempts: previewPollAttempts,
 				previewProductId,
 			});
 			const previewProductResp = await axios.get(
@@ -6566,11 +6578,7 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 			const allImages = Array.isArray(previewProductResp?.data?.images)
 				? previewProductResp.data.images
 				: [];
-			const prioritized = [...allImages]
-				.sort((a, b) => scorePreviewImage(b) - scorePreviewImage(a))
-				.map((image) => image?.src)
-				.filter(Boolean);
-			previewImages = [...new Set(prioritized)].slice(0, 3);
+			previewImages = selectPreviewImages(allImages);
 			console.log(`[${debugId}] Poll result`, {
 				attempt: attempt + 1,
 				totalImages: Array.isArray(previewProductResp?.data?.images)
@@ -6578,23 +6586,35 @@ exports.previewCustomPrintifyDesign = async (req, res) => {
 					: 0,
 				returnedImages: previewImages.length,
 			});
-			if (previewImages.length >= 3) break;
-			await new Promise((resolve) => setTimeout(resolve, 900));
+			if (
+				previewImages.length >= 3 ||
+				(previewImages.length >= 1 && attempt >= 2)
+			) {
+				break;
+			}
+			const waitMs = attempt < 4 ? 1000 : 1800;
+			await new Promise((resolve) => setTimeout(resolve, waitMs));
 		}
 		console.log(`[${debugId}] Preview generation finished`, {
 			previewProductId,
 			imageCount: previewImages.length,
 			durationMs: Date.now() - startedAt,
 		});
-		shouldCleanupPreviewProduct = false;
-
-		return res.json({
-			success: true,
-			product_id: previewProductId,
-			preview_product_id: previewProductId,
+		const hasPreviewImages = previewImages.length > 0;
+		shouldCleanupPreviewProduct = !hasPreviewImages;
+		const responsePayload = {
+			success: hasPreviewImages,
+			product_id: hasPreviewImages ? previewProductId : null,
+			preview_product_id: hasPreviewImages ? previewProductId : null,
 			shop_id: shopId,
 			preview_images: previewImages,
-		});
+		};
+		if (!hasPreviewImages) {
+			responsePayload.warning =
+				"Printify mockup images were not ready; temporary preview product was cleaned up.";
+		}
+
+		return res.json(responsePayload);
 	} catch (error) {
 		console.error(`[${debugId}] Error generating Printify preview:`, {
 			status: error?.response?.status || null,

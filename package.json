@@ -12,6 +12,9 @@
 	],
 	"author": "Ahmed Abdelrazak",
 	"license": "ISC",
+	"overrides": {
+		"ws": "^8.20.1"
+	},
 	"dependencies": {
 		"@google-analytics/data": "^5.2.1",
 		"@paypal/checkout-server-sdk": "^1.0.3",
